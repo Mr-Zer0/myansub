@@ -1,0 +1,70 @@
+# subtrans configuration. Values shown are the defaults.
+# Copy to <project>/subtrans.toml or the global config dir and edit.
+
+[llm]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+timeout_secs = 120
+max_retries = 6                  # transport retries per request
+backoff_base_ms = 1000
+backoff_max_ms = 60000
+service_tier = "flex"            # flex (≈50% cheaper, may be shed) | standard
+service_tier_fallback = true     # move a unit to standard after repeated sheds
+max_sheds_before_fallback = 3
+confirm_above_usd = 1.0          # ask before runs estimated above this (0 = always ask)
+
+[llm.models]
+# Aliases are convenient; pin explicit versions for reproducible results and caching.
+analysis = "gemini-flash-latest"
+translation = "gemini-flash-latest"
+
+[llm.thinking]
+analysis = "low"                 # off | minimal | low | medium | high | <token budget>
+translation = "off"
+
+[cache]
+local = true                     # local response cache in project.db
+provider = "auto"                # off | implicit | explicit | auto
+implicit_hit_rate = 0.5          # assumption used by the auto break-even estimate
+min_cache_tokens = 2048
+ttl_margin_secs = 600
+
+[analysis]
+single_pass_max_tokens = 150000  # above this, use map-reduce
+chunk_cues = 400                 # cues per map chunk
+
+[translation]
+batch_size = 80
+context_before = 3
+context_after = 2
+concurrency = 4
+warm_cache_first = true
+max_content_attempts = 3
+output_ratio = 4.0               # est. output tokens per source token (Burmese is dense)
+
+[quality]
+max_graphemes_per_line = 42      # tune after native review
+max_lines = 2
+max_gps = 20.0                   # graphemes per second
+drift_ratio = 3.0                # boundary-drift sensitivity
+
+[estimate]
+bytes_per_token_latin = 4.0
+bytes_per_token_myanmar = 3.0    # tune with real usage data
+bytes_per_token_cjk = 3.0
+
+[output]
+ass_font_override = "Noto Sans Myanmar"   # "" to keep original fonts
+utf8_bom = false
+grace_secs = 10                  # Ctrl-C grace period for in-flight calls
+
+# Prices in USD per 1M tokens. Fill from the current Gemini pricing page.
+# Models without an entry report cost as "unknown".
+# [pricing."gemini-flash-latest"]
+# input = 0.0
+# cached_input = 0.0
+# output = 0.0                   # thinking tokens are billed as output
+# storage_per_hour = 0.0         # explicit cache storage
+# flex_multiplier = 0.5
+# long_prompt_threshold = 200000 # optional bracket
+# long_input = 0.0
+# long_output = 0.0
