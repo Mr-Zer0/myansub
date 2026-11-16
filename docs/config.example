@@ -1,5 +1,6 @@
-# subtrans configuration. Values shown are the defaults.
-# Copy to <project>/subtrans.toml or the global config dir and edit.
+# myansub configuration. Values shown are the defaults.
+# Copy to <project>/myansub.toml or the global config dir
+# (<config_dir>/myansub/config.toml) and edit.
 
 [llm]
 base_url = "https://generativelanguage.googleapis.com/v1beta"

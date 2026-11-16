@@ -3,10 +3,10 @@
 ## 1. Resolution order (later wins)
 
 1. Built-in defaults
-2. Global file: `<config_dir>/subtrans/config.toml` (platform config dir)
-3. Project file: `<project>/subtrans.toml`
+2. Global file: `<config_dir>/myansub/config.toml` (platform config dir)
+3. Project file: `<project>/myansub.toml`
 4. File given with `--config`
-5. Environment variables `SUBTRANS_*`
+5. Environment variables `MYANSUB_*`
 6. CLI flags
 
 `.env` is loaded with `dotenvy` from the current directory at startup (missing file is not an error).
@@ -19,12 +19,22 @@
 
 ## 3. Environment overrides
 
-`SUBTRANS_ANALYSIS_MODEL`, `SUBTRANS_TRANSLATION_MODEL`, `SUBTRANS_SERVICE_TIER`,
-`SUBTRANS_CONCURRENCY`. Add more only when needed; keep names `SUBTRANS_<SECTION>_<KEY>`.
+Names follow `MYANSUB_<SECTION>_<KEY>` (ADR-017). The currently supported variables and the
+config keys they map to:
+
+| Variable | Config key |
+|---|---|
+| `MYANSUB_ANALYSIS_MODEL` | `llm.models.analysis` |
+| `MYANSUB_TRANSLATION_MODEL` | `llm.models.translation` |
+| `MYANSUB_SERVICE_TIER` | `llm.service_tier` |
+| `MYANSUB_CONCURRENCY` | `translation.concurrency` |
+
+Add more only when needed; keep the `MYANSUB_<SECTION>_<KEY>` convention. Unknown
+`MYANSUB_*` variables are ignored.
 
 ## 4. Full reference
 
-See `config.example.toml` in the repository root. Every key there is documented inline and
+See `docs/config.example` in the repository. Every key there is documented inline and
 shows its default. Unknown keys are an error (`#[serde(deny_unknown_fields)]`).
 
 ## 5. Validation
