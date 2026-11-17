@@ -86,6 +86,13 @@ pub enum Cost {
 /// optional long-prompt bracket. Explicit-cache storage is a separate component
 /// ([`storage_cost`]). An unknown model yields [`Cost::Unknown`].
 pub fn cost(model: &str, tier: ServiceTier, usage: &Usage, table: &PriceTable) -> Cost {
+    // A local cache hit consumed no API tokens, so it is always free regardless of
+    // the token counts carried by the stored response (`docs/LLM.md` §5). This
+    // guards a caller that prices a hit's usage directly from over-charging.
+    if usage.cache_hit_local {
+        return Cost::Known(0.0);
+    }
+
     let Some(price) = table.get(model) else {
         return Cost::Unknown;
     };

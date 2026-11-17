@@ -162,6 +162,23 @@ fn storage_cost_uses_storage_rate() {
     assert_known(storage_cost(MODEL, 1_000_000, 3.0, &table()), 3.0);
 }
 
+// AC: M3-AC3/§5 — a local cache hit is always free, even if the stored response
+// carried non-zero token counts. Guards a future caller that prices a hit's usage
+// directly from over-charging.
+#[test]
+fn local_cache_hit_costs_zero_regardless_of_tokens() {
+    let usage = Usage {
+        prompt_tokens: 1_000_000,
+        cached_tokens: 0,
+        output_tokens: 500_000,
+        thinking_tokens: 10_000,
+        cache_hit_local: true,
+        applied_tier: None,
+    };
+    assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 0.0);
+    assert_known(cost(MODEL, ServiceTier::Flex, &usage, &table()), 0.0);
+}
+
 // AC: M3-AC5 — an unknown model reports Unknown, for both cost and storage.
 #[test]
 fn unknown_model_reports_unknown() {

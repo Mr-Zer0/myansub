@@ -175,32 +175,73 @@ pub struct Usage {
     pub applied_tier: Option<String>,
 }
 
+/// Everything the [`Cached`](crate::llm::cache) layer needs to persist one
+/// `llm_cache` row (`docs/DATA_MODEL.md` §2): the cache key plus the model,
+/// prompt version, response text, and [`Usage`] to store under it. Carried by a
+/// [`CommitToken`] from a cache *miss* so the caller can store the response once
+/// it has validated it (`docs/LLM.md` §4). Public fields so the pipeline (M5/M6)
+/// can hand the payload to a store `*_in_tx` helper and commit it inside the
+/// unit's transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachePayload {
+    pub key: String,
+    pub model: String,
+    pub prompt_version: u32,
+    pub response: String,
+    pub usage: Usage,
+}
+
 /// An opaque token returned alongside a response so the caller can confirm
-/// validity before the [`Cached`](crate::llm) layer stores it
-/// (`docs/LLM.md` §4). The cache implementation (M3-C) consumes it; here we only
-/// define the type and the flow surface.
+/// validity before the [`Cached`](crate::llm::cache) layer stores it
+/// (`docs/LLM.md` §4).
+///
+/// A *miss* carries a [`CachePayload`] (the response to store once validated); a
+/// *hit*, a dry-run, or a transport with no cache behind it carries nothing
+/// (`noop`). Invalid responses are simply never committed — the caller just
+/// drops the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitToken {
     key: Option<String>,
+    payload: Option<CachePayload>,
 }
 
 impl CommitToken {
     /// A token that commits nothing (e.g. for a local cache hit, or a transport
     /// with no cache behind it).
     pub fn noop() -> Self {
-        Self { key: None }
+        Self {
+            key: None,
+            payload: None,
+        }
     }
 
-    /// A token carrying the cache key to store under once the caller validates.
+    /// A token naming the cache key to store under, without a payload. Used where
+    /// only the key is known; committing it is a no-op.
     pub fn for_key(key: impl Into<String>) -> Self {
         Self {
             key: Some(key.into()),
+            payload: None,
+        }
+    }
+
+    /// A token carrying the full [`CachePayload`] to store once the caller
+    /// validates the response (`docs/LLM.md` §4). Built by the `Cached` layer on a
+    /// cache miss.
+    pub fn to_store(payload: CachePayload) -> Self {
+        Self {
+            key: Some(payload.key.clone()),
+            payload: Some(payload),
         }
     }
 
     /// The cache key to commit under, if any.
     pub fn key(&self) -> Option<&str> {
         self.key.as_deref()
+    }
+
+    /// The payload to store once validated, if this token carries one.
+    pub fn payload(&self) -> Option<&CachePayload> {
+        self.payload.as_ref()
     }
 }
 

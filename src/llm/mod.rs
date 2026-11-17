@@ -9,10 +9,12 @@
 //! `llm` depends only on `domain`/`config` here and must never depend on
 //! `pipeline` (`docs/ARCHITECTURE.md` §3).
 
+pub mod cache;
 pub mod canonical;
 pub mod client;
 pub mod dry_run;
 pub mod gemini;
+pub mod metered;
 pub mod pricing;
 pub mod prompts;
 pub mod retry;
@@ -24,14 +26,37 @@ pub mod schemas;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
 
+pub use cache::{CacheError, CacheStore, Cached, CachedEntry, cache_key};
 pub use canonical::canonical_json;
 pub use client::{
-    CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError, LlmRequest,
-    LlmResponse, Role, Secret, ServiceTier, ThinkingSetting, Usage,
+    CachePayload, CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError,
+    LlmRequest, LlmResponse, Role, Secret, ServiceTier, ThinkingSetting, Usage,
 };
 pub use dry_run::{DryRun, Estimator};
 pub use gemini::Gemini;
+pub use metered::{CallContext, CallOutcome, LlmCallRecord, Metered, SinkError, UsageSink};
 pub use pricing::{Cost, ModelPrice, PriceTable, cost, storage_cost};
 pub use prompts::{PROMPT_VERSION, TranslationBlock, TranslationLine};
 pub use retry::{Decision, RetryConfig, Xorshift, decide};
 pub use retrying::Retrying;
+
+/// The full client layer stack `Metered<Cached<Retrying<Transport>>>`
+/// (`docs/ARCHITECTURE.md` §5). A type alias so the pipeline (M5/M6) can name the
+/// assembled stack without spelling out the nesting.
+pub type Stack<Transport, Store, Sink> = Metered<Cached<Retrying<Transport>, Store>, Sink>;
+
+/// Assembles the full layer stack over `transport` (`docs/ARCHITECTURE.md` §5):
+/// `Metered<Cached<Retrying<Transport>>>`.
+pub fn assemble_stack<Transport, Store, Sink>(
+    transport: Transport,
+    cfg: RetryConfig,
+    token: tokio_util::sync::CancellationToken,
+    seed: u64,
+    store: Store,
+    sink: Sink,
+    context: CallContext,
+) -> Stack<Transport, Store, Sink> {
+    let retrying = Retrying::new(transport, cfg, token, seed);
+    let cached = Cached::new(retrying, store);
+    Metered::new(cached, sink, context)
+}

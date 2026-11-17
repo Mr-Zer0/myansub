@@ -1,0 +1,188 @@
+//! Repository for the LLM persistence tables: `llm_cache` and `llm_calls`
+//! (`docs/DATA_MODEL.md` §2).
+//!
+//! This module is the **only** place where `store` and `llm` meet
+//! (`docs/ARCHITECTURE.md` §3): it provides the store-backed implementations of
+//! the narrow [`CacheStore`](crate::llm::cache::CacheStore) and
+//! [`UsageSink`](crate::llm::metered::UsageSink) traits that `llm` defines. The
+//! coupling points the correct way — `store` depends on the `llm` traits, and
+//! `llm` never references `store` — so the dependency rule holds with no cycle.
+//!
+//! Each persisted change goes through one transaction (`docs/ARCHITECTURE.md` §6
+//! rule 1). The `*_in_tx` helpers expose the atomic step so the pipeline (M5/M6)
+//! can land a cache write inside the unit's own transaction; the plain functions
+//! wrap one transaction for standalone use.
+
+use rusqlite::{Connection, Row, Transaction, params};
+
+use super::db::{Store, StoreError};
+use crate::llm::cache::{CacheError, CacheStore, CachedEntry};
+use crate::llm::client::{CachePayload, Usage};
+use crate::llm::metered::{LlmCallRecord, SinkError, UsageSink};
+
+// ---------------------------------------------------------------------------
+// llm_cache
+// ---------------------------------------------------------------------------
+
+/// A full `llm_cache` row (`docs/DATA_MODEL.md` §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheRow {
+    pub key: String,
+    pub model: String,
+    pub prompt_version: u32,
+    pub response: String,
+    pub usage: Usage,
+}
+
+const CACHE_COLUMNS: &str = "key, model, prompt_version, response, usage";
+
+fn cache_row_from_row(row: &Row) -> Result<CacheRow, StoreError> {
+    let usage_json: String = row.get(4)?;
+    let usage: Usage = serde_json::from_str(&usage_json)
+        .map_err(|e| StoreError::Unexpected(format!("llm_cache.usage JSON: {e}")))?;
+    let prompt_version: i64 = row.get(2)?;
+    Ok(CacheRow {
+        key: row.get(0)?,
+        model: row.get(1)?,
+        prompt_version: prompt_version.max(0) as u32,
+        response: row.get(3)?,
+        usage,
+    })
+}
+
+/// Reads one full `llm_cache` row by key, if present.
+pub fn get_cache_row(conn: &Connection, key: &str) -> Result<Option<CacheRow>, StoreError> {
+    let sql = format!("SELECT {CACHE_COLUMNS} FROM llm_cache WHERE key = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(cache_row_from_row(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Reads a cached response by key as a [`CachedEntry`] (the `CacheStore` view).
+pub fn get_cache_entry(conn: &Connection, key: &str) -> Result<Option<CachedEntry>, StoreError> {
+    Ok(get_cache_row(conn, key)?.map(|row| CachedEntry {
+        response: row.response,
+        usage: row.usage,
+    }))
+}
+
+/// Stores a validated response within the caller's transaction
+/// (`docs/ARCHITECTURE.md` §6 rule 1). This is the seam the pipeline (M5/M6) uses
+/// to commit a cache write inside the unit's transaction.
+///
+/// On a key conflict the existing row is kept untouched (`DO NOTHING`): a
+/// re-commit of the same key is an identical response, and preserving the original
+/// row keeps `created_at` at the first-seen time so `prune_cache` ages entries by
+/// first-seen, not last-written.
+pub fn put_cache_in_tx(tx: &Transaction, payload: &CachePayload) -> Result<(), StoreError> {
+    let usage_json = serde_json::to_string(&payload.usage)
+        .map_err(|e| StoreError::Unexpected(format!("serialize Usage: {e}")))?;
+    tx.execute(
+        "INSERT INTO llm_cache (key, model, prompt_version, response, usage) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(key) DO NOTHING",
+        params![
+            payload.key,
+            payload.model,
+            payload.prompt_version,
+            payload.response,
+            usage_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Stores a validated response in its own transaction.
+pub fn put_cache(conn: &mut Connection, payload: &CachePayload) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    put_cache_in_tx(&tx, payload)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes `llm_cache` entries older than `older_than_days` days
+/// (`docs/LLM.md` §4, `docs/CLI.md` `cache prune`). Returns the number removed.
+pub fn prune_cache(conn: &mut Connection, older_than_days: u32) -> Result<usize, StoreError> {
+    let modifier = format!("-{older_than_days} days");
+    let tx = conn.transaction()?;
+    let removed = tx.execute(
+        "DELETE FROM llm_cache WHERE created_at < datetime('now', ?1)",
+        params![modifier],
+    )?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// llm_calls
+// ---------------------------------------------------------------------------
+
+/// Inserts one `llm_calls` row within the caller's transaction, returning its id.
+pub fn insert_call_in_tx(tx: &Transaction, call: &LlmCallRecord) -> Result<i64, StoreError> {
+    tx.execute(
+        "INSERT INTO llm_calls \
+         (stage, unit, model, service_tier, prompt_tokens, cached_tokens, output_tokens, \
+          thinking_tokens, latency_ms, cache_hit_local, dry_run, outcome) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            call.stage,
+            call.unit,
+            call.model,
+            call.service_tier,
+            call.prompt_tokens,
+            call.cached_tokens,
+            call.output_tokens,
+            call.thinking_tokens,
+            call.latency_ms,
+            call.cache_hit_local as i64,
+            call.dry_run as i64,
+            call.outcome.as_str(),
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Inserts one `llm_calls` row in its own transaction, returning its id.
+pub fn insert_call(conn: &mut Connection, call: &LlmCallRecord) -> Result<i64, StoreError> {
+    let tx = conn.transaction()?;
+    let id = insert_call_in_tx(&tx, call)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Counts `llm_calls` rows (test/report helper).
+pub fn count_calls(conn: &Connection) -> Result<usize, StoreError> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM llm_calls", [], |row| row.get(0))?;
+    Ok(count.max(0) as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Store-backed trait implementations (the one llm↔store seam)
+// ---------------------------------------------------------------------------
+
+impl CacheStore for Store {
+    async fn get(&self, key: &str) -> Result<Option<CachedEntry>, CacheError> {
+        let key = key.to_string();
+        self.call(move |conn| get_cache_entry(conn, &key))
+            .await
+            .map_err(|e| CacheError::Backend(e.to_string()))
+    }
+
+    async fn put(&self, payload: &CachePayload) -> Result<(), CacheError> {
+        let payload = payload.clone();
+        self.call(move |conn| put_cache(conn, &payload))
+            .await
+            .map_err(|e| CacheError::Backend(e.to_string()))
+    }
+}
+
+impl UsageSink for Store {
+    async fn record(&self, call: LlmCallRecord) -> Result<(), SinkError> {
+        self.call(move |conn| insert_call(conn, &call).map(|_| ()))
+            .await
+            .map_err(|e| SinkError::Backend(e.to_string()))
+    }
+}

@@ -15,11 +15,13 @@ pub mod atomic;
 pub mod db;
 pub mod migrations;
 pub mod repo_cues;
+pub mod repo_llm;
 pub mod repo_project;
 pub mod repo_units;
 
 pub use atomic::{StagedWrite, atomic_write};
 pub use db::{Store, StoreError};
 pub use repo_cues::{insert_cues, load_cues};
+pub use repo_llm::CacheRow;
 pub use repo_project::{Project, Stage, StageStatus};
 pub use repo_units::{AnalysisChunk, NewTranslationBatch, TranslationBatch, UnitStatus};

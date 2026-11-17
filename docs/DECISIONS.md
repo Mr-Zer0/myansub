@@ -210,3 +210,24 @@ touch the network or the store; the estimator is a pure, unit-tested function. T
 deliberately conservative — it scales output from the whole variable block and counts the full prefix
 with `cached_tokens = 0` (no implicit-cache discount), so it tends to *over*estimate versus a real run
 that benefits from caching, while the `maxOutputTokens` cap bounds the output overshoot.
+
+### ADR-030 llm↔store seam direction: store depends on llm traits (not the reverse)
+Context (M3-C): `ARCHITECTURE.md` §3 says "`llm` may depend on `store` only inside `cache.rs` and
+`metered.rs`, through a narrow trait (`CacheStore`, `UsageSink`) defined in `llm`." The narrow traits
+are defined in `llm` (`cache.rs`, `metered.rs`). Decision: `llm` does NOT depend on `store` at all —
+`cache.rs`/`metered.rs` reference only `llm`-internal types — and `store/repo_llm.rs` implements
+`llm::CacheStore` and `llm::UsageSink` for `store::Store`, so the concrete coupling points `store → llm`.
+This is the inverse of the literal direction in §3 but strictly honours its intent (one narrow seam,
+defined in `llm`, confined to `cache.rs`/`metered.rs` + `repo_llm.rs`) and is the option the M3-C brief
+authorised. `Cached<T, S: CacheStore>` and `Metered<T, U: UsageSink>` stay generic (static dispatch),
+so `llm` has no cyclic or concrete dependency on `store`. The trait `get`/`put`/`record` methods are
+async (`-> impl Future + Send`) so the store-backed impl runs DB work through `Store::call`
+(spawn_blocking, §7); the transactional commit path (M5/M6) instead uses the sync `repo_llm::*_in_tx`
+helpers with the `CachePayload` carried on the response's `CommitToken`, landing the cache write inside
+the unit transaction (§6 rule 1). Consequence: `llm` is fully decoupled from `store` (even cleaner than
+the exception allows); the only file where the two meet is `store/repo_llm.rs`. The local cache key
+excludes `service_tier` automatically because it is a request field, never part of `generationConfig`
+(the hashed `{model, prompt_version, systemInstruction, contents, generationConfig}`). A local cache hit
+records an `llm_calls` row with zero token counts and `cache_hit_local = 1` (cost 0) rather than echoing
+the originally-stored token counts, so any downstream cost sum is 0 regardless of whether it inspects
+the flag.
