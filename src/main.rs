@@ -4,19 +4,30 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
+use std::time::Duration;
+
 use anyhow::{Context, bail};
 use clap::Parser;
-use myansub::cli::{AutoApprove, Cli, Command, InitArgs, RunArgs};
+use myansub::cli::{AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, RunArgs, ServiceTier};
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, exit};
-use myansub::llm::pricing::Cost;
+use myansub::llm::client::Secret;
+use myansub::llm::pricing::{Cost, PriceTable};
+use myansub::llm::{Estimator, Gemini, RetryConfig};
+use myansub::pipeline::analysis::{
+    AnalysisFlags, AnalysisModeKind, AnalysisOutcome, AnalysisParams, DryRunReport,
+    analysis_exit_code, dry_run_analysis, parse_thinking, parse_tier, prepare_analysis,
+    run_analysis,
+};
 use myansub::pipeline::input::{InitOutcome, run_init};
 use myansub::pipeline::orchestrator::{
     AutoApproveGate, RunOptions, RunOutcome, RunRequest, StatusReport, run as run_pipeline,
     run_exit_code, status as gather_status,
 };
-use myansub::project::resolve_project;
-use myansub::store::StageStatus;
+use myansub::pipeline::scheduler::SchedulerConfig;
+use myansub::project::{project_db_path, resolve_project};
+use myansub::store::repo_project::get_project;
+use myansub::store::{StageStatus, Store};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -56,16 +67,17 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
-/// Dispatches a parsed command, returning the success-side exit code (0, or 130
-/// when interrupted; failed-unit code 4 arrives with translation in M6). Errors
-/// are mapped to codes by [`exit_code_for`]. `init`, `run` (up to analysis), and
-/// `status` are implemented; the rest map to a generic error until their
-/// milestones land.
+/// Dispatches a parsed command, returning the success-side exit code (0, 130 when
+/// interrupted, or 4 when `analyze` finished with failed chunks). Errors are mapped
+/// to codes by [`exit_code_for`]. `init`, `run` (up to the analysis boundary),
+/// `status`, and `analyze` are implemented; the rest map to a generic error until
+/// their milestones land.
 fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
     match &cli.command {
         Command::Init(args) => run_init_command(cli, args).map(|()| exit::SUCCESS),
         Command::Run(args) => run_run_command(cli, args),
         Command::Status => run_status_command(cli),
+        Command::Analyze(args) => run_analyze_command(cli, args),
         other => not_implemented(command_name(other)),
     }
 }
@@ -262,6 +274,186 @@ fn status_label(status: StageStatus) -> &'static str {
     }
 }
 
+/// Handles `myansub analyze [--model M] [--tier T] [--redo] [--retry-failed]
+/// [--dry-run]` (docs/CLI.md §6). Resolves the project, enforces the analysis gate
+/// (input completed), builds the LLM stack (DryRun for `--dry-run`, otherwise the
+/// Gemini transport from `GEMINI_API_KEY`), runs the analysis stage, and maps the
+/// outcome to an exit code (0 ok / 4 failed units / 3 precondition / 130 interrupt).
+fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
+    let overrides = CliOverrides {
+        analysis_model: args.model.clone(),
+        service_tier: args.tier.map(tier_label),
+        ..CliOverrides::default()
+    };
+    let config = load_config_with(cli, &location.dir, overrides)?;
+
+    let db = project_db_path(&location.dir);
+    if !db.is_file() {
+        return Err(PipelineError::Uninitialized {
+            dir: location.dir.clone(),
+        }
+        .into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    let token = CancellationToken::new();
+    let code = runtime.block_on(async {
+        let store = Store::open(&db)?;
+        let Some(project) = store.call(|conn| get_project(conn)).await? else {
+            return Err(PipelineError::Uninitialized {
+                dir: location.dir.clone(),
+            });
+        };
+
+        // Source-hash check + analysis gate (input completed) + load cues
+        // (docs/ARCHITECTURE.md §2/§6).
+        let cues = prepare_analysis(&store, Path::new(&project.source_path)).await?;
+        let params = analysis_params(&config, &project.source_hash);
+
+        if args.dry_run {
+            let prices = PriceTable::from_config(&config.pricing);
+            let report = dry_run_analysis(&store, &cues, &params, &prices).await?;
+            print_dry_run_report(&report);
+            return Ok(exit::SUCCESS);
+        }
+
+        // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6).
+        let signal_token = token.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_token.cancel();
+            }
+        });
+
+        let transport = build_gemini(&config)?;
+        let flags = AnalysisFlags {
+            redo: args.redo,
+            retry_failed: args.retry_failed,
+        };
+        let outcome = run_analysis(transport, &store, &cues, &params, flags, &token).await?;
+        report_analysis_outcome(&outcome);
+        Ok(analysis_exit_code(token.is_cancelled(), &outcome))
+    });
+
+    // A typed PipelineError (gate, source, store, LLM) propagates for exit mapping.
+    code.map_err(anyhow::Error::new)
+}
+
+/// Builds [`AnalysisParams`] from the resolved config and the project source hash.
+fn analysis_params(config: &Config, source_hash: &str) -> AnalysisParams {
+    AnalysisParams {
+        model: config.llm.models.analysis.clone(),
+        tier: parse_tier(&config.llm.service_tier),
+        thinking: parse_thinking(&config.llm.thinking.analysis),
+        source_digest: source_hash.to_string(),
+        max_content_attempts: config.translation.max_content_attempts,
+        single_pass_max_tokens: config.analysis.single_pass_max_tokens,
+        chunk_cues: config.analysis.chunk_cues,
+        estimator: Estimator {
+            bytes_per_token_latin: config.estimate.bytes_per_token_latin,
+            bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
+            bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
+        },
+        output_ratio: config.translation.output_ratio,
+        scheduler: SchedulerConfig {
+            concurrency: config.translation.concurrency.max(1) as usize,
+            warm_cache_first: config.translation.warm_cache_first,
+            grace: Duration::from_secs(config.output.grace_secs),
+        },
+        seed: clock_seed(),
+        retry: RetryConfig {
+            max_retries: config.llm.max_retries,
+            backoff_base_ms: config.llm.backoff_base_ms,
+            backoff_max_ms: config.llm.backoff_max_ms,
+            max_sheds_before_fallback: config.llm.max_sheds_before_fallback,
+            service_tier_fallback: config.llm.service_tier_fallback,
+        },
+    }
+}
+
+/// Builds the real Gemini transport from the environment and config
+/// (docs/LLM.md §1). The API key comes from `GEMINI_API_KEY` and is wrapped in a
+/// [`Secret`] so it never leaks through logging.
+fn build_gemini(config: &Config) -> Result<Gemini, PipelineError> {
+    // Detect an absent/empty key before building the transport, so a missing key is
+    // a clear, actionable error rather than a confusing 401 from a would-be request.
+    let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
+    if key.trim().is_empty() {
+        return Err(PipelineError::MissingApiKey);
+    }
+    Gemini::new(
+        config.llm.base_url.clone(),
+        Secret::new(key),
+        Duration::from_secs(config.llm.timeout_secs),
+    )
+    .map_err(PipelineError::Llm)
+}
+
+/// A jitter seed from the system clock (docs/ARCHITECTURE.md §10: a local seed, no
+/// `rand` dependency).
+fn clock_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+}
+
+/// The config label for a CLI service tier.
+fn tier_label(tier: ServiceTier) -> String {
+    match tier {
+        ServiceTier::Flex => "flex".to_string(),
+        ServiceTier::Standard => "standard".to_string(),
+    }
+}
+
+/// Prints where the analysis stage stopped and the next action (docs/CLI.md §6).
+fn report_analysis_outcome(outcome: &AnalysisOutcome) {
+    match outcome {
+        AnalysisOutcome::Completed { version } => {
+            println!(
+                "analysis complete; stored version {version}. \
+                 Next: `myansub analysis approve` (or edit with `myansub analysis edit`)."
+            );
+        }
+        AnalysisOutcome::NothingToDo => {
+            println!("an analysis version already exists; pass `--redo` to produce a new one.");
+        }
+        AnalysisOutcome::CompletedWithFailures { failed } => {
+            println!(
+                "analysis finished with {failed} failed chunk(s); \
+                 re-run with `--retry-failed` to retry them."
+            );
+        }
+        AnalysisOutcome::Interrupted => {
+            println!("interrupted; re-run `myansub analyze` to resume.");
+        }
+    }
+}
+
+/// Prints the `analyze --dry-run` estimate (docs/CLI.md §6, docs/LLM.md §9).
+fn print_dry_run_report(report: &DryRunReport) {
+    let mode = match report.mode {
+        AnalysisModeKind::SinglePass => "single-pass",
+        AnalysisModeKind::MapReduce => "map-reduce",
+    };
+    println!("Analysis dry run ({mode}):");
+    if report.mode == AnalysisModeKind::MapReduce {
+        println!("  chunks:          {}", report.chunk_count);
+    }
+    println!("  LLM calls:       {}", report.calls);
+    println!(
+        "  estimated tokens: input {} / output {}",
+        report.estimated_prompt_tokens, report.estimated_output_tokens
+    );
+    match report.estimated_cost {
+        Cost::Known(usd) => println!("  estimated cost:  ${usd:.4}"),
+        Cost::Unknown => println!("  estimated cost:  unknown (no price entry for the model)"),
+    }
+    println!("(dry run: nothing was written to the database.)");
+}
+
 /// Logs the user-facing result of `init`.
 fn report_init_outcome(project_dir: &Path, outcome: &InitOutcome) {
     let dir = project_dir.display();
@@ -298,6 +490,16 @@ fn warn_replacement_cues(input: &myansub::pipeline::input::InputOutcome) {
 /// project config files are included only when present; `--config` is a hard
 /// error if missing.
 fn load_config(cli: &Cli, project_dir: &Path) -> anyhow::Result<Config> {
+    load_config_with(cli, project_dir, CliOverrides::default())
+}
+
+/// [`load_config`] with command-specific CLI overrides (e.g. `analyze --model`,
+/// `--tier`) applied at the highest precedence (docs/CONFIG.md §1).
+fn load_config_with(
+    cli: &Cli,
+    project_dir: &Path,
+    overrides: CliOverrides,
+) -> anyhow::Result<Config> {
     let env: Vec<(String, String)> = std::env::vars()
         .filter(|(key, _)| key.starts_with("MYANSUB_"))
         .collect();
@@ -306,7 +508,7 @@ fn load_config(cli: &Cli, project_dir: &Path) -> anyhow::Result<Config> {
         Some(project_dir.join("myansub.toml")),
         cli.config.clone(),
         env,
-        CliOverrides::default(),
+        overrides,
     );
     Ok(config::load(&sources)?)
 }

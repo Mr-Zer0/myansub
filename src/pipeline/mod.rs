@@ -7,11 +7,17 @@
 //! `orchestrator` and per-stage modules (`input`, `analysis`, `translation`,
 //! `output`) arrive in later M4 slices.
 
+pub mod analysis;
 pub mod error;
 pub mod input;
 pub mod orchestrator;
 pub mod scheduler;
 
+pub use analysis::{
+    AnalysisFlags, AnalysisModeKind, AnalysisOutcome, AnalysisParams, DryRunReport,
+    analysis_exit_code, analysis_output_budget, dry_run_analysis, prepare_analysis, run_analysis,
+    worst_case_doc_tokens,
+};
 pub use error::PipelineError;
 pub use orchestrator::{
     NextStep, ProjectState, RunOptions, RunOutcome, RunRequest, StatusReport, can_run, next_step,

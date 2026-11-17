@@ -437,6 +437,53 @@ fn count_by_status(
     Ok(count.max(0) as usize)
 }
 
+/// Lists every analysis chunk in `chunk_no` order, regardless of status. Used by
+/// the analysis pipeline to build its scheduler units on a fresh run or a resume.
+pub fn list_all_analysis_chunks(conn: &Connection) -> Result<Vec<AnalysisChunk>, StoreError> {
+    let sql = format!("SELECT {CHUNK_COLUMNS} FROM analysis_chunks ORDER BY chunk_no");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut chunks = Vec::new();
+    while let Some(row) = rows.next()? {
+        chunks.push(chunk_from_row(row)?);
+    }
+    Ok(chunks)
+}
+
+// ---------------------------------------------------------------------------
+// Requeue / reset / clear (analysis chunks)
+// ---------------------------------------------------------------------------
+
+/// Resets one `in_flight` analysis chunk back to `pending` (the scheduler's
+/// per-unit recovery seam, `docs/ARCHITECTURE.md` §4.1). Returns whether a row
+/// changed. A chunk in any other state is left untouched.
+pub fn reset_analysis_chunk(conn: &Connection, chunk_no: i64) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "UPDATE analysis_chunks SET status = 'pending' \
+         WHERE chunk_no = ?1 AND status = 'in_flight'",
+        params![chunk_no],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Requeues every `failed` analysis chunk back to `pending` so a `--retry-failed`
+/// run reruns only the failures (`docs/CLI.md` §6). `attempts` is preserved as the
+/// running count. Returns the number of chunks requeued.
+pub fn requeue_failed_analysis_chunks(conn: &Connection) -> Result<usize, StoreError> {
+    let changed = conn.execute(
+        "UPDATE analysis_chunks SET status = 'pending' WHERE status = 'failed'",
+        [],
+    )?;
+    Ok(changed)
+}
+
+/// Deletes every analysis chunk row (a fresh `--redo` run starts from a clean map
+/// phase). Returns the number of rows removed.
+pub fn clear_analysis_chunks(conn: &Connection) -> Result<usize, StoreError> {
+    let changed = conn.execute("DELETE FROM analysis_chunks", [])?;
+    Ok(changed)
+}
+
 // ---------------------------------------------------------------------------
 // Recovery
 // ---------------------------------------------------------------------------

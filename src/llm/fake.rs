@@ -29,6 +29,11 @@ struct FakeState {
     /// When set, the token is cancelled on each call before the result is
     /// returned — used to drive cancellation tests deterministically.
     cancel_on_call: Option<CancellationToken>,
+    /// When set, the token is cancelled once this many calls have been received
+    /// (the Nth call), just before that call's result is returned. Lets a test
+    /// stop the scheduler after a fixed number of completed units — a simulated
+    /// crash between units (`docs/TESTING.md` §4).
+    cancel_after: Option<(CancellationToken, usize)>,
 }
 
 /// A scripted transport for tests.
@@ -82,6 +87,16 @@ impl Fake {
         self
     }
 
+    /// Cancels `token` once `after` calls have been received (on the `after`-th
+    /// call), after that call's result is scripted but before it is returned. The
+    /// `after`-th call still returns its scripted result, so the unit that made it
+    /// completes; later units are then never dispatched by the scheduler, modelling
+    /// a crash between units (`docs/TESTING.md` §4).
+    pub fn cancel_after(self, token: CancellationToken, after: usize) -> Self {
+        self.with_state(|s| s.cancel_after = Some((token, after)));
+        self
+    }
+
     /// Every request received, in order.
     pub fn calls(&self) -> Vec<LlmRequest> {
         self.with_state(|s| s.calls.clone())
@@ -104,6 +119,11 @@ impl LlmClient for Fake {
         self.with_state(|s| {
             s.calls.push(req);
             if let Some(token) = &s.cancel_on_call {
+                token.cancel();
+            }
+            if let Some((token, after)) = &s.cancel_after
+                && s.calls.len() == *after
+            {
                 token.cancel();
             }
             if let Some(result) = s.script.pop_front() {

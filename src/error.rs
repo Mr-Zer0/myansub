@@ -88,10 +88,13 @@ impl ExitCode for PipelineError {
             | PipelineError::FromDisagreement { .. }
             | PipelineError::Uninitialized { .. }
             | PipelineError::MissingFromLanguage => exit::PRECONDITION,
+            // A missing API key is a generic error (exit 1), not a precondition.
+            PipelineError::MissingApiKey => exit::ERROR,
             PipelineError::ProjectResolution(err) => err.exit_code(),
             PipelineError::Format(err) => err.exit_code(),
             PipelineError::Encoding(err) => err.exit_code(),
             PipelineError::Store(err) => err.exit_code(),
+            PipelineError::Llm(err) => err.exit_code(),
             PipelineError::Io { .. } => exit::ERROR,
         }
     }

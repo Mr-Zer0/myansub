@@ -42,6 +42,23 @@ pub fn translation_system_instruction() -> String {
     .join("\n")
 }
 
+/// The strict reminder appended to a unit's request on a content retry
+/// (`docs/LLM.md` §6). This is prompt text: any edit must bump [`PROMPT_VERSION`].
+pub fn strict_retry_reminder() -> String {
+    "Your previous response was not valid JSON matching the required analysis schema. Respond with \
+     ONLY a single JSON object matching the analysis document schema — no prose, no code fences."
+        .to_string()
+}
+
+/// The instruction heading the map-reduce reduce call's variable block
+/// (`docs/LLM.md` §2). This is prompt text: any edit must bump [`PROMPT_VERSION`].
+pub fn analysis_reduce_instruction() -> String {
+    "Merge the following partial analysis documents, listed in chunk order, into one complete \
+     analysis document. Reconcile characters, address matrix, glossary, scenes (contiguous over the \
+     whole cue range), style rules, and ambiguities. Return ONLY the merged JSON document."
+        .to_string()
+}
+
 /// Formats one transcript line for the analysis input as `[idx] Speaker: text`,
 /// or `[idx] text` when the speaker is unknown (`docs/LLM.md` §2).
 pub fn analysis_input_line(idx: u32, speaker: Option<&str>, text: &str) -> String {

@@ -248,3 +248,44 @@ replaces that boundary with real gate/completion stops, at which point the analy
 follows the exit-3 rule above. Consequence: `myansub run … --auto-approve all --yes` that drives a
 project to a finished output returns 0, while an unattended `run` that halts awaiting a human approval
 returns 3, so scripts can distinguish "done" from "needs a human" without parsing output.
+
+### ADR-032 Analysis content retries reuse `[translation].max_content_attempts`
+Context (M5-A): `LLM.md` §6 gives content retries their own counter, separate from the transport
+retries, and `CONFIG.md` only defines `max_content_attempts` under `[translation]`. The analysis stage
+needs the same bound for its single-pass call, each map chunk, and the reduce call. Decision: analysis
+reuses `[translation].max_content_attempts` rather than adding an `[analysis].max_content_attempts`
+key — the retry semantics are identical and a single knob keeps config small. The counter lives in
+`pipeline/analysis.rs::call_validated` (one attempt counter per logical unit), entirely separate from
+the transport retries inside `Retrying`, honouring the "never share a counter" rule. If analysis later
+needs a different budget, add `[analysis].max_content_attempts` then. Consequence: lowering the
+translation content-retry budget also lowers analysis's; documented here so it is not a surprise.
+
+### ADR-033 `--dry-run` analysis persists nothing (Cached<DryRun>, no Metered)
+Context (M5-A, M5-AC5, `LLM.md` §9): a dry run must leave the database byte-unchanged while still
+running the real plan and prompts. The spec permits either a rolled-back transaction or `dry_run = 1`
+`llm_calls` rows deleted at the end. Decision: `pipeline::analysis::dry_run_analysis` writes **nothing**
+— it drives the real plan and prompts through `Cached<DryRun>` (real local-cache *lookups*, which are
+reads; a hit is free; a miss is estimated by `DryRun`), never attaches the `Metered` layer (so no
+`llm_calls` rows are written), and never commits a cache payload or an analysis version. The
+`DryRun` transport returns empty text, so the dry-run path deliberately does not validate/parse a
+document — it only estimates tokens and cost and reports the plan (mode, chunk count, calls, tokens,
+cost). This is the strongest guarantee (nothing to clean up) and the preferred option in the brief.
+Consequence: the dry-run estimate reflects local-cache hits as free but does not record a ledger row;
+the reduce input is approximated by the chunk transcripts (we have no real partials), which tends to
+overestimate — the safe direction for a cost warning (consistent with ADR-029).
+
+### ADR-034 Analysis executes via the `analyze` command, not inside `run` (M5-A)
+Context (M5-A): the brief asks that `run` execute analysis end-to-end and then stop at the
+analysis-review gate. Doing so requires `run` to hold an LLM transport. The existing M4 orchestrator
+tests pin `run` stopping at the analysis *boundary* (`RunOutcome::StoppedAtStage(Analysis)`, exit 0,
+naming `analyze`), and the test rule forbids weakening them; more importantly, giving `run` an implicit
+real transport would make those (and any) `run` tests touch the network, violating the offline-test
+rule, while adding a transport parameter would break every existing `run` caller/test at compile time.
+Decision for this slice: deliver analysis execution through the `analyze` command (which `main` wires
+with the Gemini transport, or `DryRun` for `--dry-run`), leaving `run`'s M4 behaviour intact — it still
+stops at the analysis boundary and names `analyze`. After `analyze` completes, a subsequent `run`
+already reaches the analysis-review gate and returns exit 3 (ADR-031), so the pipeline flow is correct;
+only the "one `run` invocation does everything" convenience is deferred. Full `run`-drives-analysis
+wiring (with an injected transport and updated `run` tests) is left to a follow-up once a transport
+injection seam for `run` is designed. The minimal `approve_current_analysis` helper (for a future
+`--auto-approve analysis`) is implemented in `repo_analysis` but not yet wired into `run`.

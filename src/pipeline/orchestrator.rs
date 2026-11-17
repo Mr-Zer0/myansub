@@ -406,8 +406,10 @@ fn extension_of(source: &Path) -> Option<&str> {
     source.extension().and_then(|e| e.to_str())
 }
 
-/// Reads the full [`ProjectState`] from the store in one short closure.
-async fn load_state(store: &Store) -> Result<ProjectState, PipelineError> {
+/// Reads the full [`ProjectState`] from the store in one short closure. Public so
+/// command handlers (e.g. `analyze`) can evaluate a stage gate with [`can_run`]
+/// without duplicating the per-stage reads.
+pub async fn load_state(store: &Store) -> Result<ProjectState, PipelineError> {
     let state = store
         .call(|conn| {
             let stage = |s: Stage| -> Result<StageStatus, crate::store::StoreError> {

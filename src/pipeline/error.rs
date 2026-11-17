@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use crate::formats::codec::FormatError;
 use crate::formats::encoding::EncodingError;
+use crate::llm::client::LlmError;
 use crate::project::ProjectError;
 use crate::store::StoreError;
 
@@ -59,6 +60,12 @@ pub enum PipelineError {
     #[error("confirmation required: stdin is not a TTY; pass `{flag}` to proceed")]
     ConfirmationNeeded { flag: String },
 
+    /// A real (non-dry-run) LLM command was invoked without a Gemini API key
+    /// (`docs/LLM.md` §1). A clear, actionable message; maps to exit code 1 (a
+    /// generic error, not a pipeline precondition).
+    #[error("GEMINI_API_KEY is not set; export it (or add it to a `.env` file) to run analysis")]
+    MissingApiKey,
+
     /// Project resolution failed (`docs/CLI.md` §2). Maps to exit code 3 (except
     /// an unreadable directory, which is a generic error).
     #[error(transparent)]
@@ -75,6 +82,14 @@ pub enum PipelineError {
     /// A persistence operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    /// An LLM call failed terminally (after transport retries), e.g. a fatal
+    /// request error, or the operation was cancelled during a call. A cancelled
+    /// call maps to exit 130; every other terminal `LlmError` to exit 1. Content
+    /// (validation) failures are *not* errors — they surface as a
+    /// completed-with-failures outcome (exit 4), never this variant.
+    #[error(transparent)]
+    Llm(#[from] LlmError),
 
     /// A filesystem operation failed (reading the source, creating the project
     /// directory).
