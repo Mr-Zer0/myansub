@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use myansub::cli::{AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, RunArgs, ServiceTier};
+use myansub::cli::{
+    AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, RunArgs, ServiceTier,
+};
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
-use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, exit};
+use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
 use myansub::llm::client::Secret;
 use myansub::llm::pricing::{Cost, PriceTable};
 use myansub::llm::{Estimator, Gemini, RetryConfig};
@@ -19,6 +21,7 @@ use myansub::pipeline::analysis::{
     analysis_exit_code, dry_run_analysis, parse_thinking, parse_tier, prepare_analysis,
     run_analysis,
 };
+use myansub::pipeline::input::check_source_unchanged;
 use myansub::pipeline::input::{InitOutcome, run_init};
 use myansub::pipeline::orchestrator::{
     AutoApproveGate, RunOptions, RunOutcome, RunRequest, StatusReport, run as run_pipeline,
@@ -26,6 +29,8 @@ use myansub::pipeline::orchestrator::{
 };
 use myansub::pipeline::scheduler::SchedulerConfig;
 use myansub::project::{project_db_path, resolve_project};
+use myansub::review::EnvEditorLauncher;
+use myansub::review::analysis as analysis_review;
 use myansub::store::repo_project::get_project;
 use myansub::store::{StageStatus, Store};
 use tokio_util::sync::CancellationToken;
@@ -78,6 +83,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Run(args) => run_run_command(cli, args),
         Command::Status => run_status_command(cli),
         Command::Analyze(args) => run_analyze_command(cli, args),
+        Command::Analysis { command } => run_analysis_review_command(cli, command),
         other => not_implemented(command_name(other)),
     }
 }
@@ -341,6 +347,85 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
     code.map_err(anyhow::Error::new)
 }
 
+/// Handles `myansub analysis show|edit|export|import|approve` (docs/CLI.md §6).
+/// Resolves the project, opens the store, and dispatches to the review module. A
+/// missing current analysis maps to exit 3 (precondition); validation failures and
+/// I/O to exit 1 (see [`exit_code_for`]).
+fn run_analysis_review_command(cli: &Cli, command: &AnalysisCommand) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
+    // Validate configuration at startup (docs/CONFIG.md §5).
+    let _config = load_config(cli, &location.dir)?;
+
+    let db = project_db_path(&location.dir);
+    if !db.is_file() {
+        return Err(PipelineError::Uninitialized {
+            dir: location.dir.clone(),
+        }
+        .into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    runtime.block_on(async {
+        let store = Store::open(&db)?;
+        let Some(project) = store.call(|conn| get_project(conn)).await? else {
+            return Err::<i32, anyhow::Error>(
+                PipelineError::Uninitialized {
+                    dir: location.dir.clone(),
+                }
+                .into(),
+            );
+        };
+
+        match command {
+            AnalysisCommand::Show { json } => {
+                let rendered = analysis_review::show(&store, *json).await?;
+                print!("{rendered}");
+                Ok(exit::SUCCESS)
+            }
+            AnalysisCommand::Export { path } => {
+                analysis_review::export(&store, path).await?;
+                println!("exported current analysis to {}", path.display());
+                Ok(exit::SUCCESS)
+            }
+            AnalysisCommand::Import { path } => {
+                // Cues are read during range validation, so the source must be
+                // unchanged (docs/ARCHITECTURE.md §6 rule 5).
+                check_source_unchanged(&store, Path::new(&project.source_path)).await?;
+                // The file read is blocking I/O, so it runs on the blocking pool
+                // rather than an async worker (docs/ARCHITECTURE.md §7).
+                let read_path = path.clone();
+                let content = tokio::task::spawn_blocking(move || {
+                    myansub::review::editor::read_file(&read_path)
+                })
+                .await
+                .context("read import file")??;
+                let version = analysis_review::import_doc(&store, &content).await?;
+                println!(
+                    "imported analysis as version {version} (unapproved); \
+                     run `myansub analysis approve` to approve it."
+                );
+                Ok(exit::SUCCESS)
+            }
+            AnalysisCommand::Edit => {
+                check_source_unchanged(&store, Path::new(&project.source_path)).await?;
+                let version =
+                    analysis_review::edit(&store, EnvEditorLauncher, &location.dir).await?;
+                println!(
+                    "edited analysis stored as version {version} (unapproved); \
+                     run `myansub analysis approve` to approve it."
+                );
+                Ok(exit::SUCCESS)
+            }
+            AnalysisCommand::Approve => {
+                let version = analysis_review::approve(&store).await?;
+                println!("approved analysis version {version}.");
+                Ok(exit::SUCCESS)
+            }
+        }
+    })
+}
+
 /// Builds [`AnalysisParams`] from the resolved config and the project source hash.
 fn analysis_params(config: &Config, source_hash: &str) -> AnalysisParams {
     AnalysisParams {
@@ -518,6 +603,9 @@ fn load_config_with(
 fn exit_code_for(err: &anyhow::Error) -> i32 {
     for cause in err.chain() {
         if let Some(e) = cause.downcast_ref::<PipelineError>() {
+            return e.exit_code();
+        }
+        if let Some(e) = cause.downcast_ref::<ReviewError>() {
             return e.exit_code();
         }
         if let Some(e) = cause.downcast_ref::<ProjectError>() {

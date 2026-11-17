@@ -11,6 +11,7 @@ pub use crate::formats::encoding::EncodingError;
 pub use crate::llm::client::LlmError;
 pub use crate::pipeline::PipelineError;
 pub use crate::project::ProjectError;
+pub use crate::review::ReviewError;
 pub use crate::store::StoreError;
 
 /// Process exit codes, per `docs/CLI.md` §7.
@@ -96,6 +97,19 @@ impl ExitCode for PipelineError {
             PipelineError::Store(err) => err.exit_code(),
             PipelineError::Llm(err) => err.exit_code(),
             PipelineError::Io { .. } => exit::ERROR,
+        }
+    }
+}
+
+impl ExitCode for ReviewError {
+    /// A missing current analysis is a precondition (exit 3, `docs/CLI.md` §7).
+    /// Parse failures, validation violations, editor failures, I/O, and wrapped
+    /// store errors are generic errors (exit 1).
+    fn exit_code(&self) -> i32 {
+        match self {
+            ReviewError::NoCurrentAnalysis => exit::PRECONDITION,
+            ReviewError::Store(err) => err.exit_code(),
+            _ => exit::ERROR,
         }
     }
 }

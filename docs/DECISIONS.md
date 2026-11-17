@@ -289,3 +289,34 @@ only the "one `run` invocation does everything" convenience is deferred. Full `r
 wiring (with an injected transport and updated `run` tests) is left to a follow-up once a transport
 injection seam for `run` is designed. The minimal `approve_current_analysis` helper (for a future
 `--auto-approve analysis`) is implemented in `repo_analysis` but not yet wired into `run`.
+
+### ADR-035 Analysis user-import: manual strict validation + provenance carry-forward (M5-B)
+Context (M5-B, M5-AC3, `DATA_MODEL.md` §3/§6): user import must reject unknown fields (strict) and the
+§3 rules **each with the field location** ("characters[3].gender", "address_matrix[1].from references
+unknown character 'c9'", "scenes[2].cue_range not ascending", "scenes[1] and scenes[2] overlap",
+"glossary[4]: keep=true but target != term"). `DATA_MODEL.md` §3 names `serde deny_unknown_fields` as
+the strict mechanism, but serde's `deny_unknown_fields` reports a byte line/column, not a logical path,
+so it cannot by itself satisfy "with field locations". Decision: `review::analysis` validates the
+imported document by walking a `serde_json::Value` against explicit per-object field allowlists and the
+§3 rules, **collecting** `Violation { location, message }` entries whose `location` is the logical path.
+This delivers the same observable strictness (unknown fields rejected on the user path; the LLM-output
+path in `pipeline::analysis::validate_full` stays lenient and is untouched) while meeting the
+location requirement. Second decision: a user-imported version is `origin = user`, `approved = 0`, and
+**carries forward the edited version's `source_digest` and `signature`** — provenance stays in table
+columns (never the JSON, §6); the `origin` column is what records user authorship, and the carried-over
+signature keeps the `prompt_vN|model` lineage the edit derives from valid. Import is all-or-nothing:
+validate fully, then insert the version and set `analysis_review → completed` in one transaction
+(`ARCHITECTURE.md` §6 rule 7); `approve` marks the current version approved and `analysis_review →
+approved` in one transaction. The editor launch is behind an injectable `EditorLauncher` trait so the
+edit round-trip is tested offline without a real `$EDITOR` (`TESTING.md` §1).
+
+Required keys: strict import mirrors the Gemini response schema's `required` set (`llm/schemas.rs`) —
+`schema_version`, `premise`, `characters`, and `scenes` must be *present* (empty arrays are allowed for
+`characters`/`scenes`). So a user who deletes one of those top-level keys is rejected ("`premise`: is
+required", "`characters`: is required", etc.), while `tone`, `address_matrix`, `glossary`, `style_rules`,
+and `unresolved_ambiguities` remain optional. Per-element required fields follow §3 (character `id`/
+`name`/`gender`/`age_group`; address_matrix `from`/`to`/`register`; glossary `term`/`target`/`keep`;
+scene `cue_range`/`summary`). Note: to keep validation work bounded on a pathological over-cap array,
+an over-cap array records its cap violation and then only its first `cap` elements are walked (the import
+is rejected regardless). Length limits use `chars().count()` (not graphemes), judged defensible for the
+analysis document's prose fields.
