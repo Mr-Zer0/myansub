@@ -310,6 +310,18 @@ validate fully, then insert the version and set `analysis_review → completed` 
 approved` in one transaction. The editor launch is behind an injectable `EditorLauncher` trait so the
 edit round-trip is tested offline without a real `$EDITOR` (`TESTING.md` §1).
 
+### ADR-036 Translation retry reminder ships at the existing `PROMPT_VERSION` (M6-B1)
+Context (M6-B1, `LLM.md` §6, `CLAUDE.md` "Prompt changes bump `PROMPT_VERSION`"): the tier-1 content
+retry appends a strict reminder to the batch request. The analysis stage's reminder
+(`strict_retry_reminder`) names the "analysis schema", so translation needs its own text. A new
+`prompts::translation_retry_reminder()` was added. Normally new prompt text bumps `PROMPT_VERSION`, but
+`PROMPT_VERSION` is `1` and asserted `== 1` by an existing test (`tests/llm_support.rs`), and the whole
+translation prompt surface (system instruction, variable-block builder, response schema) already shipped
+at `PROMPT_VERSION = 1` in M5/M6-A. Decision: the reminder ships at `PROMPT_VERSION = 1` as part of that
+same, not-yet-run translation prompt surface. This invalidates nothing: the translation stage has never
+produced a cached response, and the analysis prompts are unchanged. A future edit to any *already-used*
+prompt still requires a bump.
+
 Required keys: strict import mirrors the Gemini response schema's `required` set (`llm/schemas.rs`) —
 `schema_version`, `premise`, `characters`, and `scenes` must be *present* (empty arrays are allowed for
 `characters`/`scenes`). So a user who deletes one of those top-level keys is rejected ("`premise`: is

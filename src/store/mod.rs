@@ -18,6 +18,7 @@ pub mod repo_analysis;
 pub mod repo_cues;
 pub mod repo_llm;
 pub mod repo_project;
+pub mod repo_translations;
 pub mod repo_units;
 
 pub use atomic::{StagedWrite, atomic_write};
@@ -30,4 +31,8 @@ pub use repo_analysis::{
 pub use repo_cues::{insert_cues, insert_cues_in_tx, load_cues};
 pub use repo_llm::{CacheRow, ModelUsage, usage_by_model};
 pub use repo_project::{Project, Stage, StageStatus, clear_all_data};
+pub use repo_translations::{
+    NewTranslation, TranslationHistoryRow, TranslationOrigin, TranslationRow, cue_id_by_idx,
+    get_translation, list_translations, upsert_translation, upsert_translation_in_tx,
+};
 pub use repo_units::{AnalysisChunk, NewTranslationBatch, TranslationBatch, UnitStatus};

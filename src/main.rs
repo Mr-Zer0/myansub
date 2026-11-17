@@ -10,6 +10,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use myansub::cli::{
     AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, RunArgs, ServiceTier,
+    TranslateArgs,
 };
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
@@ -28,6 +29,11 @@ use myansub::pipeline::orchestrator::{
     run_exit_code, status as gather_status,
 };
 use myansub::pipeline::scheduler::SchedulerConfig;
+use myansub::pipeline::translation::{
+    DryRunReport as TranslationDryRunReport, TranslationFlags, TranslationOutcome,
+    TranslationParams, dry_run_translation, prepare_translation, run_translation,
+    translation_exit_code,
+};
 use myansub::project::{project_db_path, resolve_project};
 use myansub::review::EnvEditorLauncher;
 use myansub::review::analysis as analysis_review;
@@ -84,6 +90,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Status => run_status_command(cli),
         Command::Analyze(args) => run_analyze_command(cli, args),
         Command::Analysis { command } => run_analysis_review_command(cli, command),
+        Command::Translate(args) => run_translate_command(cli, args),
         other => not_implemented(command_name(other)),
     }
 }
@@ -345,6 +352,152 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
 
     // A typed PipelineError (gate, source, store, LLM) propagates for exit mapping.
     code.map_err(anyhow::Error::new)
+}
+
+/// Handles `myansub translate [--model M] [--tier T] [--concurrency N] [--dry-run]`
+/// (docs/CLI.md §6). Resolves the project, enforces the translation gate (current
+/// analysis approved), builds the LLM stack (DryRun for `--dry-run`, otherwise the
+/// Gemini transport from `GEMINI_API_KEY`), runs the translation stage, and maps the
+/// outcome to an exit code (0 ok / 4 failed units / 3 precondition / 130 interrupt).
+///
+/// `--stale`/`--redo`/`--retry-failed` are accepted but deferred to M6-B2; they are
+/// threaded through and currently have no effect.
+fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
+    let overrides = CliOverrides {
+        translation_model: args.model.clone(),
+        service_tier: args.tier.map(tier_label),
+        concurrency: args.concurrency,
+        ..CliOverrides::default()
+    };
+    let config = load_config_with(cli, &location.dir, overrides)?;
+
+    let db = project_db_path(&location.dir);
+    if !db.is_file() {
+        return Err(PipelineError::Uninitialized {
+            dir: location.dir.clone(),
+        }
+        .into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    let token = CancellationToken::new();
+    let code = runtime.block_on(async {
+        let store = Store::open(&db)?;
+        let Some(project) = store.call(|conn| get_project(conn)).await? else {
+            return Err(PipelineError::Uninitialized {
+                dir: location.dir.clone(),
+            });
+        };
+
+        // Source-hash check + translation gate (analysis approved) + load cues
+        // (docs/ARCHITECTURE.md §2/§6).
+        let cues = prepare_translation(&store, Path::new(&project.source_path)).await?;
+        let params = translation_params(&config);
+
+        if args.dry_run {
+            let prices = PriceTable::from_config(&config.pricing);
+            let report = dry_run_translation(&store, &cues, &params, &prices).await?;
+            print_translation_dry_run(&report);
+            return Ok(exit::SUCCESS);
+        }
+
+        // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6).
+        let signal_token = token.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_token.cancel();
+            }
+        });
+
+        let transport = build_gemini(&config)?;
+        let flags = TranslationFlags {
+            redo: args.redo,
+            retry_failed: args.retry_failed,
+            stale: args.stale,
+        };
+        let outcome = run_translation(transport, &store, &cues, &params, flags, &token).await?;
+        report_translation_outcome(&outcome);
+        Ok(translation_exit_code(token.is_cancelled(), &outcome))
+    });
+
+    code.map_err(anyhow::Error::new)
+}
+
+/// Builds [`TranslationParams`] from the resolved config (docs/CONFIG.md
+/// `[translation]`).
+fn translation_params(config: &Config) -> TranslationParams {
+    TranslationParams {
+        model: config.llm.models.translation.clone(),
+        tier: parse_tier(&config.llm.service_tier),
+        thinking: parse_thinking(&config.llm.thinking.translation),
+        batch_size: config.translation.batch_size,
+        context_before: config.translation.context_before,
+        context_after: config.translation.context_after,
+        max_content_attempts: config.translation.max_content_attempts,
+        output_ratio: config.translation.output_ratio,
+        estimator: Estimator {
+            bytes_per_token_latin: config.estimate.bytes_per_token_latin,
+            bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
+            bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
+        },
+        limits: (&config.quality).into(),
+        scheduler: SchedulerConfig {
+            concurrency: config.translation.concurrency.max(1) as usize,
+            warm_cache_first: config.translation.warm_cache_first,
+            grace: Duration::from_secs(config.output.grace_secs),
+        },
+        seed: clock_seed(),
+        retry: RetryConfig {
+            max_retries: config.llm.max_retries,
+            backoff_base_ms: config.llm.backoff_base_ms,
+            backoff_max_ms: config.llm.backoff_max_ms,
+            max_sheds_before_fallback: config.llm.max_sheds_before_fallback,
+            service_tier_fallback: config.llm.service_tier_fallback,
+        },
+    }
+}
+
+/// Prints where the translation stage stopped and the next action (docs/CLI.md §6).
+fn report_translation_outcome(outcome: &TranslationOutcome) {
+    match outcome {
+        TranslationOutcome::Completed { batches } => {
+            println!(
+                "translation complete; {batches} batch(es) done. \
+                 Next: `myansub review approve` (or review with `myansub review list`)."
+            );
+        }
+        TranslationOutcome::NothingToDo => {
+            println!("no translatable cues to translate.");
+        }
+        TranslationOutcome::CompletedWithFailures { failed } => {
+            println!(
+                "translation finished with {failed} failed batch(es). \
+                 See them with `myansub status`; automatic retry of failed batches \
+                 lands in a later step."
+            );
+        }
+        TranslationOutcome::Interrupted => {
+            println!("interrupted; re-run `myansub translate` to resume.");
+        }
+    }
+}
+
+/// Prints the `translate --dry-run` estimate (docs/CLI.md §6, docs/LLM.md §9).
+fn print_translation_dry_run(report: &TranslationDryRunReport) {
+    println!("Translation dry run:");
+    println!("  batches:          {}", report.batches);
+    println!("  LLM calls:        {}", report.calls);
+    println!(
+        "  estimated tokens: input {} / output {}",
+        report.estimated_prompt_tokens, report.estimated_output_tokens
+    );
+    match report.estimated_cost {
+        Cost::Known(usd) => println!("  estimated cost:  ${usd:.4}"),
+        Cost::Unknown => println!("  estimated cost:  unknown (no price entry for the model)"),
+    }
+    println!("(dry run: nothing was written to the database.)");
 }
 
 /// Handles `myansub analysis show|edit|export|import|approve` (docs/CLI.md §6).

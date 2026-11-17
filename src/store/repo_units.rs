@@ -466,6 +466,18 @@ pub fn reset_analysis_chunk(conn: &Connection, chunk_no: i64) -> Result<bool, St
     Ok(changed == 1)
 }
 
+/// Resets one `in_flight` translation batch back to `pending` (the scheduler's
+/// per-unit recovery seam, `docs/ARCHITECTURE.md` §4.1), bumping `updated_at`.
+/// Returns whether a row changed. A batch in any other state is left untouched.
+pub fn reset_translation_batch(conn: &Connection, batch_no: i64) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "UPDATE translation_batches SET status = 'pending', updated_at = datetime('now') \
+         WHERE batch_no = ?1 AND status = 'in_flight'",
+        params![batch_no],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Requeues every `failed` analysis chunk back to `pending` so a `--retry-failed`
 /// run reruns only the failures (`docs/CLI.md` §6). `attempts` is preserved as the
 /// running count. Returns the number of chunks requeued.

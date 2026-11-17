@@ -50,6 +50,17 @@ pub fn strict_retry_reminder() -> String {
         .to_string()
 }
 
+/// The strict reminder appended to a translation batch's request on a content
+/// retry (`docs/LLM.md` §6). This is prompt text: any edit must bump
+/// [`PROMPT_VERSION`]. Introduced with the translation stage, so it ships at the
+/// same [`PROMPT_VERSION`] as the rest of the translation prompt surface.
+pub fn translation_retry_reminder() -> String {
+    "Your previous response was not valid JSON matching the required schema. Respond with ONLY a \
+     single JSON object of the form {\"lines\":[{\"id\":<integer>,\"t\":\"<translation>\"}]} — one \
+     entry per line to translate, no prose, no code fences."
+        .to_string()
+}
+
 /// The instruction heading the map-reduce reduce call's variable block
 /// (`docs/LLM.md` §2). This is prompt text: any edit must bump [`PROMPT_VERSION`].
 pub fn analysis_reduce_instruction() -> String {

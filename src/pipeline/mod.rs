@@ -12,6 +12,7 @@ pub mod error;
 pub mod input;
 pub mod orchestrator;
 pub mod scheduler;
+pub mod translation;
 
 pub use analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, AnalysisParams, DryRunReport,
@@ -24,3 +25,7 @@ pub use orchestrator::{
     run, run_exit_code, status,
 };
 pub use scheduler::{SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};
+pub use translation::{
+    TranslationFlags, TranslationOutcome, TranslationParams, dry_run_translation,
+    prepare_translation, run_translation, translation_exit_code,
+};
