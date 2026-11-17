@@ -40,6 +40,10 @@ pub enum StoreError {
     /// A blocking database task failed to complete (panicked or was cancelled).
     #[error("database task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    /// The database held a value this code does not recognise (e.g. an unknown
+    /// status label), indicating corruption or a version mismatch.
+    #[error("unexpected value in database: {0}")]
+    Unexpected(String),
 }
 
 /// A handle to the project database.
@@ -70,6 +74,10 @@ impl Store {
     fn from_connection(mut conn: Connection) -> Result<Store, StoreError> {
         apply_pragmas(&conn)?;
         run_migrations(&mut conn)?;
+        // Crash recovery (`docs/ARCHITECTURE.md` §6 rule 2): any unit left
+        // `in_flight` by a previous crashed run is reset to `pending` on open.
+        // This is a no-op on a fresh database.
+        super::repo_units::recover(&mut conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -94,6 +102,14 @@ impl Store {
             Ok(result) => result,
             Err(join_err) => Err(StoreError::from(join_err)),
         }
+    }
+
+    /// Resets every `in_flight` unit back to `pending` (`docs/ARCHITECTURE.md`
+    /// §6 rule 2). This runs automatically on [`Store::open`]; it is exposed so
+    /// callers (and tests) can trigger recovery explicitly. Returns the number of
+    /// units reset.
+    pub async fn recover(&self) -> Result<usize, StoreError> {
+        self.call(super::repo_units::recover).await
     }
 }
 
