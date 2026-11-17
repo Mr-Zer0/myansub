@@ -67,6 +67,20 @@ fn invalid_cache_provider_names_the_key() {
 }
 
 #[test]
+fn drift_ratio_below_one_names_the_key() {
+    // drift_ratio < 1.0 makes boundary_drift over-flag (low = med/ratio → inf).
+    let err =
+        load_toml("[quality]\ndrift_ratio = 0.0\n").expect_err("should reject drift_ratio 0.0");
+    assert!(
+        err.to_string().contains("quality.drift_ratio"),
+        "error should name quality.drift_ratio, got: {err}"
+    );
+    let err =
+        load_toml("[quality]\ndrift_ratio = 0.5\n").expect_err("should reject drift_ratio 0.5");
+    assert!(err.to_string().contains("quality.drift_ratio"));
+}
+
+#[test]
 fn unknown_key_is_rejected() {
     let err = load_toml("[translation]\nnot_a_real_key = 1\n").expect_err("unknown key rejected");
     assert!(err.to_string().contains("not_a_real_key"));

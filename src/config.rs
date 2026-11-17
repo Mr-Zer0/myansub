@@ -157,6 +157,22 @@ pub struct Quality {
     pub drift_ratio: f64,
 }
 
+/// Bridges the `[quality]` config to the pure [`quality::Limits`] the checks
+/// consume. The mapping lives here (not in `quality`) so `quality`'s only crate
+/// dependency stays `domain` (ADR-010).
+///
+/// [`quality::Limits`]: crate::quality::checks::Limits
+impl From<&Quality> for crate::quality::checks::Limits {
+    fn from(q: &Quality) -> Self {
+        Self {
+            max_graphemes_per_line: q.max_graphemes_per_line,
+            max_lines: q.max_lines,
+            max_gps: q.max_gps,
+            drift_ratio: q.drift_ratio,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Estimate {
@@ -521,6 +537,12 @@ impl Config {
                     "must be one of flex, standard; got `{}`",
                     self.llm.service_tier
                 ),
+            });
+        }
+        if self.quality.drift_ratio < 1.0 {
+            return Err(ConfigError::Invalid {
+                key: "quality.drift_ratio".to_string(),
+                message: format!("must be at least 1.0, got {}", self.quality.drift_ratio),
             });
         }
         if !matches!(

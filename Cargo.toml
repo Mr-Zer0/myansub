@@ -39,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 sha2 = "0.10"
+unicode-segmentation = "1"
 
 [features]
 # Scripted `llm::fake` transport for tests. Enabled for this crate's own unit

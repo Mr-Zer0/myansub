@@ -12,5 +12,6 @@ pub mod formats;
 pub mod llm;
 pub mod pipeline;
 pub mod project;
+pub mod quality;
 pub mod review;
 pub mod store;

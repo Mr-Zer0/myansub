@@ -90,7 +90,7 @@ Same-format output is the only lossless path (ASS styles survive). `--output-for
 ### ADR-021 Standard Unicode Myanmar only
 The product supports only standard Unicode Burmese; Zawgyi is not supported anywhere. LLMs
 can still occasionally emit legacy-ordered text, so a deterministic check
-(`invalid_myanmar_unicode`) guards the output and triggers a retry. It enforces the
+(`zawgyi_suspect`) guards the output and triggers a retry. It enforces the
 Unicode-only rule; it is not a conversion feature.
 
 ### ADR-022 Codec dependency surface and fallback write path
