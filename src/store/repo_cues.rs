@@ -12,39 +12,48 @@ use crate::domain::Cue;
 /// Bulk-inserts `cues` in one transaction (`docs/ARCHITECTURE.md` §6).
 pub fn insert_cues(conn: &mut Connection, cues: &[Cue]) -> Result<(), StoreError> {
     let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO cues \
-             (idx, start_ms, end_ms, text_raw, text_masked, lead_tags, \
-              inline_tags, style, speaker, translatable) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        )?;
-        for cue in cues {
-            let inline_tags = serde_json::to_string(&cue.inline_tags)
-                .map_err(|err| StoreError::Unexpected(format!("serialize inline_tags: {err}")))?;
-            // SQLite integers are signed i64; millisecond timings fit comfortably,
-            // but convert fallibly rather than wrap a pathological value silently.
-            let start_ms = i64::try_from(cue.start_ms).map_err(|_| {
-                StoreError::Unexpected(format!("start_ms out of range: {}", cue.start_ms))
-            })?;
-            let end_ms = i64::try_from(cue.end_ms).map_err(|_| {
-                StoreError::Unexpected(format!("end_ms out of range: {}", cue.end_ms))
-            })?;
-            stmt.execute(params![
-                cue.idx,
-                start_ms,
-                end_ms,
-                cue.text_raw,
-                cue.text_masked,
-                cue.lead_tags,
-                inline_tags,
-                cue.style,
-                cue.speaker,
-                cue.translatable,
-            ])?;
-        }
-    }
+    insert_cues_in_tx(&tx, cues)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Bulk-inserts `cues` using a caller-supplied connection, *without* opening its
+/// own transaction.
+///
+/// The input stage groups the project row, cues, and stage state into a single
+/// transaction (`docs/ARCHITECTURE.md` §6 rule 1), so it needs an insert that
+/// participates in an existing transaction rather than starting a nested one.
+/// [`insert_cues`] wraps this in its own transaction for standalone callers.
+pub fn insert_cues_in_tx(conn: &Connection, cues: &[Cue]) -> Result<(), StoreError> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO cues \
+         (idx, start_ms, end_ms, text_raw, text_masked, lead_tags, \
+          inline_tags, style, speaker, translatable) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    for cue in cues {
+        let inline_tags = serde_json::to_string(&cue.inline_tags)
+            .map_err(|err| StoreError::Unexpected(format!("serialize inline_tags: {err}")))?;
+        // SQLite integers are signed i64; millisecond timings fit comfortably,
+        // but convert fallibly rather than wrap a pathological value silently.
+        let start_ms = i64::try_from(cue.start_ms).map_err(|_| {
+            StoreError::Unexpected(format!("start_ms out of range: {}", cue.start_ms))
+        })?;
+        let end_ms = i64::try_from(cue.end_ms)
+            .map_err(|_| StoreError::Unexpected(format!("end_ms out of range: {}", cue.end_ms)))?;
+        stmt.execute(params![
+            cue.idx,
+            start_ms,
+            end_ms,
+            cue.text_raw,
+            cue.text_masked,
+            cue.lead_tags,
+            inline_tags,
+            cue.style,
+            cue.speaker,
+            cue.translatable,
+        ])?;
+    }
     Ok(())
 }
 

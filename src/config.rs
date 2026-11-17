@@ -331,6 +331,29 @@ pub fn load(sources: &ConfigSources) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+/// Assembles [`ConfigSources`] from candidate filesystem paths.
+///
+/// The global and project file layers are included only when they exist on disk
+/// (a missing one is not an error, `docs/CONFIG.md` §1). The `--config` layer is
+/// passed through unconditionally, so a missing file given with `--config`
+/// becomes a hard read error at [`load`]. This is where configuration first
+/// loads from disk, so the existence filter lives here (M0 reliability fix).
+pub fn sources_from_paths(
+    global_file: Option<PathBuf>,
+    project_file: Option<PathBuf>,
+    config_file: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    overrides: CliOverrides,
+) -> ConfigSources {
+    ConfigSources {
+        global_file: global_file.filter(|p| p.is_file()),
+        project_file: project_file.filter(|p| p.is_file()),
+        config_file,
+        env,
+        overrides,
+    }
+}
+
 /// Platform global config path: `<config_dir>/myansub/config.toml`.
 ///
 /// Resolved from `XDG_CONFIG_HOME`/`HOME` on Unix and `APPDATA` on Windows

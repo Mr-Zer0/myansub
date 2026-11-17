@@ -11,4 +11,5 @@ pub mod error;
 pub mod formats;
 pub mod llm;
 pub mod pipeline;
+pub mod project;
 pub mod store;

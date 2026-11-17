@@ -21,7 +21,7 @@ pub mod repo_units;
 
 pub use atomic::{StagedWrite, atomic_write};
 pub use db::{Store, StoreError};
-pub use repo_cues::{insert_cues, load_cues};
+pub use repo_cues::{insert_cues, insert_cues_in_tx, load_cues};
 pub use repo_llm::CacheRow;
-pub use repo_project::{Project, Stage, StageStatus};
+pub use repo_project::{Project, Stage, StageStatus, clear_all_data};
 pub use repo_units::{AnalysisChunk, NewTranslationBatch, TranslationBatch, UnitStatus};

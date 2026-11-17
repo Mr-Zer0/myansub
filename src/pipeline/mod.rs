@@ -7,6 +7,9 @@
 //! `orchestrator` and per-stage modules (`input`, `analysis`, `translation`,
 //! `output`) arrive in later M4 slices.
 
+pub mod error;
+pub mod input;
 pub mod scheduler;
 
+pub use error::PipelineError;
 pub use scheduler::{SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};

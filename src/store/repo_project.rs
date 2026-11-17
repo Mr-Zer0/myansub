@@ -49,6 +49,36 @@ pub fn insert_project(conn: &Connection, project: &Project) -> Result<(), StoreE
     Ok(())
 }
 
+/// Deletes every row from every project-scoped table, using a caller-supplied
+/// connection without opening its own transaction.
+///
+/// This is the destructive half of `init --force` (`docs/CLI.md` §6): when the
+/// source changed, the old project data is wiped before the input stage
+/// repopulates it. The input stage runs this and the re-insert inside one
+/// transaction so a crash leaves either the old data intact or the new data fully
+/// in place (`docs/ARCHITECTURE.md` §6). Running it on an empty database is a
+/// harmless no-op, so the input stage can call it unconditionally.
+pub fn clear_all_data(conn: &Connection) -> Result<(), StoreError> {
+    // Children before parents so foreign keys never block a delete.
+    const TABLES: &[&str] = &[
+        "translation_history",
+        "translations",
+        "translation_batches",
+        "analysis",
+        "analysis_chunks",
+        "cues",
+        "stage_state",
+        "project",
+        "llm_cache",
+        "llm_calls",
+        "provider_cache",
+    ];
+    for table in TABLES {
+        conn.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    Ok(())
+}
+
 /// Reads the project row, if any.
 pub fn get_project(conn: &Connection) -> Result<Option<Project>, StoreError> {
     let project = conn
