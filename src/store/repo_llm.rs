@@ -159,6 +159,56 @@ pub fn count_calls(conn: &Connection) -> Result<usize, StoreError> {
     Ok(count.max(0) as usize)
 }
 
+/// Token usage for one `(model, service_tier)` group, summed over `llm_calls`
+/// (`docs/DATA_MODEL.md` §2). Used by `status` to report usage and estimate cost
+/// (`docs/CLI.md` §6, `docs/LLM.md` §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub model: String,
+    /// The `service_tier` label stored on the calls (`flex`/`standard`), or `None`
+    /// when the column was null.
+    pub service_tier: Option<String>,
+    pub usage: Usage,
+}
+
+/// Aggregates `llm_calls` token counts grouped by `(model, service_tier)`.
+///
+/// Local cache hits and dry-run calls are included with their recorded (zero)
+/// token counts, matching how they were metered (`docs/ARCHITECTURE.md` §5). An
+/// empty table yields an empty vector, so `status` reports zeroed usage on a fresh
+/// project without any special-casing.
+pub fn usage_by_model(conn: &Connection) -> Result<Vec<ModelUsage>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT model, service_tier, \
+         COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(cached_tokens), 0), \
+         COALESCE(SUM(output_tokens), 0), COALESCE(SUM(thinking_tokens), 0) \
+         FROM llm_calls \
+         GROUP BY model, service_tier \
+         ORDER BY model, service_tier",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let prompt: i64 = row.get(2)?;
+        let cached: i64 = row.get(3)?;
+        let output: i64 = row.get(4)?;
+        let thinking: i64 = row.get(5)?;
+        out.push(ModelUsage {
+            model: row.get(0)?,
+            service_tier: row.get(1)?,
+            usage: Usage {
+                prompt_tokens: prompt.max(0) as u64,
+                cached_tokens: cached.max(0) as u64,
+                output_tokens: output.max(0) as u64,
+                thinking_tokens: thinking.max(0) as u64,
+                cache_hit_local: false,
+                applied_tier: None,
+            },
+        });
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Store-backed trait implementations (the one llm↔store seam)
 // ---------------------------------------------------------------------------

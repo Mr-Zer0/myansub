@@ -82,9 +82,12 @@ impl ExitCode for PipelineError {
     /// to their own mapping; I/O failures are generic errors (exit 1).
     fn exit_code(&self) -> i32 {
         match self {
-            PipelineError::SourceChanged { .. } | PipelineError::ConfirmationNeeded { .. } => {
-                exit::PRECONDITION
-            }
+            PipelineError::SourceChanged { .. }
+            | PipelineError::ConfirmationNeeded { .. }
+            | PipelineError::GateViolation { .. }
+            | PipelineError::FromDisagreement { .. }
+            | PipelineError::Uninitialized { .. }
+            | PipelineError::MissingFromLanguage => exit::PRECONDITION,
             PipelineError::ProjectResolution(err) => err.exit_code(),
             PipelineError::Format(err) => err.exit_code(),
             PipelineError::Encoding(err) => err.exit_code(),

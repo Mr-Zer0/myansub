@@ -9,7 +9,12 @@
 
 pub mod error;
 pub mod input;
+pub mod orchestrator;
 pub mod scheduler;
 
 pub use error::PipelineError;
+pub use orchestrator::{
+    NextStep, ProjectState, RunOptions, RunOutcome, RunRequest, StatusReport, can_run, next_step,
+    run, run_exit_code, status,
+};
 pub use scheduler::{SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};

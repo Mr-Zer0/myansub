@@ -231,3 +231,20 @@ excludes `service_tier` automatically because it is a request field, never part 
 records an `llm_calls` row with zero token counts and `cache_hit_local = 1` (cost 0) rather than echoing
 the originally-stored token counts, so any downstream cost sum is 0 regardless of whether it inspects
 the flag.
+
+### ADR-031 `run` graceful stop at an unapproved review gate exits 3 (action needed)
+Context (M4-C): `run` advances stages until it reaches a gate that is not approved, then stops and
+prints the next action (`ARCHITECTURE.md` §2, `CLI.md` §6). The exit-code table (`CLI.md` §7) lists
+"gate not approved" under exit 3 (precondition), but it is not obvious whether a *graceful* gate-stop
+(where `run` did useful work, printed guidance, and returned cleanly) should be exit 0 or exit 3.
+Decision: a `run` that stops at an unapproved review gate (`RunOutcome::StoppedAtGate`) exits **3** —
+it is a precondition/action-needed state, matching "gate not approved" in §7; the user must run the
+named approve command (or pass `--auto-approve`) before the pipeline can finish. A `run` that completes
+the whole pipeline (all gates approved or auto-approved, output written → `RunOutcome::Completed`) exits
+**0**. Cancellation still wins: `token.is_cancelled()` maps to 130 regardless of the outcome
+(`ARCHITECTURE.md` §6 rule 6). The M4-only transitional stop at the analysis boundary
+(`RunOutcome::StoppedAtStage`, because analysis execution lands in M5) maps to **0** for now; M5
+replaces that boundary with real gate/completion stops, at which point the analysis-review gate-stop
+follows the exit-3 rule above. Consequence: `myansub run … --auto-approve all --yes` that drives a
+project to a finished output returns 0, while an unattended `run` that halts awaiting a human approval
+returns 3, so scripts can distinguish "done" from "needs a human" without parsing output.

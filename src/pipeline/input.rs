@@ -84,7 +84,7 @@ pub async fn run_input_with_fault<H>(
 where
     H: FnOnce(&Connection) -> Result<(), StoreError> + Send + 'static,
 {
-    let bytes = read_source(source_path)?;
+    let bytes = read_source(source_path).await?;
     let source_hash = hash_source(&bytes);
 
     let decoded = encoding::decode(&bytes, encoding_override, Some(from_lang))?;
@@ -148,7 +148,7 @@ pub async fn check_source_unchanged(
     store: &Store,
     source_path: &Path,
 ) -> Result<(), PipelineError> {
-    let bytes = read_source(source_path)?;
+    let bytes = read_source(source_path).await?;
     let current = hash_source(&bytes);
     let stored = store
         .call(|conn| get_project(conn))
@@ -242,7 +242,7 @@ pub async fn run_init(
         return Ok(InitOutcome::Initialized(outcome));
     };
 
-    let bytes = read_source(source_path)?;
+    let bytes = read_source(source_path).await?;
     let changed = hash_source(&bytes) != existing.source_hash;
 
     match decide_reinit(changed, force, interactive, yes) {
@@ -294,12 +294,26 @@ fn confirm_destructive_reinit(source_path: &Path) -> bool {
     }
 }
 
-/// Reads the raw source bytes, mapping I/O failures with path context.
-fn read_source(source_path: &Path) -> Result<Vec<u8>, PipelineError> {
-    std::fs::read(source_path).map_err(|source| PipelineError::Io {
-        path: source_path.to_path_buf(),
-        source,
+/// Reads the raw source bytes on the blocking pool, mapping I/O failures with path
+/// context. The filesystem read runs inside [`tokio::task::spawn_blocking`] so it
+/// never stalls an async runtime worker (`docs/ARCHITECTURE.md` §7; consistent with
+/// the `init` confirmation prompt). A join failure (task panic/shutdown) surfaces
+/// as an I/O error against the source path.
+async fn read_source(source_path: &Path) -> Result<Vec<u8>, PipelineError> {
+    let path = source_path.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        let bytes = std::fs::read(&path);
+        (path, bytes)
     })
+    .await
+    {
+        Ok((_, Ok(bytes))) => Ok(bytes),
+        Ok((path, Err(source))) => Err(PipelineError::Io { path, source }),
+        Err(join) => Err(PipelineError::Io {
+            path: source_path.to_path_buf(),
+            source: std::io::Error::other(join),
+        }),
+    }
 }
 
 /// Computes `sha256:<hex>` over the raw source bytes (`docs/REQUIREMENTS.md`

@@ -14,7 +14,8 @@ use crate::formats::encoding::EncodingError;
 use crate::project::ProjectError;
 use crate::store::StoreError;
 
-/// Errors raised by the pipeline (input stage and the `init` command for M4-B).
+/// Errors raised by the pipeline (input stage, the `init` command, and the
+/// orchestrator's `run`/`status` for M4-C).
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     /// The source file's SHA-256 differs from the one recorded at `init`
@@ -24,6 +25,34 @@ pub enum PipelineError {
         path.display()
     )]
     SourceChanged { path: PathBuf },
+
+    /// A stage cannot run because its precondition in the stage state machine is
+    /// not met (`docs/ARCHITECTURE.md` §2). The message names the exact next
+    /// action the user must take. Maps to exit code 3.
+    #[error("{message}")]
+    GateViolation { message: String },
+
+    /// `run FILE --from <LANG>` was given a language that disagrees with the one
+    /// stored at `init` (`docs/CLI.md` §2). Maps to exit code 3.
+    #[error(
+        "project was initialized with `--from {stored}`, but `--from {given}` was given; \
+         omit --from to resume, or re-initialize with `init --force --from {given}`"
+    )]
+    FromDisagreement { stored: String, given: String },
+
+    /// A command that needs an initialized project found none — the project
+    /// directory has no project row, even if a `project.db` file is present
+    /// (`docs/CLI.md` §2). Maps to exit code 3.
+    #[error(
+        "no initialized project in `{}`; run `myansub init <FILE> --from <LANG>` first",
+        dir.display()
+    )]
+    Uninitialized { dir: PathBuf },
+
+    /// `run` must create the project (no project row exists) but no source
+    /// language was given (`docs/CLI.md` §2). Maps to exit code 3.
+    #[error("creating a project requires a source language; pass `--from <LANG>`")]
+    MissingFromLanguage,
 
     /// A destructive action needs confirmation, but stdin is not a TTY and the
     /// confirmation flag was not given (`docs/CLI.md` §5). Maps to exit code 3.

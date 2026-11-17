@@ -14,6 +14,7 @@
 pub mod atomic;
 pub mod db;
 pub mod migrations;
+pub mod repo_analysis;
 pub mod repo_cues;
 pub mod repo_llm;
 pub mod repo_project;
@@ -21,7 +22,8 @@ pub mod repo_units;
 
 pub use atomic::{StagedWrite, atomic_write};
 pub use db::{Store, StoreError};
+pub use repo_analysis::{CurrentAnalysis, current_analysis, current_analysis_approved};
 pub use repo_cues::{insert_cues, insert_cues_in_tx, load_cues};
-pub use repo_llm::CacheRow;
+pub use repo_llm::{CacheRow, ModelUsage, usage_by_model};
 pub use repo_project::{Project, Stage, StageStatus, clear_all_data};
 pub use repo_units::{AnalysisChunk, NewTranslationBatch, TranslationBatch, UnitStatus};
