@@ -45,6 +45,7 @@ fn input_tokens_billed_at_input_rate() {
         output_tokens: 0,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // 100k * 2.0 / 1M = 0.2
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 0.2);
@@ -59,6 +60,7 @@ fn cached_tokens_billed_at_cached_rate() {
         output_tokens: 0,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // fresh 60k * 2.0 + cached 40k * 0.5 = 120k + 20k = 140k tokens·USD/1M = 0.14
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 0.14);
@@ -73,6 +75,7 @@ fn output_tokens_billed_at_output_rate() {
         output_tokens: 500_000,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 4.0);
 }
@@ -86,6 +89,7 @@ fn thinking_tokens_billed_as_output() {
         output_tokens: 500_000,
         thinking_tokens: 500_000,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // (500k + 500k) * 8.0 / 1M = 8.0
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 8.0);
@@ -100,6 +104,7 @@ fn flex_tier_applies_multiplier() {
         output_tokens: 0,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // (100k * 2.0 / 1M) * 0.5 = 0.2 * 0.5 = 0.1
     assert_known(cost(MODEL, ServiceTier::Flex, &usage, &table()), 0.1);
@@ -114,6 +119,7 @@ fn long_prompt_bracket_applies_above_threshold() {
         output_tokens: 1_000_000,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // long_input 4.0 * 1M + long_output 12.0 * 1M = 4.0 + 12.0 = 16.0
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 16.0);
@@ -128,6 +134,7 @@ fn long_prompt_bracket_applies_at_exact_threshold() {
         output_tokens: 0,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // long_input 4.0 * 200k / 1M = 0.8 (base input 2.0 would give 0.4)
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 0.8);
@@ -142,6 +149,7 @@ fn base_bracket_applies_below_threshold() {
         output_tokens: 100_000,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     // 0.1M*2.0 + 0.1M*8.0 = 0.2 + 0.8 = 1.0
     assert_known(cost(MODEL, ServiceTier::Standard, &usage, &table()), 1.0);
@@ -163,6 +171,7 @@ fn unknown_model_reports_unknown() {
         output_tokens: 0,
         thinking_tokens: 0,
         cache_hit_local: false,
+        applied_tier: None,
     };
     assert_eq!(
         cost("no-such-model", ServiceTier::Standard, &usage, &table()),

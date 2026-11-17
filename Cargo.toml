@@ -33,6 +33,25 @@ subtitler = { version = "2", default-features = false, features = [
 rsubs-lib = "0.4"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+[features]
+# Scripted `llm::fake` transport for tests. Enabled for this crate's own unit
+# tests via `cfg(test)` and for the integration tests via the self
+# dev-dependency below, so plain `cargo test` works without extra flags, while a
+# production build (`cargo build`) excludes the test scaffolding.
+testing = []
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
+# Enables `tokio::time::pause`/`start_paused` for deterministic delay tests
+# (union of features is dev/test-only; production keeps the plain `tokio` above).
+tokio = { version = "1.54.1", features = ["test-util"] }
+# Self-dependency with `testing` enabled so integration tests (a separate crate)
+# can use `llm::fake`. See ADR-027.
+myansub = { path = ".", features = ["testing"] }

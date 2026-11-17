@@ -17,6 +17,51 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// A secret string (e.g. an API key) whose `Debug` and `Display` both render
+/// `<redacted>`, so it can never leak through structured logging, `anyhow`
+/// context, or a `#[derive(Debug)]` on an enclosing struct
+/// (`CLAUDE.md` "Never log API keys", `docs/ARCHITECTURE.md` §9). The raw value is
+/// reachable only through the explicit [`Secret::expose`] accessor.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the raw secret. Call only where the value must be used (e.g. to set
+    /// an auth header); never log the result.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for Secret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
 /// Service tier for a request (`docs/LLM.md` §5). `Flex` is roughly half the
 /// standard price but may be shed under load; `Standard` is the fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +156,7 @@ pub struct LlmRequest {
 /// Field mapping from Gemini `usageMetadata`:
 /// `promptTokenCount → prompt_tokens`, `cachedContentTokenCount → cached_tokens`,
 /// `candidatesTokenCount → output_tokens`, `thoughtsTokenCount → thinking_tokens`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
     /// Portion of the prompt served from cache (subset of `prompt_tokens`).
@@ -122,6 +167,12 @@ pub struct Usage {
     /// Set when the response came from the local response cache (cost 0).
     #[serde(default)]
     pub cache_hit_local: bool,
+    /// The service tier the server reported it actually applied
+    /// (`usageMetadata.serviceTier`), when present. Lets a smoke test confirm a
+    /// `flex` request was not silently served on `standard` (ADR-028). Additive:
+    /// defaults to `None` and is omitted from serialized output when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_tier: Option<String>,
 }
 
 /// An opaque token returned alongside a response so the caller can confirm
@@ -206,6 +257,18 @@ pub enum LlmError {
     #[error("fatal request error (HTTP {status}): {message}")]
     Fatal { status: u16, message: String },
 
+    /// The model rejected the requested service tier (`docs/LLM.md` §1). The
+    /// `Retrying` layer warns and retries once on the standard tier.
+    #[error("service tier not supported: {message}")]
+    TierUnsupported { message: String },
+
+    /// The operation was cancelled (Ctrl-C / [`CancellationToken`]), e.g. during
+    /// a backoff sleep (`docs/ARCHITECTURE.md` §6.6). Maps to exit code 130.
+    ///
+    /// [`CancellationToken`]: tokio_util::sync::CancellationToken
+    #[error("operation cancelled")]
+    Cancelled,
+
     /// A generic transport failure not captured by the variants above.
     #[error("transport error: {0}")]
     Transport(String),
@@ -228,7 +291,13 @@ impl LlmError {
             | LlmError::Connection(_)
             | LlmError::Transport(_) => ErrorClass::Retryable,
             LlmError::Shed => ErrorClass::Shed,
-            LlmError::Fatal { .. } | LlmError::Decode(_) => ErrorClass::Fatal,
+            // `TierUnsupported` and `Cancelled` are handled by the `Retrying`
+            // layer directly (tier re-send / early return) and never flow through
+            // `decide`; classed `Fatal` so the policy gives up if one ever does.
+            LlmError::Fatal { .. }
+            | LlmError::Decode(_)
+            | LlmError::TierUnsupported { .. }
+            | LlmError::Cancelled => ErrorClass::Fatal,
         }
     }
 }

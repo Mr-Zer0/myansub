@@ -162,3 +162,51 @@ local `Xorshift` PRNG (no `rand`, per ARCHITECTURE §10) seeded from the system 
 injectable for tests. `RetryConfig` is a plain struct (not the config type) so the policy stays pure
 and independent of `config`. Consequence: tests assert exact delays by passing a fixed factor; the
 layer owns the one impure step (drawing jitter and sleeping).
+
+### ADR-027 `llm::fake` gated by a `testing` feature plus a self dev-dependency
+Context (M3-B): `ARCHITECTURE.md` §3 says the scripted `fake` transport may be gated by `cfg(test)` or
+a `testing` feature. `cfg(test)` makes it invisible to integration tests (a separate crate), but the
+M3 wiremock/cancellation tests and later pipeline e2e tests live in `tests/` and need it, while plain
+`cargo test` must keep working with no extra flags. Decision: gate `fake` with
+`#[cfg(any(test, feature = "testing"))]` and add a self dev-dependency
+`myansub = { path = ".", features = ["testing"] }`, so the integration-test build enables `testing`
+(fake available) while a production `cargo build` excludes it. Also added `tokio`'s `test-util`
+feature as a dev-dependency (unioned only for dev/test builds) for `start_paused`/`pause`. Consequence:
+`fake` never ships in the release binary; `cargo test`, `cargo clippy --all-targets`, and `cargo build`
+all work without flags.
+
+### ADR-028 Gemini transport wire choices (service tier, thinking control, shed signal)
+Context (M3-B): `LLM.md` §1 marks the service-tier parameter, the thinking-control mapping, and the
+shed/`RetryInfo` shape as **[verify]**. Verified against the live `generateContent` reference
+(checked 2026-11): (a) `generationConfig.thinkingConfig` takes either `thinkingBudget` (integer) or
+`thinkingLevel` (enum `MINIMAL|LOW|MEDIUM|HIGH|XHIGH`), and `thinkingLevel` is "Recommended for Gemini
+3 or later models. Use with earlier models results in an error."; (b) `responseJsonSchema` is the
+structured-output field (ADR-025); (c) `ServiceTier` exists with values `standard|flex|priority`, but
+the reference documents it only as an **output-only** `usageMetadata` field ("Service tier of the
+request") and does not spell out the request-side placement; (d) the error body is a `google.rpc.Status`
+with `status`, `message`, and `details[]`. Decisions, all confined to `gemini.rs`: send the tier as a
+top-level request field `serviceTier` (a request-level concern echoed back in `usageMetadata`); map
+`ThinkingSetting` to `thinkingLevel` for model names containing `gemini-3` (Gemini-3+) and to
+`thinkingBudget` otherwise (`Off`→0, `Minimal`→128, `Low`→512, `Medium`→2048, `High`→8192, `Budget(n)`→n;
+level variant: `Off`/`Minimal`→MINIMAL, `Low`→LOW, `Medium`→MEDIUM, `High`→HIGH); read a 429's delay
+from the `Retry-After` header or a `google.rpc.RetryInfo.retryDelay` detail (protobuf duration string);
+map HTTP 503 (overloaded/capacity/flex shed) to `Shed`, 500/502/504 to `Server`, 429 to `RateLimited`,
+400/401/403/404 to `Fatal` — except a 400 whose status/message names the service tier, which maps to the
+new `TierUnsupported` and is retried once on standard by the `Retrying` layer (§1). Consequence: if a
+request-side field name differs from the server's expectation the request degrades to the default
+(standard) tier rather than failing; only `gemini.rs` changes if a name is later corrected.
+
+### ADR-029 DryRun output-token estimate scales from the variable block
+Context (M3-B): `LLM.md` §9 says `--dry-run` estimates prompt tokens as `ceil(utf8_bytes/bytes_per_token)`
+per script and output tokens "via `output_ratio`", while §5.8 defines `maxOutputTokens ≈ source tokens ×
+output_ratio`. The transport cannot see which cues are "source". Decision: `DryRun` estimates prompt
+tokens over the system instruction plus all content blocks, and output tokens as
+`ceil(variable_block_tokens × output_ratio)` capped at the request's `maxOutputTokens`, where the
+variable block is the last content block in the fixed prompt layout (`LLM.md` §2). The `dry_run = 1`
+marker on `llm_calls` rows is set by the metered layer / pipeline (M3-C / M5), not here; adding a marker
+field to the shared `Usage`/`LlmResponse` types was avoided because it would break existing M3-A test
+literals. Consequence: dry-run cost estimates are approximate (per-script byte heuristic) and never
+touch the network or the store; the estimator is a pure, unit-tested function. The estimate is
+deliberately conservative — it scales output from the whole variable block and counts the full prefix
+with `cached_tokens = 0` (no implicit-cache discount), so it tends to *over*estimate versus a real run
+that benefits from caching, while the `maxOutputTokens` cap bounds the output overshoot.

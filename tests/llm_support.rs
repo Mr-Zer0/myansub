@@ -8,7 +8,7 @@ use std::time::Duration;
 use myansub::llm::canonical_json;
 use myansub::llm::client::{
     CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError, LlmRequest,
-    LlmResponse, ServiceTier, ThinkingSetting, Usage,
+    LlmResponse, Secret, ServiceTier, ThinkingSetting, Usage,
 };
 use myansub::llm::prompts::{
     self, PROMPT_VERSION, TranslationBlock, TranslationLine, analysis_input_line,
@@ -166,6 +166,15 @@ fn error_class_maps_each_variant() {
         ErrorClass::Fatal
     );
     assert_eq!(LlmError::Decode("x".into()).class(), ErrorClass::Fatal);
+    // M3-B additive variants: handled specially by the Retrying layer, classed Fatal.
+    assert_eq!(
+        LlmError::TierUnsupported {
+            message: "no flex".into()
+        }
+        .class(),
+        ErrorClass::Fatal
+    );
+    assert_eq!(LlmError::Cancelled.class(), ErrorClass::Fatal);
 }
 
 #[test]
@@ -176,6 +185,7 @@ fn usage_serde_round_trips() {
         output_tokens: 6,
         thinking_tokens: 2,
         cache_hit_local: true,
+        applied_tier: Some("flex".to_string()),
     };
     let json = serde_json::to_string(&usage).unwrap();
     let back: Usage = serde_json::from_str(&json).unwrap();
@@ -186,6 +196,17 @@ fn usage_serde_round_trips() {
 fn service_tier_label() {
     assert_eq!(ServiceTier::Flex.label(), "flex");
     assert_eq!(ServiceTier::Standard.label(), "standard");
+}
+
+// AC: M3 security — a Secret never renders its value via Debug or Display.
+#[test]
+fn secret_redacts_value_in_debug_and_display() {
+    let secret = Secret::new("my-api-key-abc123");
+    assert!(!format!("{secret:?}").contains("my-api-key-abc123"));
+    assert!(!format!("{secret}").contains("my-api-key-abc123"));
+    assert!(format!("{secret:?}").contains("redacted"));
+    // The raw value is still reachable through the explicit accessor.
+    assert_eq!(secret.expose(), "my-api-key-abc123");
 }
 
 #[test]

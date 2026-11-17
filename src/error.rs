@@ -64,9 +64,38 @@ impl ExitCode for StoreError {
 }
 
 impl ExitCode for LlmError {
-    /// `LlmError` itself maps to the generic error code; the pipeline translates
-    /// failed *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
+    /// A cancelled operation maps to the interrupted code (130); every other
+    /// `LlmError` maps to the generic error code. The pipeline translates failed
+    /// *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
     fn exit_code(&self) -> i32 {
-        exit::ERROR
+        match self {
+            LlmError::Cancelled => exit::INTERRUPTED,
+            _ => exit::ERROR,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AC: CLI.md §7 — a cancelled LLM op exits 130; other LlmErrors exit 1.
+    #[test]
+    fn cancelled_llm_error_maps_to_interrupted_exit_code() {
+        assert_eq!(LlmError::Cancelled.exit_code(), 130);
+        assert_eq!(exit::INTERRUPTED, 130);
+    }
+
+    #[test]
+    fn other_llm_errors_map_to_generic_error_code() {
+        assert_eq!(LlmError::Timeout.exit_code(), 1);
+        assert_eq!(
+            LlmError::Fatal {
+                status: 400,
+                message: "bad".to_string(),
+            }
+            .exit_code(),
+            exit::ERROR
+        );
     }
 }
