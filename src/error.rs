@@ -6,6 +6,7 @@
 //! (see `docs/CLI.md` §7).
 
 pub use crate::config::ConfigError;
+pub use crate::formats::codec::FormatError;
 pub use crate::formats::encoding::EncodingError;
 
 /// Process exit codes, per `docs/CLI.md` §7.
@@ -43,6 +44,12 @@ impl ExitCode for ConfigError {
 }
 
 impl ExitCode for EncodingError {
+    fn exit_code(&self) -> i32 {
+        exit::ERROR
+    }
+}
+
+impl ExitCode for FormatError {
     fn exit_code(&self) -> i32 {
         exit::ERROR
     }

@@ -92,3 +92,49 @@ The product supports only standard Unicode Burmese; Zawgyi is not supported anyw
 can still occasionally emit legacy-ordered text, so a deterministic check
 (`invalid_myanmar_unicode`) guards the output and triggers a retry. It enforces the
 Unicode-only rule; it is not a conversion feature.
+
+### ADR-022 Codec dependency surface and fallback write path
+Context: implementing the `formats::codec` chain (M1-B). `subtitler` 2.x defaults pull in
+`cli` (clap, tracing-subscriber) and `http` (reqwest); `rsubs-lib` 0.4.x stores timestamps
+as `time::Time` and offers no public constructor for them, and `time` is not an approved
+dependency. Decisions: (1) depend on `subtitler` with `default-features = false` and only
+`srt, vtt, ass, ssa, sbv` to keep the build lean and avoid duplicate HTTP/CLI stacks; (2) the
+`rsubs-lib` adapter is a *parse-only* fallback — its `write` delegates to the `subtitler`
+codec, since `subtitler` serializes every accepted format and a parsed `Document` is
+codec-agnostic. This avoids both adding `time` and hand-writing a serializer. Consequence:
+`rsubs-lib` timestamps are read via the `time::Time` component accessors (through a local
+macro, without naming the transitive type); ASS/SSA recovered via the fallback carry no
+`format_meta` (styles would be in `rsubs-lib`'s shape, not `subtitler`'s), so a same-format
+ASS write after a fallback parse uses default styling. This path is only reached when the
+primary parser rejects the input, which does not occur for the supported fixtures.
+
+### ADR-023 FormatMeta stores ASS metadata as JSON blobs
+Context: `FormatMeta` has `script_info` and `styles` string fields; `DATA_MODEL.md` describes
+them as verbatim section text. The `subtitler` model exposes ASS `[Script Info]` as a
+`HashMap` and styles as a typed `Vec<AssStyle>`, not verbatim text. Decision: the `subtitler`
+adapter serializes those structured values to JSON into the two `FormatMeta` fields and
+deserializes them on write. Consequence: same-format ASS/SSA output reproduces the script
+info and full style table (M1-AC2) without re-parsing section text; the stored strings are
+JSON, not the original section bytes. `[Script Info]` key order is not preserved (HashMap),
+which is cosmetic.
+
+### ADR-024 ASS/SSA text-fidelity overlay (amends ADR-001)
+Context: probing the crates revealed that `subtitler` 2.13 corrupts ASS/SSA dialogue text at
+parse time — it splits each `Dialogue:` line on commas and trims each piece, dropping the
+space after every comma (`"Hello, world, and goodbye"` → `"Hello,world,and goodbye"`). This
+hits the *source* text the translator and LLM see, for a first-class format. `subtitler`'s
+writer is fine, and `rsubs-lib` parses the same dialogue faithfully (commas, spaces, and
+inline tags like `{\i1}Wait{\i0}, where…`) provided the ASS has complete V4+ style headers.
+Decision (orchestrator-approved; product-owner review deferred): keep `subtitler` as the
+primary structural parser *and* writer — timings, styles, speaker, `format_meta`, and
+detection all stay `subtitler`'s (so M1-AC2 is unaffected) — and add a deterministic
+text-fidelity overlay for ASS/SSA only. `parse_document` parses with `subtitler`, re-parses
+the same input with the `rsubs-lib` codec, and, only when both agree on cue count and per-cue
+timings, replaces each cue's `text_raw` with the faithful `rsubs-lib` text and re-runs
+`markup::mask`. If `rsubs-lib` fails or the parses do not align, the `subtitler` text is kept
+and a single `tracing::warn!` is emitted; the parse never fails. The overlay lives in
+`formats::codec` (not the `subtitler` adapter) to avoid a `subtitler`↔`rsubs` module cycle and
+to keep each adapter a pure single-crate wrapper. Consequence: ASS/SSA source text is faithful
+for files with complete V4+ headers; legacy v4 SSA that `rsubs-lib` cannot parse keeps
+`subtitler`'s comma-corrupted text (graceful, with a warning). SRT/VTT/SBV are unchanged
+(`subtitler` only). No hand-written parsing — both parses go through the crates.

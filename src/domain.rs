@@ -81,13 +81,16 @@ impl fmt::Display for SubtitleFormat {
 /// Format-specific metadata preserved for same-format output.
 ///
 /// This is an opaque container for things like ASS script-info and style blocks.
-/// Codecs populate it in a later task; the domain only needs it to round-trip.
+/// The codec populates it so same-format output can reproduce ASS/SSA headers
+/// (see `docs/DECISIONS.md` ADR-023).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatMeta {
-    /// ASS/SSA `[Script Info]` section, verbatim, when present.
+    /// ASS/SSA `[Script Info]` as JSON-encoded structured data (the codec's
+    /// key→value map), when present (`docs/DECISIONS.md` ADR-023).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_info: Option<String>,
-    /// ASS/SSA `[V4+ Styles]` section, verbatim, when present.
+    /// ASS/SSA style table as JSON-encoded structured data (the codec's style
+    /// records), when present (`docs/DECISIONS.md` ADR-023).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub styles: Option<String>,
 }
