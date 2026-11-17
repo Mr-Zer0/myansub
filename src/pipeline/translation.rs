@@ -19,11 +19,24 @@
 //! batch's request is never sent twice.
 //!
 //! Content retries (`docs/LLM.md` §6) are counted separately from the transport
-//! retries inside `Retrying`. This milestone (M6-B1) implements only tier 1:
-//! an unparseable / schema-mismatched response retries the whole batch once with a
-//! strict reminder, up to `max_content_attempts`, after which the batch is failed.
-//! The id-set and per-line tiers are M6-B2. Quality flags are **stored**, not
-//! retried on (M6-B2).
+//! retries inside `Retrying`, and the whole tiered sequence is bounded by one
+//! shared `max_content_attempts` budget so a pathological response can never loop
+//! forever:
+//! - **Tier 1** — an unparseable / schema-mismatched response retries the whole
+//!   batch once with a strict reminder.
+//! - **Tier 2** — a parseable response that omits some batch ids keeps the valid
+//!   lines already received and re-requests *only the missing ids* as a new, smaller
+//!   request, merging until coverage is reached (or the budget runs out, failing the
+//!   batch — never a silent skip).
+//! - **Tier 3** — a covered batch whose cues carry a *hard* quality flag
+//!   (`placeholder_mismatch`, `untranslated`, `zawgyi_suspect`) retries just those
+//!   lines once, isolated; if still bad the best result is stored with the flag and
+//!   the batch is still `done`. Soft flags are stored, never retried.
+//! - **Tier 4** — after the budget is exhausted a batch that still lacks coverage is
+//!   marked `failed` and the run continues (a failed batch never blocks the others).
+//!
+//! A retry that covers no new id makes no progress, so the loop stops early rather
+//! than burning the remaining budget on an unresponsive model.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -44,8 +57,8 @@ use crate::llm::dry_run::{DryRun, Estimator};
 use crate::llm::metered::CallContext;
 use crate::llm::pricing::{self, Cost, PriceTable};
 use crate::llm::prompts::{
-    PROMPT_VERSION, TranslationBlock, TranslationLine, translation_retry_reminder,
-    translation_system_instruction,
+    PROMPT_VERSION, TranslationBlock, TranslationLine, translation_missing_ids_reminder,
+    translation_per_line_reminder, translation_retry_reminder, translation_system_instruction,
 };
 use crate::llm::retry::RetryConfig;
 use crate::llm::schemas::translation_response_schema;
@@ -55,14 +68,16 @@ use crate::store::repo_cues::load_cues;
 use crate::store::repo_llm::put_cache_in_tx;
 use crate::store::repo_project::set_stage;
 use crate::store::repo_translations::{
-    NewTranslation, TranslationOrigin, cue_id_by_idx, upsert_translation_in_tx,
+    NewTranslation, TranslationOrigin, cue_id_by_idx, delete_unlocked_translation,
+    list_translations, upsert_translation_in_tx,
 };
 use crate::store::repo_units::{
     NewTranslationBatch, claim_translation_batch, complete_translation_batch_in_tx,
     count_translation_batches_by_status, create_translation_batch, fail_translation_batch,
-    get_translation_batch, list_translation_batches_by_status, reset_translation_batch,
+    get_translation_batch, list_translation_batches_by_status, requeue_failed_translation_batches,
+    requeue_translation_batch, reset_translation_batch,
 };
-use crate::store::{Stage, StageStatus, Store, UnitStatus};
+use crate::store::{Stage, StageStatus, Store, StoreError, UnitStatus};
 
 use super::error::PipelineError;
 use super::input::check_source_unchanged;
@@ -123,9 +138,19 @@ pub struct TranslationParams {
     pub retry: RetryConfig,
 }
 
-/// Run shaping flags from the `translate` command (`docs/CLI.md` §6). For M6-B1
-/// these are accepted but their behaviours (`--stale`/`--redo`/`--retry-failed`)
-/// are deferred to M6-B2.
+/// Run shaping flags from the `translate` command (`docs/CLI.md` §6).
+///
+/// - `retry_failed` requeues `failed` batches and reruns them.
+/// - `redo` re-translates every **unlocked** cue (locked cues are preserved and
+///   never re-sent), minting fresh translations.
+/// - `stale` re-translates only **stale, unlocked** cues (the `stale` flag is set by
+///   M8 selective invalidation).
+///
+/// `retry_failed` runs **independently** of `redo`/`stale`: a failed batch has no
+/// translation rows, so it never joins the stale set and must be requeued on its own.
+/// Within the unlocked-cue re-request, `redo` takes precedence over `stale` (the
+/// broader selection wins); the two together still requeue failed batches when
+/// `retry_failed` is also set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TranslationFlags {
     pub redo: bool,
@@ -140,8 +165,11 @@ pub enum TranslationOutcome {
     NothingToDo,
     /// Every batch is `done`.
     Completed { batches: usize },
-    /// Some batches failed after their content-retry budget. Maps to exit code 4.
-    CompletedWithFailures { failed: usize },
+    /// Some batches ended not-done after the run: `failed` is the count of true
+    /// content failures (exhausted their retry budget), `incomplete` is the count
+    /// still `pending`/`in_flight` (e.g. never dispatched). Maps to exit code 4 when
+    /// either is non-zero (`docs/CLI.md` §6/§7).
+    CompletedWithFailures { failed: usize, incomplete: usize },
     /// Interrupted by cancellation (Ctrl-C).
     Interrupted,
 }
@@ -210,17 +238,8 @@ pub async fn run_translation<T>(
 where
     T: LlmClient + Clone + Send + Sync + 'static,
 {
-    if flags.redo || flags.retry_failed || flags.stale {
-        tracing::info!(
-            redo = flags.redo,
-            retry_failed = flags.retry_failed,
-            stale = flags.stale,
-            "translate: --redo/--retry-failed/--stale are deferred to M6-B2 and have no effect yet"
-        );
-    }
-
     let (analysis_version, sheet) = load_sheet(store).await?;
-    let assembled = assemble_all_batches(cues, &sheet, params, analysis_version);
+    let mut assembled = assemble_all_batches(cues, &sheet, params, analysis_version);
     if assembled.is_empty() {
         return Ok(TranslationOutcome::NothingToDo);
     }
@@ -258,9 +277,24 @@ where
         })
         .await?;
 
+    let idx_to_id = store.call(|conn| cue_id_by_idx(conn)).await?;
+
+    // Apply the run-shaping flags (`docs/CLI.md` §6): requeue failed batches
+    // (`--retry-failed`) or re-run unlocked / stale-unlocked cues (`--redo`/`--stale`),
+    // rebuilding any batch that must drop a locked cue so it is never re-sent. This
+    // resets the affected batch rows before the status snapshot is taken.
+    apply_run_flags(
+        store,
+        &mut assembled,
+        flags,
+        &idx_to_id,
+        params,
+        analysis_version,
+    )
+    .await?;
+
     // The authoritative status for each batch comes from the DB rows.
     let statuses: BTreeMap<i64, UnitStatus> = status_by_batch(store).await?;
-    let idx_to_id = store.call(|conn| cue_id_by_idx(conn)).await?;
 
     let ctx = Arc::new(BatchExecCtx {
         transport,
@@ -311,9 +345,7 @@ where
         })
         .await?;
     if failed > 0 || incomplete > 0 {
-        return Ok(TranslationOutcome::CompletedWithFailures {
-            failed: failed + incomplete,
-        });
+        return Ok(TranslationOutcome::CompletedWithFailures { failed, incomplete });
     }
 
     // Every batch is done → the translation stage is complete, opening the
@@ -343,6 +375,150 @@ async fn status_by_batch(store: &Store) -> Result<BTreeMap<i64, UnitStatus>, Pip
         })
         .await?;
     Ok(map)
+}
+
+/// Applies the `translate` run-shaping flags (`docs/CLI.md` §6) to the planned
+/// batches and the stored batch rows, before the status snapshot and scheduling:
+///
+/// - `--redo`: re-run every batch holding at least one unlocked cue, clearing those
+///   cues' translations first and excluding any locked cue so it is never re-sent.
+/// - `--stale`: re-request **only** the stale, unlocked cues (`docs/LLM.md` §7,
+///   `docs/CLI.md` §6). Non-stale cues in an affected batch are preserved — never
+///   re-sent, re-billed, or overwritten — and locked cues are never touched.
+/// - `--retry-failed`: requeue every `failed` batch back to `pending`.
+///
+/// `--retry-failed` runs **independently** of `--redo`/`--stale` (ADR): a failed
+/// batch has no translation rows, so it never enters the stale set and must be
+/// requeued on its own regardless of the other flags. `--redo` takes precedence over
+/// `--stale` within the unlocked-cue re-request (the broader selection wins).
+async fn apply_run_flags(
+    store: &Store,
+    assembled: &mut [AssembledBatch],
+    flags: TranslationFlags,
+    idx_to_id: &BTreeMap<u32, i64>,
+    params: &TranslationParams,
+    analysis_version: i64,
+) -> Result<(), PipelineError> {
+    if flags.redo || flags.stale {
+        // Load locked/stale state per cue idx from the stored translations.
+        let id_to_idx: BTreeMap<i64, u32> = idx_to_id.iter().map(|(idx, id)| (*id, *idx)).collect();
+        let rows = store.call(|conn| list_translations(conn)).await?;
+        let mut locked: BTreeSet<u32> = BTreeSet::new();
+        let mut stale: BTreeSet<u32> = BTreeSet::new();
+        for row in rows {
+            let Some(idx) = id_to_idx.get(&row.cue_id).copied() else {
+                continue;
+            };
+            if row.locked {
+                locked.insert(idx);
+            }
+            if row.stale {
+                stale.insert(idx);
+            }
+        }
+
+        let mut reset_nos: Vec<i64> = Vec::new();
+        let mut clear_ids: Vec<i64> = Vec::new();
+        for batch in assembled.iter_mut() {
+            let unlocked: Vec<Cue> = batch
+                .translate_cues
+                .iter()
+                .filter(|c| !locked.contains(&c.idx))
+                .cloned()
+                .collect();
+            // A batch whose cues are all locked is never re-run or re-sent.
+            if unlocked.is_empty() {
+                continue;
+            }
+            // `--redo` re-requests every unlocked cue; `--stale` re-requests only the
+            // stale, unlocked cues (and preserves the rest). `--redo` wins when both
+            // are set.
+            let subset: Vec<Cue> = if flags.redo {
+                unlocked
+            } else {
+                unlocked
+                    .into_iter()
+                    .filter(|c| stale.contains(&c.idx))
+                    .collect()
+            };
+            if subset.is_empty() {
+                continue;
+            }
+            reset_nos.push(batch.batch_no);
+            // `--redo` mints fresh translations, so clear the unlocked cues first.
+            // `--stale` leaves the prior rows in place; the upsert overwrites only the
+            // re-requested stale cues (appending the superseded text to history).
+            if flags.redo {
+                for c in &subset {
+                    if let Some(id) = idx_to_id.get(&c.idx) {
+                        clear_ids.push(*id);
+                    }
+                }
+            }
+            // Reduce the request to the re-requested subset so locked cues (and, under
+            // `--stale`, non-stale cues) are never re-sent.
+            if subset.len() != batch.translate_cues.len() {
+                rebuild_batch_subset(batch, subset, params, analysis_version);
+            }
+        }
+
+        store
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                for id in &clear_ids {
+                    delete_unlocked_translation(&tx, *id)?;
+                }
+                for no in &reset_nos {
+                    requeue_translation_batch(&tx, *no)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await?;
+    }
+
+    // `--retry-failed` is independent of `--redo`/`--stale`: always requeue failed
+    // batches so a failure (which has no translation rows and so never joins the stale
+    // set) is retried regardless of the other flags.
+    if flags.retry_failed {
+        store
+            .call(|conn| requeue_failed_translation_batches(conn).map(|_| ()))
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// Rebuilds a batch's variable block, `input_hash`, bounds, and cue list from a
+/// subset of its cues (used when a locked cue must be dropped from a `--redo`/`--stale`
+/// re-run so it is never re-sent). The scene header is preserved; context lines are
+/// omitted from the reduced request.
+fn rebuild_batch_subset(
+    batch: &mut AssembledBatch,
+    cues: Vec<Cue>,
+    params: &TranslationParams,
+    analysis_version: i64,
+) {
+    let refs: Vec<&Cue> = cues.iter().collect();
+    let lines = to_lines(&refs);
+    let block = TranslationBlock {
+        scene: &batch.scene,
+        speakers: &batch.speakers,
+        context_before: &[],
+        translate: &lines,
+        context_after: &[],
+    };
+    let variable_block = block.render();
+    batch.input_hash = compute_input_hash(&variable_block, analysis_version, params.model.as_str());
+    if let Some(first) = cues.first() {
+        batch.first_cue = i64::from(first.idx);
+    }
+    if let Some(last) = cues.last() {
+        batch.last_cue = i64::from(last.idx);
+    }
+    batch.lines = cues.len() as u64;
+    batch.variable_block = variable_block;
+    batch.translate_cues = cues;
 }
 
 /// Loads the current approved analysis as `(version, Sheet)` for the cached prefix
@@ -577,7 +753,9 @@ impl Sheet {
 // ---------------------------------------------------------------------------
 
 /// A planned batch: its number, cue-idx bounds, assembled variable block, the
-/// `input_hash`, the batch's cues (for mapping + quality), and the line count.
+/// `input_hash`, the batch's cues (for mapping + quality), the line count, and the
+/// scene header (summary + speakers) needed to re-render a smaller variable block
+/// for a tier-2/tier-3 partial re-request (`docs/LLM.md` §6).
 #[derive(Debug, Clone)]
 struct AssembledBatch {
     batch_no: i64,
@@ -587,6 +765,8 @@ struct AssembledBatch {
     input_hash: String,
     translate_cues: Vec<Cue>,
     lines: u64,
+    scene: String,
+    speakers: Vec<(String, String)>,
 }
 
 /// The cues eligible for translation: translatable cues with non-blank masked text
@@ -647,6 +827,8 @@ fn assemble_all_batches(
             input_hash,
             translate_cues: group.iter().map(|c| (*c).clone()).collect(),
             lines: group.len() as u64,
+            scene: summary,
+            speakers,
         });
     }
     out
@@ -737,8 +919,12 @@ fn build_request(
 // Response validation + parsing
 // ---------------------------------------------------------------------------
 
-/// Why a translation response is not usable (`docs/DATA_MODEL.md` §4). Drives the
-/// tier-1 content retry only; the message is logged, not surfaced to the user.
+/// Why a translation response is structurally unusable (`docs/DATA_MODEL.md` §4).
+/// A structural failure is the tier-1 "unparseable / schema mismatch" case; the
+/// message is logged, not surfaced to the user. A *parseable* response that merely
+/// omits some ids is **not** a structural error — coverage is handled by the
+/// content-retry loop (tier 2), which keeps the valid lines and re-requests the
+/// missing ones.
 #[derive(Debug, thiserror::Error)]
 enum ValidationError {
     #[error("response is not valid JSON: {0}")]
@@ -749,18 +935,25 @@ enum ValidationError {
     Lines,
     #[error("a line entry is malformed (needs integer `id` and string `t`)")]
     Entry,
-    #[error("response does not cover every batch cue id (missing {missing:?})")]
-    Coverage { missing: Vec<i64> },
 }
 
-/// Validates a translation response against `{"lines":[{"id":int,"t":string}]}`
-/// (`docs/DATA_MODEL.md` §4) **and** that the returned id set covers every cue id in
-/// `expected` (review #1). A response that omits a batch cue id — or returns an empty
-/// `lines` array — is a tier-1 content failure, not a silent skip: build_translations
-/// pairs only returned ids, so an uncovered cue would otherwise get no translation,
-/// no flag, and no retry while the batch is marked done. Extra/unknown returned ids
-/// are ignored for B1 (fine-grained re-request is M6-B2).
-fn validate_translation(text: &str, expected: &BTreeSet<i64>) -> Result<(), ValidationError> {
+/// Extracts a line's integer `id`, accepting both signed and unsigned JSON integers
+/// (Gemini may emit either). Shared by [`parse_response`] so structural validation
+/// and the parsed `(id, text)` pairs agree on what counts as an id (review).
+fn extract_id(value: &serde_json::Value) -> Option<i64> {
+    if value.is_i64() {
+        value.as_i64()
+    } else {
+        value.as_u64().map(|u| u as i64)
+    }
+}
+
+/// Parses a translation response against `{"lines":[{"id":int,"t":string}]}`
+/// (`docs/DATA_MODEL.md` §4), returning the `(id, text)` pairs in order. A structural
+/// problem (bad JSON, missing `lines`, a malformed entry) is a [`ValidationError`]
+/// and drives the tier-1 whole-batch retry. Coverage of the expected ids is *not*
+/// checked here; the caller compares the returned ids against what it still needs.
+fn parse_response(text: &str) -> Result<Vec<(i64, String)>, ValidationError> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| ValidationError::Parse(e.to_string()))?;
     let obj = value.as_object().ok_or(ValidationError::NotObject)?;
@@ -768,47 +961,31 @@ fn validate_translation(text: &str, expected: &BTreeSet<i64>) -> Result<(), Vali
         .get("lines")
         .and_then(|v| v.as_array())
         .ok_or(ValidationError::Lines)?;
-    let mut returned: BTreeSet<i64> = BTreeSet::new();
+    let mut out = Vec::with_capacity(lines.len());
     for entry in lines {
         let entry = entry.as_object().ok_or(ValidationError::Entry)?;
-        let id = entry.get("id").and_then(|v| {
-            if v.is_i64() {
-                v.as_i64()
-            } else {
-                v.as_u64().map(|u| u as i64)
-            }
-        });
-        let t_ok = entry.get("t").is_some_and(|v| v.is_string());
-        match id {
-            Some(id) if t_ok => {
-                returned.insert(id);
-            }
+        let id = entry.get("id").and_then(extract_id);
+        let t = entry.get("t").and_then(|v| v.as_str());
+        match (id, t) {
+            (Some(id), Some(t)) => out.push((id, t.to_string())),
             _ => return Err(ValidationError::Entry),
         }
     }
-    let missing: Vec<i64> = expected.difference(&returned).copied().collect();
-    if !missing.is_empty() {
-        return Err(ValidationError::Coverage { missing });
-    }
-    Ok(())
+    Ok(out)
 }
 
-/// Parses a validated response into `(id, text)` pairs in order.
-fn parse_lines(text: &str) -> Vec<(i64, String)> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
-    };
-    let Some(lines) = value.get("lines").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    lines
-        .iter()
-        .filter_map(|entry| {
-            let id = entry.get("id").and_then(|v| v.as_i64())?;
-            let t = entry.get("t").and_then(|v| v.as_str())?.to_string();
-            Some((id, t))
-        })
-        .collect()
+/// The "hard" quality flags that drive the tier-3 isolated per-line retry
+/// (`docs/LLM.md` §6.3): a mismatched placeholder set, an untranslated target, or a
+/// Zawgyi-suspect target. Every other flag is "soft" — stored, never retried.
+const HARD_FLAGS: [QualityFlag; 3] = [
+    QualityFlag::PlaceholderMismatch,
+    QualityFlag::Untranslated,
+    QualityFlag::ZawgyiSuspect,
+];
+
+/// Whether any flag in `flags` is a tier-3 hard flag.
+fn has_hard_flag(flags: &[QualityFlag]) -> bool {
+    flags.iter().any(|f| HARD_FLAGS.contains(f))
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +1049,8 @@ struct TranslationBatchUnit<T> {
     input_hash: String,
     translate_cues: Vec<Cue>,
     lines: u64,
+    scene: String,
+    speakers: Vec<(String, String)>,
     state: AtomicU8,
     ctx: Arc<BatchExecCtx<T>>,
 }
@@ -884,17 +1063,16 @@ impl<T> TranslationBatchUnit<T> {
             input_hash: batch.input_hash,
             translate_cues: batch.translate_cues,
             lines: batch.lines,
+            scene: batch.scene,
+            speakers: batch.speakers,
             state: AtomicU8::new(status_to_atom(status)),
             ctx,
         }
     }
 
-    /// Runs the per-cue and batch-level quality checks and builds the rows to
-    /// persist, mapping each returned line id (a cue `idx`) to its cue and
-    /// `cues.id` (`docs/LLM.md` §8, `docs/DATA_MODEL.md` §4/§5).
-    fn build_translations(&self, lines: &[(i64, String)]) -> Vec<NewTranslation> {
-        let glossary: Vec<GlossaryTerm> = self
-            .ctx
+    /// This run's glossary terms as borrowed [`GlossaryTerm`]s for the quality checks.
+    fn glossary_terms(&self) -> Vec<GlossaryTerm<'_>> {
+        self.ctx
             .glossary
             .iter()
             .map(|(term, target, keep)| GlossaryTerm {
@@ -902,17 +1080,42 @@ impl<T> TranslationBatchUnit<T> {
                 target,
                 keep: *keep,
             })
-            .collect();
+            .collect()
+    }
+
+    /// Runs the per-cue quality checks on one `(cue, text)` pair (`docs/LLM.md` §8).
+    fn cue_flags(&self, cue: &Cue, text: &str) -> Vec<QualityFlag> {
+        let glossary = self.glossary_terms();
+        let names: Vec<&str> = self.ctx.names.iter().map(String::as_str).collect();
+        let ctx = AnalysisContext {
+            glossary: &glossary,
+            names: &names,
+        };
+        checks::check_cue(cue, text, &ctx, &self.ctx.limits)
+    }
+
+    /// Runs the per-cue and batch-level quality checks and builds the rows to
+    /// persist, mapping each returned line id (a cue `idx`) to its cue and
+    /// `cues.id` (`docs/LLM.md` §8, `docs/DATA_MODEL.md` §4/§5).
+    ///
+    /// A returned id with no `cues.id` mapping is an invariant violation (the
+    /// coverage gate has already guaranteed every batch cue is present), so this
+    /// fails the batch rather than silently dropping the pair — a silent skip can
+    /// never re-emerge after the coverage gate (review).
+    fn build_translations(
+        &self,
+        lines: &[(i64, String)],
+    ) -> Result<Vec<NewTranslation>, StoreError> {
+        let glossary = self.glossary_terms();
         let names: Vec<&str> = self.ctx.names.iter().map(String::as_str).collect();
         let analysis_ctx = AnalysisContext {
             glossary: &glossary,
             names: &names,
         };
 
-        // Pair each returned line with its batch cue (ignore ids not in this batch;
-        // the id-set tier is M6-B2). Duplicate ids in one response are deduped
-        // first-wins so a cue is never upserted twice with a spurious history row
-        // (review #6).
+        // Pair each returned line with its batch cue (ignore ids not in this batch).
+        // Duplicate ids in one response are deduped first-wins so a cue is never
+        // upserted twice with a spurious history row (review).
         let mut paired: Vec<(&Cue, String)> = Vec::new();
         let mut seen: BTreeSet<i64> = BTreeSet::new();
         for (id, text) in lines {
@@ -941,25 +1144,26 @@ impl<T> TranslationBatchUnit<T> {
             }
         }
 
-        paired
-            .into_iter()
-            .zip(flags)
-            .filter_map(|((cue, text), flags)| {
-                self.ctx
-                    .idx_to_id
-                    .get(&cue.idx)
-                    .map(|cue_id| NewTranslation {
-                        cue_id: *cue_id,
-                        text,
-                        origin: TranslationOrigin::Llm,
-                        locked: false,
-                        stale: false,
-                        flags,
-                        analysis_version: self.ctx.analysis_version,
-                        model: Some(self.ctx.model.clone()),
-                    })
-            })
-            .collect()
+        let mut out = Vec::with_capacity(paired.len());
+        for ((cue, text), flags) in paired.into_iter().zip(flags) {
+            let cue_id = self.ctx.idx_to_id.get(&cue.idx).ok_or_else(|| {
+                StoreError::Unexpected(format!(
+                    "cue idx {} has no cues.id mapping in batch {}",
+                    cue.idx, self.batch_no
+                ))
+            })?;
+            out.push(NewTranslation {
+                cue_id: *cue_id,
+                text,
+                origin: TranslationOrigin::Llm,
+                locked: false,
+                stale: false,
+                flags,
+                analysis_version: self.ctx.analysis_version,
+                model: Some(self.ctx.model.clone()),
+            });
+        }
+        Ok(out)
     }
 
     fn base_request(&self) -> LlmRequest {
@@ -1056,9 +1260,17 @@ where
         self.state.store(ST_IN_FLIGHT, Ordering::Relaxed);
 
         match self.call_validated().await {
-            CallResult::Valid { text, commit } => {
-                let lines = parse_lines(&text);
-                let translations = self.build_translations(&lines);
+            CallResult::Valid { lines, commits } => {
+                let translations = match self.build_translations(&lines) {
+                    Ok(translations) => translations,
+                    Err(err) => {
+                        // A missing cue→id mapping is an invariant violation; fail the
+                        // batch rather than committing a partial result (review).
+                        let message = err.to_string();
+                        self.mark_failed(&message).await;
+                        return UnitOutcome::Failed;
+                    }
+                };
                 let store = self.ctx.store.clone();
                 let committed = store
                     .call(move |conn| {
@@ -1073,8 +1285,12 @@ where
                         for t in &translations {
                             upsert_translation_in_tx(&tx, t)?;
                         }
-                        if let Some(payload) = commit.payload() {
-                            put_cache_in_tx(&tx, payload)?;
+                        // Commit every contributing call's cache payload in the same
+                        // transaction (tiers 2/3 may have made more than one call).
+                        for commit in &commits {
+                            if let Some(payload) = commit.payload() {
+                                put_cache_in_tx(&tx, payload)?;
+                            }
                         }
                         tx.commit()?;
                         Ok(true)
@@ -1110,10 +1326,25 @@ where
     }
 }
 
-/// The outcome of a validated call (`docs/LLM.md` §6).
+/// The outcome of the tiered content-retry loop (`docs/LLM.md` §6). `Valid` carries
+/// the merged `(id, text)` pairs covering every batch cue and the cache-commit tokens
+/// of every contributing call.
 enum CallResult {
-    Valid { text: String, commit: CommitToken },
+    Valid {
+        lines: Vec<(i64, String)>,
+        commits: Vec<CommitToken>,
+    },
     Exhausted,
+    Cancelled,
+    Transport(LlmError),
+}
+
+/// What one generate call produced inside the content loop.
+enum CallStep {
+    /// A structurally valid response, parsed into `(id, text)` pairs.
+    Parsed(Vec<(i64, String)>, CommitToken),
+    /// A transport-successful but structurally invalid response (tier-1 case).
+    Structural,
     Cancelled,
     Transport(LlmError),
 }
@@ -1122,86 +1353,213 @@ impl<T> TranslationBatchUnit<T>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
 {
-    /// Calls the LLM stack and validates the response, retrying the whole batch with a
-    /// strict reminder on a content failure (`docs/LLM.md` §6.1). Tier 1 retries the
-    /// whole batch **once** ([`TIER1_WHOLE_BATCH_RETRIES`]), bounded by the overall
-    /// `max_content_attempts` budget that the later tiers (M6-B2) will also draw on;
-    /// after that the batch is exhausted. The content-attempt counter here is separate
-    /// from the transport retries inside `Retrying`.
+    /// Resolves the batch through the tiered content-retry sequence (`docs/LLM.md`
+    /// §6.2-§6.4), all bounded by the single `max_content_attempts` budget:
+    ///
+    /// 1. Reach id coverage: the first call is the whole batch; a structurally invalid
+    ///    response retries the whole batch (tier 1), a partial response keeps the valid
+    ///    lines and re-requests *only the missing ids* (tier 2). A retry that covers no
+    ///    new id makes no progress, so the loop stops rather than looping forever.
+    /// 2. Repair hard-flagged lines: once covered, cues carrying a hard quality flag
+    ///    get one isolated re-request (tier 3); a result that clears the flag replaces
+    ///    the original, otherwise the original (best result) is kept and stored flagged.
+    ///
+    /// The content-attempt counter is separate from the transport retries inside
+    /// `Retrying`.
     async fn call_validated(&self) -> CallResult {
-        let base_req = self.base_request();
         let expected: BTreeSet<i64> = self
             .translate_cues
             .iter()
             .map(|c| i64::from(c.idx))
             .collect();
-        // Total whole-batch calls = original + at most one retry, never more than the
-        // overall content-attempt budget.
-        let cap = self
-            .ctx
-            .max_content_attempts
-            .min(TIER1_WHOLE_BATCH_RETRIES + 1);
-        let mut attempt = 0u32;
+        if expected.is_empty() {
+            return CallResult::Valid {
+                lines: Vec::new(),
+                commits: Vec::new(),
+            };
+        }
+
+        let max = self.ctx.max_content_attempts.max(1);
+        let mut accepted: BTreeMap<i64, String> = BTreeMap::new();
+        let mut commits: Vec<CommitToken> = Vec::new();
+        let mut attempts = 0u32;
+
+        // --- Tiers 1 + 2: reach coverage of every expected id. ---
         loop {
-            if self.ctx.token.is_cancelled() {
-                return CallResult::Cancelled;
+            let missing: BTreeSet<i64> = expected
+                .difference(&accepted_ids(&accepted))
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                break;
             }
-            let req = if attempt == 0 {
-                base_req.clone()
+            if attempts >= max {
+                return CallResult::Exhausted;
+            }
+
+            // First call: whole batch, no reminder. A retry with nothing accepted yet
+            // re-sends the whole batch (tier 1); with partial coverage it re-requests
+            // only the missing ids (tier 2). Retries always carry the strict reminder.
+            let req = if attempts == 0 {
+                self.base_request()
+            } else if accepted.is_empty() {
+                // Tier 1: the whole batch failed structural validation.
+                with_reminder(self.base_request(), translation_retry_reminder())
             } else {
-                with_reminder(base_req.clone())
+                // Tier 2: parseable, but some requested ids were missing.
+                with_reminder(
+                    self.subset_request(&missing),
+                    translation_missing_ids_reminder(),
+                )
             };
+            attempts += 1;
 
-            let call_ctx = CallContext {
-                stage: Stage::Translation.as_str().to_string(),
-                unit: Some(self.batch_no),
-                dry_run: false,
-            };
-            let stack = assemble_stack(
-                self.ctx.transport.clone(),
-                self.ctx.retry.clone(),
-                self.ctx.token.clone(),
-                self.ctx.seed,
-                self.ctx.store.clone(),
-                self.ctx.store.clone(),
-                call_ctx,
-            );
-
-            match stack.generate(req).await {
-                Ok(resp) => match validate_translation(&resp.text, &expected) {
-                    Ok(()) => {
-                        return CallResult::Valid {
-                            text: resp.text,
-                            commit: resp.commit,
-                        };
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            attempt,
-                            "translation response failed validation ({err}); content retry"
-                        );
-                        attempt += 1;
-                        if attempt >= cap {
-                            return CallResult::Exhausted;
+            let before = accepted.len();
+            match self.one_call(req).await {
+                CallStep::Parsed(lines, commit) => {
+                    commits.push(commit);
+                    for (id, text) in lines {
+                        if expected.contains(&id) {
+                            accepted.entry(id).or_insert(text);
                         }
                     }
-                },
-                Err(LlmError::Cancelled) => return CallResult::Cancelled,
-                Err(err) => return CallResult::Transport(err),
+                }
+                CallStep::Structural => {
+                    tracing::debug!(
+                        attempt = attempts,
+                        "translation response failed structural validation; content retry"
+                    );
+                }
+                CallStep::Cancelled => return CallResult::Cancelled,
+                CallStep::Transport(err) => return CallResult::Transport(err),
+            }
+
+            // A retry that covered no new id is making no progress; stop before burning
+            // the rest of the budget on an unresponsive model (`docs/LLM.md` §6).
+            if accepted.len() == before && attempts >= 2 {
+                return CallResult::Exhausted;
             }
         }
+
+        // --- Tier 3: one isolated retry of hard-flagged lines. ---
+        let hard: BTreeSet<i64> = self
+            .translate_cues
+            .iter()
+            .filter(|c| {
+                accepted
+                    .get(&i64::from(c.idx))
+                    .is_some_and(|text| has_hard_flag(&self.cue_flags(c, text)))
+            })
+            .map(|c| i64::from(c.idx))
+            .collect();
+        // Tier 3 is the terminal content attempt: it draws the last slot of the budget
+        // (`attempts < max`) but nothing reads the counter after it.
+        if !hard.is_empty()
+            && attempts < max
+            && let CallStep::Parsed(lines, commit) = self
+                .one_call(with_reminder(
+                    self.subset_request(&hard),
+                    translation_per_line_reminder(),
+                ))
+                .await
+        {
+            commits.push(commit);
+            for (id, text) in lines {
+                if !hard.contains(&id) {
+                    continue;
+                }
+                // Keep the retried text only if it clears the hard flag; otherwise
+                // the original stays as the best result (stored with its flag).
+                if let Some(cue) = self.translate_cues.iter().find(|c| i64::from(c.idx) == id)
+                    && !has_hard_flag(&self.cue_flags(cue, &text))
+                {
+                    accepted.insert(id, text);
+                }
+            }
+        }
+
+        CallResult::Valid {
+            lines: accepted.into_iter().collect(),
+            commits,
+        }
+    }
+
+    /// Makes one LLM call through the stack and classifies its result for the content
+    /// loop.
+    async fn one_call(&self, req: LlmRequest) -> CallStep {
+        if self.ctx.token.is_cancelled() {
+            return CallStep::Cancelled;
+        }
+        let call_ctx = CallContext {
+            stage: Stage::Translation.as_str().to_string(),
+            unit: Some(self.batch_no),
+            dry_run: false,
+        };
+        let stack = assemble_stack(
+            self.ctx.transport.clone(),
+            self.ctx.retry.clone(),
+            self.ctx.token.clone(),
+            self.ctx.seed,
+            self.ctx.store.clone(),
+            self.ctx.store.clone(),
+            call_ctx,
+        );
+        match stack.generate(req).await {
+            Ok(resp) => match parse_response(&resp.text) {
+                Ok(lines) => CallStep::Parsed(lines, resp.commit),
+                Err(_) => CallStep::Structural,
+            },
+            Err(LlmError::Cancelled) => CallStep::Cancelled,
+            Err(err) => CallStep::Transport(err),
+        }
+    }
+
+    /// Builds a request whose variable block translates only the cues in `ids` (a
+    /// tier-2/tier-3 partial re-request), keeping the batch's scene header so the
+    /// cached prefix is unchanged (`docs/LLM.md` §6). Context lines are omitted so the
+    /// smaller request carries *only* the requested ids.
+    fn subset_request(&self, ids: &BTreeSet<i64>) -> LlmRequest {
+        let cues: Vec<&Cue> = self
+            .translate_cues
+            .iter()
+            .filter(|c| ids.contains(&i64::from(c.idx)))
+            .collect();
+        let lines = to_lines(&cues);
+        let block = TranslationBlock {
+            scene: &self.scene,
+            speakers: &self.speakers,
+            context_before: &[],
+            translate: &lines,
+            context_after: &[],
+        };
+        let variable_block = block.render();
+        let budget = output_budget(
+            &variable_block,
+            &self.ctx.estimator,
+            self.ctx.output_ratio,
+            lines.len() as u64,
+        );
+        build_request(
+            &self.ctx.model,
+            self.ctx.tier,
+            self.ctx.thinking,
+            &self.ctx.system_instruction,
+            &self.ctx.analysis_sheet,
+            &variable_block,
+            budget,
+        )
     }
 }
 
-/// Tier-1 whole-batch content retries (`docs/LLM.md` §6.1: retry the whole batch
-/// *once*). Later tiers (id-set, per-line) are M6-B2 and consume the remaining
-/// `max_content_attempts` budget.
-const TIER1_WHOLE_BATCH_RETRIES: u32 = 1;
+/// The ids currently accepted, as a set (for difference against `expected`).
+fn accepted_ids(accepted: &BTreeMap<i64, String>) -> BTreeSet<i64> {
+    accepted.keys().copied().collect()
+}
 
-/// Appends the strict reminder as a trailing user block for a content retry
-/// (`docs/LLM.md` §6).
-fn with_reminder(mut req: LlmRequest) -> LlmRequest {
-    req.contents
-        .push(ContentBlock::user(translation_retry_reminder()));
+/// Appends the tier-appropriate reminder as a trailing user block for a content retry
+/// (`docs/LLM.md` §6). The caller passes the reminder matching the failure tier
+/// (structural, missing-ids, or per-line).
+fn with_reminder(mut req: LlmRequest, reminder: String) -> LlmRequest {
+    req.contents.push(ContentBlock::user(reminder));
     req
 }

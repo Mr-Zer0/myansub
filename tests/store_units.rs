@@ -626,3 +626,145 @@ async fn recover_is_noop_on_fresh_database() {
     let err = UnitStatus::from_db("weird");
     assert!(matches!(err, Err(StoreError::Unexpected(_))));
 }
+
+// --- repo_units: translation-batch requeues (M6-B2) ----------------------
+
+/// A pending translation batch with the given `batch_no`.
+fn new_batch(batch_no: i64) -> NewTranslationBatch {
+    NewTranslationBatch {
+        batch_no,
+        first_cue: batch_no,
+        last_cue: batch_no,
+        input_hash: None,
+        model: None,
+        analysis_version: None,
+    }
+}
+
+async fn batch_status(store: &Store, batch_no: i64) -> UnitStatus {
+    store
+        .call(move |conn| repo_units::get_translation_batch(conn, batch_no))
+        .await
+        .expect("get")
+        .expect("present")
+        .status
+}
+
+// AC: M6-B2 — requeue_failed_translation_batches resets only `failed` batches to
+// `pending`, leaving `in_flight`, `pending`, and `done` batches untouched (so a
+// `--retry-failed` run reruns exactly the failures).
+#[tokio::test]
+async fn requeue_failed_batches_resets_only_failed() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .call(|conn| {
+            for no in 1..=4 {
+                repo_units::create_translation_batch(conn, &new_batch(no))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("create");
+
+    // batch 1 → failed, batch 2 → done, batch 3 → in_flight, batch 4 → pending.
+    store
+        .call(|conn| {
+            repo_units::claim_translation_batch(conn, 1)?;
+            repo_units::fail_translation_batch(conn, 1, "boom")?;
+            repo_units::claim_translation_batch(conn, 2)?;
+            repo_units::complete_translation_batch(conn, 2)?;
+            repo_units::claim_translation_batch(conn, 3)?; // left in_flight
+            Ok(())
+        })
+        .await
+        .expect("arrange");
+
+    let requeued = store
+        .call(|conn| repo_units::requeue_failed_translation_batches(conn))
+        .await
+        .expect("requeue");
+    assert_eq!(requeued, 1, "only the single failed batch is requeued");
+
+    assert_eq!(
+        batch_status(&store, 1).await,
+        UnitStatus::Pending,
+        "failed → pending"
+    );
+    assert_eq!(
+        batch_status(&store, 2).await,
+        UnitStatus::Done,
+        "done untouched"
+    );
+    assert_eq!(
+        batch_status(&store, 3).await,
+        UnitStatus::InFlight,
+        "in_flight untouched"
+    );
+    assert_eq!(
+        batch_status(&store, 4).await,
+        UnitStatus::Pending,
+        "already-pending untouched"
+    );
+}
+
+// AC: M6-B2 — requeue_translation_batch resets a single `done` or `failed` batch to
+// `pending` and reports it, but leaves an `in_flight` or already-`pending` batch
+// untouched (the `--redo`/`--stale` per-batch requeue seam).
+#[tokio::test]
+async fn requeue_one_batch_resets_only_done_or_failed() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .call(|conn| {
+            for no in 1..=4 {
+                repo_units::create_translation_batch(conn, &new_batch(no))?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("create");
+
+    // batch 1 → done, batch 2 → failed, batch 3 → in_flight, batch 4 → pending.
+    store
+        .call(|conn| {
+            repo_units::claim_translation_batch(conn, 1)?;
+            repo_units::complete_translation_batch(conn, 1)?;
+            repo_units::claim_translation_batch(conn, 2)?;
+            repo_units::fail_translation_batch(conn, 2, "boom")?;
+            repo_units::claim_translation_batch(conn, 3)?; // left in_flight
+            Ok(())
+        })
+        .await
+        .expect("arrange");
+
+    // A `done` batch is requeued.
+    let done_requeued = store
+        .call(|conn| repo_units::requeue_translation_batch(conn, 1))
+        .await
+        .expect("requeue done");
+    assert!(done_requeued, "a done batch is requeued");
+    assert_eq!(batch_status(&store, 1).await, UnitStatus::Pending);
+
+    // A `failed` batch is requeued.
+    let failed_requeued = store
+        .call(|conn| repo_units::requeue_translation_batch(conn, 2))
+        .await
+        .expect("requeue failed");
+    assert!(failed_requeued, "a failed batch is requeued");
+    assert_eq!(batch_status(&store, 2).await, UnitStatus::Pending);
+
+    // An `in_flight` batch is left untouched.
+    let in_flight_requeued = store
+        .call(|conn| repo_units::requeue_translation_batch(conn, 3))
+        .await
+        .expect("requeue in_flight");
+    assert!(!in_flight_requeued, "an in_flight batch is not requeued");
+    assert_eq!(batch_status(&store, 3).await, UnitStatus::InFlight);
+
+    // An already-`pending` batch is left untouched.
+    let pending_requeued = store
+        .call(|conn| repo_units::requeue_translation_batch(conn, 4))
+        .await
+        .expect("requeue pending");
+    assert!(!pending_requeued, "a pending batch is not requeued");
+    assert_eq!(batch_status(&store, 4).await, UnitStatus::Pending);
+}

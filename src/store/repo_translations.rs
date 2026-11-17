@@ -241,6 +241,19 @@ pub fn set_flags_in_tx(
     Ok(changed == 1)
 }
 
+/// Deletes the translation for `cue_id` unless it is `locked = 1`, so a
+/// `translate --redo` run can mint fresh translations for unlocked cues while
+/// preserving reviewer-locked ones (`docs/CLI.md` §6, `docs/DATA_MODEL.md` §2).
+/// Returns `true` when a row was removed, `false` when no row existed or it was
+/// locked and left in place.
+pub fn delete_unlocked_translation(conn: &Connection, cue_id: i64) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "DELETE FROM translations WHERE cue_id = ?1 AND locked = 0",
+        params![cue_id],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Lists the `translation_history` rows for one cue, oldest first.
 pub fn list_translation_history(
     conn: &Connection,

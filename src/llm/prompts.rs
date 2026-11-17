@@ -9,7 +9,10 @@
 
 /// The prompt/schema version. Bump on any change to a system instruction, the
 /// variable-block layout, or a response schema.
-pub const PROMPT_VERSION: u32 = 1;
+///
+/// v2: the translation content-retry reminders became tier-specific
+/// ([`translation_missing_ids_reminder`], [`translation_per_line_reminder`]).
+pub const PROMPT_VERSION: u32 = 2;
 
 /// The static system instruction for the analysis stage (`docs/LLM.md` §2,
 /// "Analysis prompt"). English prose; the output is the analysis document
@@ -50,14 +53,34 @@ pub fn strict_retry_reminder() -> String {
         .to_string()
 }
 
-/// The strict reminder appended to a translation batch's request on a content
-/// retry (`docs/LLM.md` §6). This is prompt text: any edit must bump
-/// [`PROMPT_VERSION`]. Introduced with the translation stage, so it ships at the
-/// same [`PROMPT_VERSION`] as the rest of the translation prompt surface.
+/// The tier-1 reminder appended to a translation batch's request when the previous
+/// response was structurally invalid JSON (`docs/LLM.md` §6.1). This is prompt text:
+/// any edit must bump [`PROMPT_VERSION`].
 pub fn translation_retry_reminder() -> String {
     "Your previous response was not valid JSON matching the required schema. Respond with ONLY a \
      single JSON object of the form {\"lines\":[{\"id\":<integer>,\"t\":\"<translation>\"}]} — one \
      entry per line to translate, no prose, no code fences."
+        .to_string()
+}
+
+/// The tier-2 reminder appended when the previous response was valid JSON but omitted
+/// some requested ids (`docs/LLM.md` §6.2). The response *was* parseable, so this
+/// targets coverage rather than JSON shape. This is prompt text: any edit must bump
+/// [`PROMPT_VERSION`].
+pub fn translation_missing_ids_reminder() -> String {
+    "Your previous response was missing some of the requested lines. Return every requested id \
+     exactly once, and output only the ids listed below — no others, no prose, no code fences."
+        .to_string()
+}
+
+/// The tier-3 reminder appended when the previous response covered the ids but a line
+/// failed a per-line quality check (`placeholder_mismatch`, `untranslated`,
+/// `zawgyi_suspect`; `docs/LLM.md` §6.3). This is prompt text: any edit must bump
+/// [`PROMPT_VERSION`].
+pub fn translation_per_line_reminder() -> String {
+    "Re-translate the lines below. Preserve every \u{27E6}n\u{27E7} placeholder exactly once, and \
+     output natural spoken Myanmar (Burmese) in Unicode — never Zawgyi, never the untranslated \
+     source. Output only the ids listed below, no prose, no code fences."
         .to_string()
 }
 

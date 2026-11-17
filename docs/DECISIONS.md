@@ -332,3 +332,34 @@ scene `cue_range`/`summary`). Note: to keep validation work bounded on a patholo
 an over-cap array records its cap violation and then only its first `cap` elements are walked (the import
 is rejected regardless). Length limits use `chars().count()` (not graphemes), judged defensible for the
 analysis document's prose fields.
+
+### ADR-037 `translate` run-flag semantics and tier-specific retry reminders (M6-B2)
+Context (M6-B2, `LLM.md` §6/§7, `CLI.md` §6): review of the `translate` run-shaping flags surfaced three
+behavioral clarifications plus a prompt-surface change. Decisions:
+
+(a) **`--retry-failed` is independent of `--redo`/`--stale`.** A `failed` batch has no translation rows,
+so it never joins the stale set built from stored rows; folding `retry_failed` into an `else` branch of
+`redo || stale` dropped it on a combined run. `apply_run_flags` now always requeues failed batches when
+`retry_failed` is set, regardless of the other flags. Within the unlocked-cue re-request, `--redo` still
+takes precedence over `--stale` (the broader selection wins).
+
+(b) **`--stale` re-requests only the stale, unlocked cues.** Per `LLM.md` §7 / `CLI.md` §6 ("re-translate
+stale, unlocked cues"), `--stale` rebuilds an affected batch's request from the stale-unlocked subset
+only. Non-stale cues in the same batch are preserved — never re-sent, re-billed, or overwritten — and the
+upsert overwrites only the re-requested stale cues (appending the superseded text to history). `--redo`
+keeps its prior behavior: it re-requests every unlocked cue and clears their rows first to mint fresh
+translations. Locked cues are excluded from the request under both flags.
+
+(c) **`--redo` on unchanged inputs returns the locally-cached identical response.** `--redo` clears the
+unlocked *translations* but not the local response cache, and when no locked cue is dropped the request
+is byte-identical, so the re-run is a free cache hit that reproduces the same target. A genuine
+force-fresh re-call requires changing the model, prompt (`PROMPT_VERSION`), or approved analysis version
+(all of which change the request/`input_hash`), or pruning the cache with `cache prune`.
+
+(d) **Tier-specific content-retry reminders; `PROMPT_VERSION` bumped to 2.** The single generic
+`translation_retry_reminder` ("previous response was not valid JSON…") was reused for tier 2 (missing
+ids — the response *was* valid JSON) and tier 3 (per-line placeholder/untranslated/zawgyi), where it was
+misleading. Added `translation_missing_ids_reminder` and `translation_per_line_reminder`, each used on
+its own tier. Because this edits the translation prompt surface, `PROMPT_VERSION` is bumped `1 → 2`
+(superseding ADR-036's "ships at version 1" note now that the surface has changed). The bump changes every
+translation `input_hash`; this is acceptable at M6-B2 (no production translations depend on version 1).

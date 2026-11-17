@@ -360,8 +360,8 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
 /// Gemini transport from `GEMINI_API_KEY`), runs the translation stage, and maps the
 /// outcome to an exit code (0 ok / 4 failed units / 3 precondition / 130 interrupt).
 ///
-/// `--stale`/`--redo`/`--retry-failed` are accepted but deferred to M6-B2; they are
-/// threaded through and currently have no effect.
+/// `--retry-failed` requeues failed batches, `--redo` re-translates unlocked cues,
+/// and `--stale` re-translates stale, unlocked cues (`docs/CLI.md` §6).
 fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir().context("determine current directory")?;
     let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
@@ -471,11 +471,11 @@ fn report_translation_outcome(outcome: &TranslationOutcome) {
         TranslationOutcome::NothingToDo => {
             println!("no translatable cues to translate.");
         }
-        TranslationOutcome::CompletedWithFailures { failed } => {
+        TranslationOutcome::CompletedWithFailures { failed, incomplete } => {
             println!(
-                "translation finished with {failed} failed batch(es). \
-                 See them with `myansub status`; automatic retry of failed batches \
-                 lands in a later step."
+                "translation finished with {failed} failed and {incomplete} incomplete batch(es). \
+                 See them with `myansub status`; re-run `myansub translate --retry-failed` \
+                 to retry just the failures."
             );
         }
         TranslationOutcome::Interrupted => {

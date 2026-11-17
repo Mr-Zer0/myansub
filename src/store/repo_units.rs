@@ -489,6 +489,32 @@ pub fn requeue_failed_analysis_chunks(conn: &Connection) -> Result<usize, StoreE
     Ok(changed)
 }
 
+/// Requeues every `failed` translation batch back to `pending` so a
+/// `translate --retry-failed` run reruns only the failures (`docs/CLI.md` §6),
+/// mirroring [`requeue_failed_analysis_chunks`]. `attempts` is preserved as the
+/// running count; `updated_at` is bumped. Returns the number of batches requeued.
+pub fn requeue_failed_translation_batches(conn: &Connection) -> Result<usize, StoreError> {
+    let changed = conn.execute(
+        "UPDATE translation_batches SET status = 'pending', updated_at = datetime('now') \
+         WHERE status = 'failed'",
+        [],
+    )?;
+    Ok(changed)
+}
+
+/// Requeues one `done` or `failed` translation batch back to `pending` so a
+/// `translate --redo`/`--stale` run re-sends it (`docs/CLI.md` §6), bumping
+/// `updated_at`. A batch in any other state (`pending`/`in_flight`) is left
+/// untouched. Returns whether a row changed.
+pub fn requeue_translation_batch(conn: &Connection, batch_no: i64) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "UPDATE translation_batches SET status = 'pending', updated_at = datetime('now') \
+         WHERE batch_no = ?1 AND status IN ('done', 'failed')",
+        params![batch_no],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Deletes every analysis chunk row (a fresh `--redo` run starts from a clean map
 /// phase). Returns the number of rows removed.
 pub fn clear_analysis_chunks(conn: &Connection) -> Result<usize, StoreError> {

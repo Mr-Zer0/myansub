@@ -26,7 +26,10 @@ use myansub::store::repo_analysis::AnalysisOrigin;
 use myansub::store::repo_analysis::{approve_current_analysis, insert_analysis_version};
 use myansub::store::repo_cues::insert_cues;
 use myansub::store::repo_project::set_stage;
-use myansub::store::repo_translations::{cue_id_by_idx, get_translation, list_translations};
+use myansub::store::repo_translations::{
+    NewTranslation, TranslationOrigin, cue_id_by_idx, get_translation, list_translations,
+    upsert_translation,
+};
 use myansub::store::repo_units::{
     NewTranslationBatch, claim_translation_batch, complete_translation_batch,
     count_translation_batches_by_status, create_translation_batch, get_translation_batch,
@@ -526,14 +529,16 @@ async fn cached_prefix_is_stable_across_batches() {
 // Quality flagging (store flags, no retry — retry is M6-B2)
 // ---------------------------------------------------------------------------
 
-// AC: M6-B1 — a response that drops a cue's placeholder is stored with the
-// `placeholder_mismatch` flag; the batch still completes (no per-flag retry yet).
+// AC: M6-B2 — a response that drops a cue's placeholder (a hard flag) drives one
+// isolated tier-3 per-line retry; when the retry does not fix it the best result is
+// stored WITH the `placeholder_mismatch` flag and the batch still completes `done`.
+// (This replaces the M6-B1 "no per-flag retry" assertion, which tier 3 supersedes.)
 #[tokio::test]
-async fn quality_flags_are_stored_without_retry() {
+async fn hard_flag_drives_tier3_retry_then_stored_flagged() {
     let cues = vec![cue_full(1, "Hello ⟦0⟧", None, true)];
     let store = seed(&cues).await;
     let token = CancellationToken::new();
-    // Target drops the ⟦0⟧ placeholder → placeholder_mismatch.
+    // Target drops the ⟦0⟧ placeholder → placeholder_mismatch, every time.
     let fake = Fake::new().always(|| Ok(lines_response(&[(1, MM)])));
 
     let outcome = run_translation(
@@ -547,7 +552,11 @@ async fn quality_flags_are_stored_without_retry() {
     .await
     .expect("run");
     assert_eq!(outcome, TranslationOutcome::Completed { batches: 1 });
-    assert_eq!(fake.call_count(), 1, "no per-flag retry in M6-B1");
+    assert_eq!(
+        fake.call_count(),
+        2,
+        "original call + exactly one isolated tier-3 per-line retry"
+    );
 
     let id1 = store
         .call(|c| Ok(cue_id_by_idx(c)?.get(&1).copied()))
@@ -561,7 +570,7 @@ async fn quality_flags_are_stored_without_retry() {
         .expect("translated");
     assert!(
         row.flags.contains(&QualityFlag::PlaceholderMismatch),
-        "placeholder_mismatch stored, got {:?}",
+        "placeholder_mismatch stored after the retry failed to fix it, got {:?}",
         row.flags
     );
 }
@@ -628,7 +637,10 @@ async fn content_retry_exhaustion_fails_the_batch_exit_4() {
 
     assert_eq!(
         outcome,
-        TranslationOutcome::CompletedWithFailures { failed: 1 }
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        }
     );
     assert_eq!(translation_exit_code(false, &outcome), 4);
     assert_eq!(
@@ -675,7 +687,10 @@ async fn omitted_batch_cue_id_fails_the_batch() {
 
     assert_eq!(
         outcome,
-        TranslationOutcome::CompletedWithFailures { failed: 1 }
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        }
     );
     assert_eq!(
         fake.call_count(),
@@ -727,7 +742,10 @@ async fn empty_lines_response_fails_the_batch() {
 
     assert_eq!(
         outcome,
-        TranslationOutcome::CompletedWithFailures { failed: 1 }
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        }
     );
     assert_eq!(fake.call_count(), 2, "empty lines → one whole-batch retry");
     let done = store
@@ -911,36 +929,69 @@ async fn no_translatable_cues_is_nothing_to_do() {
     assert_eq!(after.1, 0, "no batch rows");
 }
 
-// AC: M6-B1 — stored quality flags are inert: once a project is fully translated, a
-// rerun (even with `--redo`, deferred to M6-B2) sends nothing and leaves the batches
-// done.
+// AC: M6-B2 — `--redo` re-translates every unlocked cue (re-sending its batch) while a
+// `locked = 1` cue is preserved and excluded from the request, so it is never re-sent
+// or overwritten. (This replaces the M6-B1 "--redo is inert" assertion.) Dropping the
+// locked cue rebuilds the batch's variable block, so the re-sent request is a genuine
+// cache miss and appears in the Fake call log.
 #[tokio::test]
-async fn deferred_flags_are_inert_on_rerun() {
-    // One cue whose translation drops a placeholder → placeholder_mismatch is stored.
-    let cues = vec![cue_full(1, "Hello ⟦0⟧", None, true)];
+async fn redo_retranslates_unlocked_and_preserves_locked() {
+    // One batch with two cues; cue 2 will be reviewer-locked.
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+    ];
     let store = seed(&cues).await;
     let token = CancellationToken::new();
 
-    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM)])));
+    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM)])));
     run_translation(
         fake1.clone(),
         &store,
         &cues,
-        &params(80),
+        &params(2),
         TranslationFlags::default(),
         &token,
     )
     .await
     .expect("run 1");
-    assert_eq!(fake1.call_count(), 1);
+    assert_eq!(fake1.call_count(), 1, "one batch, one call");
 
-    // Rerun with --redo: deferred to M6-B2, so it must be inert here.
-    let fake2 = Fake::new().always(|| Ok(lines_response(&[(1, MM)])));
+    // Lock cue 2 with reviewer text (simulating an M7 review set).
+    let id2 = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&2).copied()))
+        .await
+        .expect("map")
+        .expect("cue 2");
+    store
+        .call(move |c| {
+            upsert_translation(
+                c,
+                &NewTranslation {
+                    cue_id: id2,
+                    text: "ကိုယ်တိုင်ပြင်".to_string(),
+                    origin: TranslationOrigin::User,
+                    locked: true,
+                    stale: false,
+                    flags: vec![],
+                    analysis_version: 1,
+                    model: None,
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("lock cue 2");
+
+    // --redo: cue 1 (unlocked) is re-translated with a new target; cue 2 (locked) is
+    // excluded from the request and left untouched.
+    let mm2 = "နေကောင်းလား";
+    let fake2 = Fake::new().always(move || Ok(lines_response(&[(1, mm2)])));
     let outcome = run_translation(
         fake2.clone(),
         &store,
         &cues,
-        &params(80),
+        &params(2),
         TranslationFlags {
             redo: true,
             ..TranslationFlags::default()
@@ -948,19 +999,38 @@ async fn deferred_flags_are_inert_on_rerun() {
         &token,
     )
     .await
-    .expect("run 2");
+    .expect("redo rerun");
 
     assert_eq!(outcome, TranslationOutcome::Completed { batches: 1 });
-    assert_eq!(
-        fake2.call_count(),
-        0,
-        "a flagged-but-done batch is not resent"
+    assert_eq!(fake2.call_count(), 1, "--redo re-sends the unlocked batch");
+
+    // The re-sent request carries only the unlocked cue id.
+    let texts = call_texts(&fake2);
+    assert!(texts.iter().any(|t| t.contains("[1]")), "cue 1 re-sent");
+    assert!(
+        !texts.iter().any(|t| t.contains("[2]")),
+        "locked cue 2 is never re-sent"
     );
-    let done = store
-        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+
+    // cue 1 now holds the fresh target; cue 2 keeps its locked reviewer text.
+    let id1 = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&1).copied()))
         .await
-        .expect("count");
-    assert_eq!(done, 1, "the batch stays done");
+        .expect("map")
+        .expect("cue 1");
+    let row1 = store
+        .call(move |c| get_translation(c, id1))
+        .await
+        .expect("get")
+        .expect("cue 1 translated");
+    assert_eq!(row1.text, mm2, "unlocked cue re-translated");
+    let row2 = store
+        .call(move |c| get_translation(c, id2))
+        .await
+        .expect("get")
+        .expect("cue 2 present");
+    assert_eq!(row2.text, "ကိုယ်တိုင်ပြင်", "locked cue text preserved");
+    assert!(row2.locked, "cue 2 stays locked");
 }
 
 // AC: M6-B1 — an uneven final batch: 3 translatable cues with batch_size 2 plans
@@ -1087,4 +1157,782 @@ async fn dry_run_reports_estimate_and_writes_nothing() {
     assert_eq!(after.1, 0, "no batch rows written");
     assert_eq!(after.2, 0, "no llm_calls written");
     assert_eq!(after.3, 0, "no cache rows written");
+}
+
+// ---------------------------------------------------------------------------
+// M6-AC3: partial id set → only the MISSING ids are re-requested (tier 2)
+// ---------------------------------------------------------------------------
+
+// AC: M6-AC3 — a first response omits one of the batch's cue ids; the pipeline keeps
+// the valid line it received and re-requests ONLY the missing id as a new, smaller
+// request (not the whole batch). The merged batch then completes `done` with every cue
+// translated. The key proof is the Fake call log: the retry request contains only the
+// missing id.
+#[tokio::test]
+async fn partial_ids_re_request_only_missing_ids() {
+    // Two translatable cues in one batch.
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    // First call returns only id 1 (id 2 missing); the second call returns id 2.
+    let fake = Fake::new()
+        .push_response(lines_response(&[(1, MM)]))
+        .push_response(lines_response(&[(2, MM)]))
+        .always(|| Ok(lines_response(&[(1, MM), (2, MM)])));
+
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(2),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run");
+
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 1 });
+    assert_eq!(
+        fake.call_count(),
+        2,
+        "original call + one partial re-request of the missing id"
+    );
+
+    // The KEY assertion: the second (retry) request carries ONLY the missing id 2,
+    // never the whole batch (no [1]).
+    let texts = call_texts(&fake);
+    assert!(
+        texts[1].contains("[2]"),
+        "the re-request translates the missing cue 2"
+    );
+    assert!(
+        !texts[1].contains("[1]"),
+        "the re-request does not re-send the already-received cue 1"
+    );
+
+    // Both cues end translated and the batch is done.
+    let translations = store.call(|c| list_translations(c)).await.expect("list");
+    assert_eq!(
+        translations.len(),
+        2,
+        "every cue translated after the merge"
+    );
+    let done = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+        .await
+        .expect("count");
+    assert_eq!(done, 1, "the merged batch is done");
+}
+
+// ---------------------------------------------------------------------------
+// M6-AC5: a failed batch does not block other batches; the run exits 4
+// ---------------------------------------------------------------------------
+
+// AC: M6-AC5 — in a multi-batch run, one batch fails irrecoverably (a persistent
+// coverage miss) while the others succeed. The failure does NOT prevent the others
+// from completing: they end `done`, the failing batch ends `failed` with a recorded
+// error, the outcome is CompletedWithFailures and the exit code is 4.
+#[tokio::test]
+async fn one_failed_batch_does_not_block_others_exit_4() {
+    // Three cues, batch_size 1 → batches [1], [2], [3].
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+        cue_full(3, "To the market.", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    // Every call returns ids 1 and 3 only: batches 1 and 3 are covered, batch 2 never
+    // is, so it fails after its retry — independent of dispatch order.
+    let fake = Fake::new().always(|| Ok(lines_response(&[(1, MM), (3, MM)])));
+
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run");
+
+    assert_eq!(
+        outcome,
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        }
+    );
+    assert_eq!(translation_exit_code(false, &outcome), 4, "exit 4");
+
+    let done = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+        .await
+        .expect("count");
+    let failed = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Failed))
+        .await
+        .expect("count");
+    assert_eq!(
+        done, 2,
+        "the other two batches completed despite the failure"
+    );
+    assert_eq!(failed, 1, "exactly the uncoverable batch failed");
+
+    // The failing batch (cue 2) recorded an error so `status`/the report can list it.
+    let b2 = store
+        .call(|c| get_translation_batch(c, 2))
+        .await
+        .expect("get")
+        .expect("batch 2");
+    assert_eq!(b2.status, UnitStatus::Failed);
+    assert!(b2.last_error.is_some(), "failure recorded for the report");
+
+    // The non-blocked batches' cues are translated; the failed batch's is not.
+    let id2 = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&2).copied()))
+        .await
+        .expect("map")
+        .expect("cue 2");
+    assert!(
+        store
+            .call(move |c| get_translation(c, id2))
+            .await
+            .expect("get")
+            .is_none(),
+        "the failed batch committed nothing"
+    );
+    let translations = store.call(|c| list_translations(c)).await.expect("list");
+    assert_eq!(translations.len(), 2, "cues 1 and 3 translated");
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: per-line hard-flag retries; soft flags are not retried
+// ---------------------------------------------------------------------------
+
+// AC: M6-B2 — a cue returned with a hard flag (placeholder_mismatch) drives one
+// isolated per-line retry; when the retry fixes the flag the clean text is stored.
+#[tokio::test]
+async fn tier3_retry_fixes_hard_flag_and_stores_clean() {
+    let cues = vec![cue_full(1, "Hello ⟦0⟧", None, true)];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    let fixed = "⟦0⟧ မင်္ဂလာပါ"; // preserves the placeholder → no mismatch
+    // First response drops ⟦0⟧; the isolated retry restores it.
+    let fake = Fake::new()
+        .push_response(lines_response(&[(1, MM)]))
+        .push_response(lines_response(&[(1, fixed)]))
+        .always(move || Ok(lines_response(&[(1, fixed)])));
+
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(80),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run");
+
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 1 });
+    assert_eq!(fake.call_count(), 2, "one isolated tier-3 retry");
+
+    // The retry re-requests just cue 1.
+    let texts = call_texts(&fake);
+    assert!(
+        texts[1].contains("[1]"),
+        "the retry re-requests the flagged line"
+    );
+
+    let id1 = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&1).copied()))
+        .await
+        .expect("map")
+        .expect("cue 1");
+    let row = store
+        .call(move |c| get_translation(c, id1))
+        .await
+        .expect("get")
+        .expect("translated");
+    assert_eq!(row.text, fixed, "the fixed target replaced the flagged one");
+    assert!(
+        !row.flags.contains(&QualityFlag::PlaceholderMismatch),
+        "placeholder_mismatch cleared, got {:?}",
+        row.flags
+    );
+}
+
+// AC: M6-B2 — a cue carrying only a soft flag (too_long) is stored as-is and is NOT
+// retried: the batch sends exactly one call.
+#[tokio::test]
+async fn soft_flag_only_cue_is_not_retried() {
+    let cues = vec![cue_full(1, "Hello.", None, true)];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    // Three Burmese lines (> max_lines = 2) → too_long (soft); has Myanmar, no
+    // placeholder → no hard flag.
+    let long = "မ\nမ\nမ";
+    let fake = Fake::new().always(move || Ok(lines_response(&[(1, long)])));
+
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(80),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run");
+
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 1 });
+    assert_eq!(fake.call_count(), 1, "a soft flag triggers no retry");
+
+    let id1 = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&1).copied()))
+        .await
+        .expect("map")
+        .expect("cue 1");
+    let row = store
+        .call(move |c| get_translation(c, id1))
+        .await
+        .expect("get")
+        .expect("translated");
+    assert!(row.flags.contains(&QualityFlag::TooLong), "too_long stored");
+    assert!(
+        !row.flags.iter().any(|f| matches!(
+            f,
+            QualityFlag::PlaceholderMismatch
+                | QualityFlag::Untranslated
+                | QualityFlag::ZawgyiSuspect
+        )),
+        "no hard flag present, got {:?}",
+        row.flags
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --retry-failed: requeue failed batches and rerun; done batches are not resent
+// ---------------------------------------------------------------------------
+
+// AC: M6-B2 — after a run leaves one batch failed, a `--retry-failed` rerun with a
+// valid script reruns only that batch (now succeeding, exit 0); the already-done
+// batches are not resent.
+#[tokio::test]
+async fn retry_failed_reruns_only_the_failed_batch() {
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+        cue_full(3, "To the market.", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+
+    // Run 1: batch 2 never gets covered → fails; 1 and 3 succeed.
+    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (3, MM)])));
+    let outcome = run_translation(
+        fake1.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run 1");
+    assert_eq!(
+        outcome,
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        }
+    );
+
+    // Run 2 --retry-failed: a valid script; only batch 2 is requeued and rerun.
+    let fake2 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (3, MM)])));
+    let outcome = run_translation(
+        fake2.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags {
+            retry_failed: true,
+            ..TranslationFlags::default()
+        },
+        &token,
+    )
+    .await
+    .expect("run 2");
+
+    assert_eq!(
+        outcome,
+        TranslationOutcome::Completed { batches: 3 },
+        "exit 0"
+    );
+    assert_eq!(translation_exit_code(false, &outcome), 0);
+    assert_eq!(
+        fake2.call_count(),
+        1,
+        "only the previously-failed batch is resent"
+    );
+
+    // The resent request is the failed batch's cue 2 only.
+    let texts = call_texts(&fake2);
+    assert!(texts.iter().any(|t| t.contains("[2]")), "batch 2 rerun");
+    assert!(
+        !texts.iter().any(|t| t.contains("[1]") || t.contains("[3]")),
+        "done batches 1 and 3 are not resent"
+    );
+
+    let done = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+        .await
+        .expect("count");
+    assert_eq!(done, 3, "all batches done after retry-failed");
+}
+
+// ---------------------------------------------------------------------------
+// --stale: rerun only batches overlapping a stale, unlocked cue
+// ---------------------------------------------------------------------------
+
+/// Deletes every local response-cache row (so a re-run actually re-calls the fake).
+async fn clear_llm_cache(store: &Store) {
+    store
+        .call(|c| {
+            c.execute("DELETE FROM llm_cache", [])?;
+            Ok(())
+        })
+        .await
+        .expect("clear cache");
+}
+
+// AC: M6-B2 — with `--stale`, only the batch overlapping a stale, unlocked cue is
+// re-run; a non-stale batch is untouched, and a stale+locked cue is never re-run.
+#[tokio::test]
+async fn stale_reruns_only_stale_unlocked_batch() {
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+        cue_full(3, "To the market.", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+
+    // Run 1: everything translated, batch_size 1 → batches [1], [2], [3].
+    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (3, MM)])));
+    run_translation(
+        fake1.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run 1");
+
+    // Mark cue 1 stale+unlocked; cue 3 stale+locked (must NOT re-run); cue 2 clean.
+    let ids = store
+        .call(|c| {
+            let m = cue_id_by_idx(c)?;
+            Ok((m[&1], m[&3]))
+        })
+        .await
+        .expect("ids");
+    store
+        .call(move |c| {
+            upsert_translation(
+                c,
+                &NewTranslation {
+                    cue_id: ids.0,
+                    text: MM.to_string(),
+                    origin: TranslationOrigin::Llm,
+                    locked: false,
+                    stale: true,
+                    flags: vec![],
+                    analysis_version: 1,
+                    model: None,
+                },
+            )?;
+            upsert_translation(
+                c,
+                &NewTranslation {
+                    cue_id: ids.1,
+                    text: MM.to_string(),
+                    origin: TranslationOrigin::User,
+                    locked: true,
+                    stale: true,
+                    flags: vec![],
+                    analysis_version: 1,
+                    model: None,
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("set stale/locked");
+
+    // Clear the local cache so a genuine re-run calls the fake (an identical request
+    // would otherwise be a free cache hit).
+    clear_llm_cache(&store).await;
+
+    // Run 2 --stale: a fresh target proves cue 1 was re-translated.
+    let mm2 = "နေကောင်းလား";
+    let fake2 = Fake::new().always(move || Ok(lines_response(&[(1, mm2), (2, mm2), (3, mm2)])));
+    let outcome = run_translation(
+        fake2.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags {
+            stale: true,
+            ..TranslationFlags::default()
+        },
+        &token,
+    )
+    .await
+    .expect("run 2");
+
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 3 });
+    assert_eq!(
+        fake2.call_count(),
+        1,
+        "only the stale, unlocked batch is re-run"
+    );
+    let texts = call_texts(&fake2);
+    assert!(
+        texts.iter().any(|t| t.contains("[1]")),
+        "stale cue 1 re-run"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("[2]") || t.contains("[3]")),
+        "non-stale cue 2 and stale+locked cue 3 are not re-run"
+    );
+
+    // cue 1 re-translated; cue 3 (stale+locked) preserved.
+    let row1 = store
+        .call(move |c| get_translation(c, ids.0))
+        .await
+        .expect("get")
+        .expect("cue 1");
+    assert_eq!(row1.text, mm2, "stale unlocked cue re-translated");
+    let row3 = store
+        .call(move |c| get_translation(c, ids.1))
+        .await
+        .expect("get")
+        .expect("cue 3");
+    assert_eq!(row3.text, MM, "stale+locked cue preserved");
+}
+
+// AC: M6-B2 — `--stale` re-requests ONLY the stale, unlocked cues in an affected
+// batch: a mixed batch (batch_size ≥ 2) holding one stale-unlocked cue and one
+// non-stale unlocked cue re-sends only the stale cue's id, and the non-stale cue's
+// prior translation is preserved (not re-sent, not re-billed, not overwritten).
+#[tokio::test]
+async fn stale_re_requests_only_stale_cues_in_a_mixed_batch() {
+    // One batch of two cues (batch_size 2): cue 1 will be stale, cue 2 stays clean.
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+
+    // Run 1: both cues translated to MM in one batch.
+    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM)])));
+    run_translation(
+        fake1.clone(),
+        &store,
+        &cues,
+        &params(2),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run 1");
+    assert_eq!(fake1.call_count(), 1, "one batch, one call");
+
+    // Mark cue 1 stale+unlocked; cue 2 stays clean (not stale).
+    let ids = store
+        .call(|c| {
+            let m = cue_id_by_idx(c)?;
+            Ok((m[&1], m[&2]))
+        })
+        .await
+        .expect("ids");
+    store
+        .call(move |c| {
+            upsert_translation(
+                c,
+                &NewTranslation {
+                    cue_id: ids.0,
+                    text: MM.to_string(),
+                    origin: TranslationOrigin::Llm,
+                    locked: false,
+                    stale: true,
+                    flags: vec![],
+                    analysis_version: 1,
+                    model: None,
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("mark cue 1 stale");
+
+    clear_llm_cache(&store).await;
+
+    // Run 2 --stale: a fresh target; only cue 1 (stale) should be re-requested.
+    let mm2 = "နေကောင်းလား";
+    let fake2 = Fake::new().always(move || Ok(lines_response(&[(1, mm2), (2, mm2)])));
+    let outcome = run_translation(
+        fake2.clone(),
+        &store,
+        &cues,
+        &params(2),
+        TranslationFlags {
+            stale: true,
+            ..TranslationFlags::default()
+        },
+        &token,
+    )
+    .await
+    .expect("run 2");
+
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 1 });
+    assert_eq!(fake2.call_count(), 1, "the stale batch is re-run once");
+
+    // The re-request carries ONLY the stale cue id, never the non-stale cue 2.
+    let texts = call_texts(&fake2);
+    assert!(
+        texts.iter().any(|t| t.contains("[1]")),
+        "stale cue 1 re-sent"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("[2]")),
+        "non-stale cue 2 is never re-sent under --stale"
+    );
+
+    // cue 1 re-translated; cue 2's prior translation is unchanged.
+    let row1 = store
+        .call(move |c| get_translation(c, ids.0))
+        .await
+        .expect("get")
+        .expect("cue 1");
+    assert_eq!(row1.text, mm2, "stale cue re-translated");
+    let row2 = store
+        .call(move |c| get_translation(c, ids.1))
+        .await
+        .expect("get")
+        .expect("cue 2");
+    assert_eq!(row2.text, MM, "non-stale cue preserved unchanged");
+}
+
+// AC: M6-B2 — `--stale --retry-failed` runs both selectors independently: a project
+// with a stale-unlocked cue in one batch AND a separately-failed batch re-runs BOTH
+// (retry-failed is not a subset of stale/redo, so a failed batch — which has no
+// translation rows and so never enters the stale set — is still requeued).
+#[tokio::test]
+async fn stale_and_retry_failed_rerun_both_batches() {
+    // Three cues, batch_size 1 → batches [1], [2], [3].
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+        cue_full(3, "To the market.", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+
+    // Run 1: batch 2 never covered → fails; batches 1 and 3 succeed.
+    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (3, MM)])));
+    let outcome = run_translation(
+        fake1.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run 1");
+    assert_eq!(
+        outcome,
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        }
+    );
+
+    // Mark cue 1 stale+unlocked (batch 1); batch 2 is still failed from run 1.
+    let id1 = store
+        .call(|c| Ok(cue_id_by_idx(c)?[&1]))
+        .await
+        .expect("id1");
+    store
+        .call(move |c| {
+            upsert_translation(
+                c,
+                &NewTranslation {
+                    cue_id: id1,
+                    text: MM.to_string(),
+                    origin: TranslationOrigin::Llm,
+                    locked: false,
+                    stale: true,
+                    flags: vec![],
+                    analysis_version: 1,
+                    model: None,
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("mark cue 1 stale");
+
+    clear_llm_cache(&store).await;
+
+    // Run 2 --stale --retry-failed: batch 1 (stale) AND batch 2 (failed) both re-run.
+    let mm2 = "နေကောင်းလား";
+    let fake2 = Fake::new().always(move || Ok(lines_response(&[(1, mm2), (2, mm2), (3, mm2)])));
+    let outcome = run_translation(
+        fake2.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags {
+            stale: true,
+            retry_failed: true,
+            ..TranslationFlags::default()
+        },
+        &token,
+    )
+    .await
+    .expect("run 2");
+
+    assert_eq!(
+        outcome,
+        TranslationOutcome::Completed { batches: 3 },
+        "exit 0"
+    );
+    assert_eq!(translation_exit_code(false, &outcome), 0);
+    assert_eq!(
+        fake2.call_count(),
+        2,
+        "both the stale batch and the failed batch re-run"
+    );
+    let texts = call_texts(&fake2);
+    assert!(
+        texts.iter().any(|t| t.contains("[1]")),
+        "stale batch 1 re-run"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("[2]")),
+        "failed batch 2 re-run"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("[3]")),
+        "clean, non-stale batch 3 is not re-run"
+    );
+
+    let done = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+        .await
+        .expect("count");
+    assert_eq!(done, 3, "all batches done after stale + retry-failed");
+}
+
+// AC: M6-B2 — an interruption DURING a multi-call (tier-2) batch leaves the batch
+// in_flight with nothing committed; a Store reopen recovers it to pending. Mirrors
+// the analysis in-flight-recovery template but for the multi-call content path.
+#[tokio::test]
+async fn interrupt_during_multi_call_batch_commits_nothing_and_recovers() {
+    let tmp = tempdir().expect("tempdir");
+    let db = tmp.path().join("project.db");
+    // One batch of two cues (batch_size 2) forces a tier-2 second sub-request.
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+    ];
+    {
+        let store = Store::open(&db).expect("open seed");
+        let c = cues.clone();
+        store
+            .call(move |conn| insert_cues(conn, &c))
+            .await
+            .expect("cues");
+        store
+            .call(|conn| {
+                insert_analysis_version(
+                    conn,
+                    ANALYSIS,
+                    AnalysisOrigin::Llm,
+                    "sha256:proj",
+                    "prompt_v1|m",
+                )
+                .map(|_| ())
+            })
+            .await
+            .expect("analysis");
+        store
+            .call(|conn| approve_current_analysis(conn).map(|_| ()))
+            .await
+            .expect("approve");
+    }
+
+    let store = Store::open(&db).expect("open run");
+    let token = CancellationToken::new();
+    // The first call returns only id 1 (id 2 missing) AND cancels the token, so the
+    // tier-2 re-request for the missing id 2 is short-circuited by cancellation before
+    // a second call is ever sent.
+    let fake = Fake::new()
+        .push_response(lines_response(&[(1, MM)]))
+        .cancel_after(token.clone(), 1);
+
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(2),
+        TranslationFlags::default(),
+        &token,
+    )
+    .await
+    .expect("run");
+    assert_eq!(outcome, TranslationOutcome::Interrupted);
+    assert_eq!(translation_exit_code(true, &outcome), 130);
+    assert_eq!(
+        fake.call_count(),
+        1,
+        "the second sub-request is never sent after cancellation"
+    );
+
+    // Nothing committed: no translations, and the batch is not done.
+    let translations = store.call(|c| list_translations(c)).await.expect("list");
+    assert!(
+        translations.is_empty(),
+        "no partial translations committed, got {translations:?}"
+    );
+    let done = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+        .await
+        .expect("count");
+    assert_eq!(done, 0, "the interrupted batch is not marked done");
+
+    // The batch was left in_flight; a Store reopen recovers it to pending.
+    drop(store);
+    let store = Store::open(&db).expect("reopen");
+    let pending = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Pending))
+        .await
+        .expect("count");
+    assert_eq!(pending, 1, "the interrupted batch recovered to pending");
+    let in_flight = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::InFlight))
+        .await
+        .expect("count");
+    assert_eq!(in_flight, 0, "no batch left in_flight after recovery");
 }

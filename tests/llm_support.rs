@@ -17,8 +17,8 @@ use myansub::llm::retry::Xorshift;
 use myansub::llm::schemas::{analysis_response_schema, translation_response_schema};
 
 #[test]
-fn prompt_version_is_one() {
-    assert_eq!(PROMPT_VERSION, 1);
+fn prompt_version_is_two() {
+    assert_eq!(PROMPT_VERSION, 2);
 }
 
 #[test]
