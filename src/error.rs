@@ -8,6 +8,7 @@
 pub use crate::config::ConfigError;
 pub use crate::formats::codec::FormatError;
 pub use crate::formats::encoding::EncodingError;
+pub use crate::llm::client::LlmError;
 pub use crate::store::StoreError;
 
 /// Process exit codes, per `docs/CLI.md` §7.
@@ -57,6 +58,14 @@ impl ExitCode for FormatError {
 }
 
 impl ExitCode for StoreError {
+    fn exit_code(&self) -> i32 {
+        exit::ERROR
+    }
+}
+
+impl ExitCode for LlmError {
+    /// `LlmError` itself maps to the generic error code; the pipeline translates
+    /// failed *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
     fn exit_code(&self) -> i32 {
         exit::ERROR
     }

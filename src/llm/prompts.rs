@@ -1,0 +1,122 @@
+//! Prompt builders and the [`PROMPT_VERSION`] constant (`docs/LLM.md` §2).
+//!
+//! These are pure string/structure builders used by the analysis and translation
+//! pipelines (M5/M6). The content above the cached-prefix line must be
+//! byte-identical across all calls of a stage, so everything here is
+//! deterministic. Any change to a prompt or the response schema must bump
+//! [`PROMPT_VERSION`], which is part of every cache key (`CLAUDE.md`,
+//! `docs/LLM.md` §2/§4).
+
+/// The prompt/schema version. Bump on any change to a system instruction, the
+/// variable-block layout, or a response schema.
+pub const PROMPT_VERSION: u32 = 1;
+
+/// The static system instruction for the analysis stage (`docs/LLM.md` §2,
+/// "Analysis prompt"). English prose; the output is the analysis document
+/// (`docs/DATA_MODEL.md` §3).
+pub fn analysis_system_instruction() -> String {
+    [
+        "You analyze a subtitle transcript to prepare it for translation into Burmese (Myanmar).",
+        "Produce a single analysis document as JSON matching the provided schema.",
+        "Write all prose fields in English. Write self_ref, addressee_ref, particle, and glossary targets in Burmese (Unicode, never Zawgyi).",
+        "Mark a character's gender as \"unknown\" when the text is insufficient. Do not guess.",
+        "List concrete ambiguities that would change the Burmese output.",
+        "Scenes must cover the cue range contiguously.",
+        "Return only JSON matching the schema.",
+    ]
+    .join("\n")
+}
+
+/// The static system instruction for the translation stage (`docs/LLM.md` §2,
+/// "System instruction for translation").
+pub fn translation_system_instruction() -> String {
+    [
+        "You translate subtitle lines into natural, spoken Myanmar (Burmese) in Unicode. Never use Zawgyi.",
+        "Choose pronouns, kinship terms, register, and sentence-final particles from the address matrix. Infer the speaker from the scene speakers and the dialogue when not given.",
+        "Keep glossary terms marked keep: true unchanged. Use glossary targets consistently.",
+        "Preserve every \u{27E6}n\u{27E7} placeholder exactly once.",
+        "Translate each line only from its own source. Never move text between lines, even when a sentence spans several cues.",
+        "Keep lines short enough to read; subtitles are not prose.",
+        "Return only JSON matching the schema: {\"lines\":[{\"id\":\u{2026},\"t\":\"\u{2026}\"}]}.",
+    ]
+    .join("\n")
+}
+
+/// Formats one transcript line for the analysis input as `[idx] Speaker: text`,
+/// or `[idx] text` when the speaker is unknown (`docs/LLM.md` §2).
+pub fn analysis_input_line(idx: u32, speaker: Option<&str>, text: &str) -> String {
+    match speaker {
+        Some(name) if !name.is_empty() => format!("[{idx}] {name}: {text}"),
+        _ => format!("[{idx}] {text}"),
+    }
+}
+
+/// A single line in a translation variable block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationLine {
+    pub idx: u32,
+    /// The ASS Name/Actor speaker, when known (`docs/LLM.md` §2).
+    pub speaker: Option<String>,
+    pub text: String,
+}
+
+impl TranslationLine {
+    fn render(&self) -> String {
+        analysis_input_line(self.idx, self.speaker.as_deref(), &self.text)
+    }
+}
+
+/// The inputs for one translation batch's variable block (`docs/LLM.md` §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationBlock<'a> {
+    pub scene: &'a str,
+    /// Scene speakers as `(id, name)` pairs, e.g. `("c1", "Aoi")`.
+    pub speakers: &'a [(String, String)],
+    pub context_before: &'a [TranslationLine],
+    pub translate: &'a [TranslationLine],
+    pub context_after: &'a [TranslationLine],
+}
+
+impl TranslationBlock<'_> {
+    /// Renders the variable block as laid out in `docs/LLM.md` §2. A context
+    /// section is omitted entirely when its line slice is empty, so no empty
+    /// header or stray blank line is emitted.
+    pub fn render(&self) -> String {
+        let speakers = self
+            .speakers
+            .iter()
+            .map(|(id, name)| format!("{id} ({name})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let render_lines = |lines: &[TranslationLine]| {
+            lines
+                .iter()
+                .map(TranslationLine::render)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Each present section is a block of non-empty text; sections are joined
+        // with a blank line between them, so no empty section leaves a gap.
+        let mut sections: Vec<String> = Vec::new();
+        sections.push(format!(
+            "SCENE: {}\nSPEAKERS IN SCENE: {speakers}",
+            self.scene
+        ));
+        if !self.context_before.is_empty() {
+            sections.push(format!(
+                "CONTEXT BEFORE (reference only, do not translate):\n{}",
+                render_lines(self.context_before)
+            ));
+        }
+        sections.push(format!("TRANSLATE:\n{}", render_lines(self.translate)));
+        if !self.context_after.is_empty() {
+            sections.push(format!(
+                "CONTEXT AFTER (reference only, do not translate):\n{}",
+                render_lines(self.context_after)
+            ));
+        }
+        sections.join("\n\n")
+    }
+}

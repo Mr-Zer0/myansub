@@ -181,6 +181,7 @@ pub struct PriceEntry {
     pub input: f64,
     pub cached_input: f64,
     pub output: f64,
+    /// Explicit-cache storage rate, in USD per 1,000,000 tokens per hour.
     #[serde(default)]
     pub storage_per_hour: f64,
     #[serde(default = "default_flex_multiplier")]

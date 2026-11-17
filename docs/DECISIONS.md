@@ -138,3 +138,27 @@ to keep each adapter a pure single-crate wrapper. Consequence: ASS/SSA source te
 for files with complete V4+ headers; legacy v4 SSA that `rsubs-lib` cannot parse keeps
 `subtitler`'s comma-corrupted text (graceful, with a warning). SRT/VTT/SBV are unchanged
 (`subtitler` only). No hand-written parsing — both parses go through the crates.
+
+### ADR-025 Gemini structured output uses `responseJsonSchema`
+Context: `docs/LLM.md` §1 leaves open ([verify]) whether to send the response schema as
+`generationConfig.responseSchema` or `generationConfig.responseJsonSchema`. Verified against the
+live Gemini `generateContent` API reference (checked 2026-11, Gemini 3.x Flash era): the reference
+documents `responseJsonSchema` (full JSON Schema) as the field to use and marks the older
+`responseSchema` as "an internal detail. Use responseJsonSchema rather than this field." Decision:
+model the schemas in `llm/schemas.rs` using only keywords valid in both dialects (`type`,
+`properties`, `items`, `required`, `enum`, `maxItems`, `maxLength`, `minItems`) and have the
+transport (`gemini.rs`, M3-B) send them under `responseJsonSchema`. Consequence: the modeled
+`serde_json::Value` is compatible either way; only the wire field name in `gemini.rs` is affected,
+and it should be `responseJsonSchema`. Bump `PROMPT_VERSION` if the schema shape later changes.
+
+### ADR-026 Retry policy takes the jitter factor as a parameter
+Context: `docs/LLM.md` §6 requires full jitter on backoff but the policy must be a pure function
+whose exact delays unit tests can assert (M3-AC2). `docs/LLM.md` §6 permits either passing a drawn
+jitter factor into `decide` or returning the ceiling plus a separate `jittered(ceiling, rng)` helper.
+Decision: `decide(err, attempt, consecutive_sheds, cfg, jitter: f64)` takes the full-jitter factor
+(`[0,1)`) and returns the final `Retry { delay }`; a server-provided `Retry-After`/`RetryInfo` delay
+on a 429 is honored exactly and is not jittered. The `Retrying` layer (M3-B) draws the factor from a
+local `Xorshift` PRNG (no `rand`, per ARCHITECTURE §10) seeded from the system clock, with the seed
+injectable for tests. `RetryConfig` is a plain struct (not the config type) so the policy stays pure
+and independent of `config`. Consequence: tests assert exact delays by passing a fixed factor; the
+layer owns the one impure step (drawing jitter and sleeping).
