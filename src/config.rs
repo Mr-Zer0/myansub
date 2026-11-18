@@ -557,6 +557,17 @@ impl Config {
                 ),
             });
         }
+        // The `auto` break-even treats implicit_hit_rate as a probability
+        // (`docs/LLM.md` §5.5), so it must lie in [0, 1].
+        if !(0.0..=1.0).contains(&self.cache.implicit_hit_rate) {
+            return Err(ConfigError::Invalid {
+                key: "cache.implicit_hit_rate".to_string(),
+                message: format!(
+                    "must be between 0.0 and 1.0, got {}",
+                    self.cache.implicit_hit_rate
+                ),
+            });
+        }
         Ok(())
     }
 

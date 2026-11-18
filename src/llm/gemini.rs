@@ -28,6 +28,15 @@
 //!   like `"5s"`) inside the `error.details` array. 503 (overloaded / capacity /
 //!   flex shed) maps to [`LlmError::Shed`]; 500/502/504 to [`LlmError::Server`]
 //!   (ADR-028).
+//! - **Explicit context cache** ([`ContextCacheClient`]): `POST {base}/cachedContents`
+//!   with `{ model: "models/<name>", contents, systemInstruction, ttl: "<n>s" }`
+//!   returns `{ name: "cachedContents/<id>", …, usageMetadata.totalTokenCount }`;
+//!   `DELETE {base}/<name>` removes it; a `generateContent` call references it via a
+//!   top-level `cachedContent` field (the system instruction and cached contents are
+//!   baked into the cache, so they are *not* re-sent on such a call). Verified against
+//!   the live Gemini v1beta reference (checked 2026-11): the endpoints, the string
+//!   `ttl` duration, the `cachedContent` reference field, and the baked-in-prefix rule
+//!   all match (ADR-042). All `cachedContents` wire names are confined to this module.
 
 use std::time::Duration;
 
@@ -37,6 +46,7 @@ use crate::llm::client::{
     ContentBlock, GenerationConfig, LlmClient, LlmError, LlmRequest, LlmResponse, Role, Secret,
     ServiceTier, ThinkingSetting, Usage,
 };
+use crate::llm::context_cache::{CacheHandle, ContextCacheClient, CreateCacheRequest};
 
 /// The Gemini `generateContent` transport. Holds one shared [`reqwest::Client`]
 /// (`docs/LLM.md` §1); clone it freely — the client is internally reference
@@ -123,6 +133,116 @@ impl LlmClient for Gemini {
             Err(map_error_response(status.as_u16(), retry_after, &text))
         }
     }
+}
+
+impl ContextCacheClient for Gemini {
+    async fn create_cache(&self, req: CreateCacheRequest) -> Result<CacheHandle, LlmError> {
+        let url = format!("{}/cachedContents", self.base_url.trim_end_matches('/'));
+        let body = build_cached_content_body(&req);
+        tracing::trace!(model = %req.model, "gemini cachedContents create");
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", self.api_key.expose())
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        let status = response.status();
+        let retry_after = parse_retry_after_header(&response);
+        let text = response
+            .text()
+            .await
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+
+        if status.is_success() {
+            parse_cache_handle(&text)
+        } else {
+            Err(map_error_response(status.as_u16(), retry_after, &text))
+        }
+    }
+
+    async fn delete_cache(&self, name: String) -> Result<(), LlmError> {
+        // `name` is a `cachedContents/...` resource name; the delete URL is
+        // `{base_url}/{name}`.
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            name.trim_start_matches('/')
+        );
+        tracing::trace!(cache = %name, "gemini cachedContents delete");
+
+        let response = self
+            .client
+            .delete(&url)
+            .header("x-goog-api-key", self.api_key.expose())
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let retry_after = parse_retry_after_header(&response);
+            let text = response
+                .text()
+                .await
+                .map_err(|e| LlmError::Transport(e.to_string()))?;
+            Err(map_error_response(status.as_u16(), retry_after, &text))
+        }
+    }
+}
+
+/// Builds the `cachedContents` create request JSON from a logical
+/// [`CreateCacheRequest`] (`docs/LLM.md` §5.5). All Gemini `cachedContents` wire
+/// names are confined here (ADR-042).
+fn build_cached_content_body(req: &CreateCacheRequest) -> Value {
+    let mut body = json!({
+        "model": qualify_model(&req.model),
+        "contents": [ { "role": "user", "parts": [ { "text": req.content } ] } ],
+        // TTL is a protobuf duration string (e.g. "900s").
+        "ttl": format!("{}s", req.ttl_secs),
+    });
+    // The system instruction is baked into the cache (omitted when empty so the
+    // cached prefix stays byte-stable, `docs/LLM.md` §2).
+    if !req.system_instruction.is_empty() {
+        body["systemInstruction"] = json!({ "parts": [ { "text": req.system_instruction } ] });
+    }
+    body
+}
+
+/// Qualifies a plain model name to the `models/<name>` form the `cachedContents`
+/// endpoint expects, leaving an already-qualified name untouched.
+fn qualify_model(model: &str) -> String {
+    if model.starts_with("models/") {
+        model.to_string()
+    } else {
+        format!("models/{model}")
+    }
+}
+
+/// Parses a successful `cachedContents` create body into a [`CacheHandle`]: the
+/// `name` resource id and the `usageMetadata.totalTokenCount` (defaulting to `0`).
+fn parse_cache_handle(body: &str) -> Result<CacheHandle, LlmError> {
+    let value: Value = serde_json::from_str(body).map_err(|e| LlmError::Decode(e.to_string()))?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LlmError::Decode("cachedContents response had no name".to_string()))?;
+    let token_count = value
+        .get("usageMetadata")
+        .and_then(|m| m.get("totalTokenCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Ok(CacheHandle {
+        name: name.to_string(),
+        token_count,
+    })
 }
 
 /// Builds the `generateContent` request JSON from a logical [`LlmRequest`].

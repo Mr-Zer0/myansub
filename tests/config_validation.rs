@@ -67,6 +67,29 @@ fn invalid_cache_provider_names_the_key() {
 }
 
 #[test]
+fn implicit_hit_rate_out_of_range_names_the_key() {
+    // The auto break-even treats implicit_hit_rate as a probability in [0, 1]
+    // (docs/LLM.md §5.5); a value outside that range is rejected.
+    let err = load_toml("[cache]\nimplicit_hit_rate = 1.5\n")
+        .expect_err("should reject implicit_hit_rate 1.5");
+    assert!(
+        err.to_string().contains("implicit_hit_rate"),
+        "error should name cache.implicit_hit_rate, got: {err}"
+    );
+    let err = load_toml("[cache]\nimplicit_hit_rate = -0.1\n")
+        .expect_err("should reject implicit_hit_rate -0.1");
+    assert!(err.to_string().contains("implicit_hit_rate"));
+}
+
+#[test]
+fn implicit_hit_rate_in_range_passes() {
+    let config = load_toml("[cache]\nimplicit_hit_rate = 0.0\n").expect("0.0 is valid");
+    assert_eq!(config.cache.implicit_hit_rate, 0.0);
+    let config = load_toml("[cache]\nimplicit_hit_rate = 1.0\n").expect("1.0 is valid");
+    assert_eq!(config.cache.implicit_hit_rate, 1.0);
+}
+
+#[test]
 fn drift_ratio_below_one_names_the_key() {
     // drift_ratio < 1.0 makes boundary_drift over-flag (low = med/ratio → inf).
     let err =

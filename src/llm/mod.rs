@@ -12,6 +12,7 @@
 pub mod cache;
 pub mod canonical;
 pub mod client;
+pub mod context_cache;
 pub mod dry_run;
 pub mod gemini;
 pub mod metered;
@@ -31,6 +32,11 @@ pub use canonical::canonical_json;
 pub use client::{
     CachePayload, CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError,
     LlmRequest, LlmResponse, Role, Secret, ServiceTier, ThinkingSetting, Usage,
+};
+pub use context_cache::{
+    CacheDecision, CacheHandle, CacheProvider, CacheSpec, ContextCacheClient, ContextCacheError,
+    CreateCacheRequest, ProviderCacheEntry, ProviderCacheStore, ProviderCacheStoreError,
+    SkipReason, delete_cache, get_or_create, should_create_explicit_cache,
 };
 pub use dry_run::{DryRun, Estimator};
 pub use gemini::Gemini;

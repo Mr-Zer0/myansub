@@ -463,3 +463,63 @@ diff against is the newest analysis version strictly older than the just-approve
 translations were built against (`MAX(analysis_version) < approved` over `translations`); a first approval with
 no translations, a re-approval of the same version, or byte-identical docs are all no-ops. A role-only character
 edit invalidates nothing: `role` is not among §7's five character fields, so it is not even parsed.
+
+### ADR-042 Explicit context-cache: derived discounts, locally-tracked expiry, unverified cachedContents wire shape (M8-B)
+
+Context (M8-B, `docs/LLM.md` §5.5, `docs/CONFIG.md`, `docs/DATA_MODEL.md` §2, `docs/ARCHITECTURE.md` §3/§10):
+implementing the Gemini explicit context-cache lifecycle and the `auto` break-even raised three choices the docs
+leave open. Decisions:
+
+(a) **Break-even discounts are derived from the price table.** The §5.5 formula multiplies by
+`(explicit_discount - implicit_hit_rate * implicit_discount)`, but `[pricing]` has no `explicit_discount` /
+`implicit_discount` keys — only `input` and `cached_input`. Both discounts are therefore derived as
+`discount = (input - cached_input) / input`, clamped to `[0, 1]` (a zero/negative `input` → zero discount). Under
+this model the explicit and implicit discounts are equal; `should_create_explicit_cache` keeps them as separate
+terms in the formula so M9 tuning can diverge them (e.g. add explicit keys) without reshaping the function. The
+saving is computed in USD (both terms divided by 1e6, matching `pricing.rs`'s per-1M-token basis); the common
+positive divisor cannot change the `> 0` outcome, so dividing is purely for a meaningful figure. `auto` with no
+price entry skips (`UnknownPrice`) rather than risk paying storage for an unknowable benefit; `explicit` never
+consults the price (it creates whenever the prefix reaches `min_cache_tokens`). `cache.implicit_hit_rate` is
+validated to `[0, 1]`.
+
+(b) **Expiry is tracked locally as `now + ttl` in epoch seconds, not parsed from the server.** The `cachedContents`
+response carries an RFC3339 `expireTime`, but parsing/comparing timestamps would need `chrono`, which is not an
+approved dependency (ARCHITECTURE §10). Instead `get_or_create` takes an injected `now` (epoch seconds) and stores
+`expires_at = now + ttl_secs` in `provider_cache` (the `expires_at TEXT` column holds the decimal epoch). The
+reuse-vs-recreate decision is `expires_at > now`, so it is deterministic in tests (no wall-clock) and needs no date
+library. The system clock is read only at the lifecycle's call boundary (the caller passes `now`).
+
+(c) **The `cachedContents` wire shape is VERIFIED against the live Gemini v1beta reference (checked 2026-11) and
+matches.** Confined to `gemini.rs`: create is `POST {base}/cachedContents` with `{ model: "models/<name>",
+contents: [{role:"user",parts:[{text}]}], systemInstruction: {parts:[{text}]}, ttl: "<n>s" }` (TTL is a string
+duration); the response's `name` (`cachedContents/<id>`) and `usageMetadata.totalTokenCount` are read; delete is
+`DELETE {base}/<name>`; a `generateContent` call references the cache via a top-level `cachedContent` field, with the
+system instruction and cached contents baked into the cache at create time and therefore NOT re-sent on such a call
+(the system-instruction placement rule §5.5 flagged). All field names were confirmed against the current reference;
+if one later changes, only `gemini.rs` changes.
+
+(d) **Seam direction mirrors ADR-030; request-plumbing deferred (confirmed safe).** `llm::context_cache` defines two
+narrow traits — `ContextCacheClient` (implemented by `gemini.rs`) and `ProviderCacheStore` (implemented by
+`store/repo_llm.rs`) — so `llm` never references `store`, exactly as ADR-030 established for the local cache/usage
+seams. The lifecycle (create/reuse/recreate/delete) and the `auto`/`explicit` decision are fully implemented and
+tested (pure unit tests for the decision; wiremock + in-memory-fake unit tests for the lifecycle, including the
+crash-safe local-then-remote delete ordering). The explicit cache is never invoked from the pipeline yet, so no
+production caches are created — the deferral cannot regress the default cost path, which already benefits from the
+stable-prefix implicit caching (ADR-006).
+
+The remaining **WIRING FOLLOW-UP** (tracked post-M8, not implemented now) needed before the explicit cache delivers
+any benefit:
+- (i) add an optional `cached_content: Option<String>` field to `LlmRequest` that `gemini.rs` emits as the top-level
+  `cachedContent` field and `Fake` ignores (NO `LlmClient` bound change); when set, OMIT the baked-in prefix
+  (system instruction + analysis sheet) from the request;
+- (ii) per `LLM.md` §4 the LOCAL response-cache key must still EXCLUDE the explicit handle but FOLD IN the hash of the
+  cached content, so a request served against a cache still keys correctly;
+- (iii) invoke `get_or_create` / `delete_cache` in `run_translation` behind an OPTIONAL capability
+  (e.g. `run` accepts `Option<&C: ContextCacheClient>`; `Gemini` passes `Some`, tests pass `None`) so offline
+  pipeline tests stay `Fake`-only;
+- (iv) derive `TTL = est_duration + ttl_margin_secs` at the call site;
+- (v) on a cache-not-found error at `generateContent`, RECREATE (Gemini may clamp the granted TTL below the requested
+  value, so a cache can expire earlier than our locally-tracked `expires_at`);
+- (vi) route cache create/delete through the `Retrying` policy so 429/503 on cache ops are retried.
+
+The M8-B ACs (break-even unit tests; reuse/recreate wiremock) are met without that wiring.

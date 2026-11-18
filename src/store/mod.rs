@@ -29,7 +29,10 @@ pub use repo_analysis::{
     insert_analysis_version_in_tx, list_analysis_versions,
 };
 pub use repo_cues::{insert_cues, insert_cues_in_tx, load_cues};
-pub use repo_llm::{CacheRow, ModelUsage, usage_by_model};
+pub use repo_llm::{
+    CacheRow, ModelUsage, delete_provider_cache, get_provider_cache, upsert_provider_cache,
+    usage_by_model,
+};
 pub use repo_project::{
     Project, Stage, StageStatus, clear_all_data, get_output_prefs, get_stage_origin,
     set_output_prefs, set_stage_with_origin,

@@ -18,6 +18,7 @@ use rusqlite::{Connection, Row, Transaction, params};
 use super::db::{Store, StoreError};
 use crate::llm::cache::{CacheError, CacheStore, CachedEntry};
 use crate::llm::client::{CachePayload, Usage};
+use crate::llm::context_cache::{ProviderCacheEntry, ProviderCacheStore, ProviderCacheStoreError};
 use crate::llm::metered::{LlmCallRecord, SinkError, UsageSink};
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,80 @@ pub fn usage_by_model(conn: &Connection) -> Result<Vec<ModelUsage>, StoreError> 
 }
 
 // ---------------------------------------------------------------------------
+// provider_cache (Gemini explicit context cache, `docs/DATA_MODEL.md` §2)
+// ---------------------------------------------------------------------------
+
+/// Reads the `provider_cache` row for `(analysis_version, model)`, if any
+/// (`docs/LLM.md` §5.5). `expires_at` is stored as epoch seconds (ADR-042) in the
+/// `TEXT` column and parsed back here.
+pub fn get_provider_cache(
+    conn: &Connection,
+    analysis_version: i64,
+    model: &str,
+) -> Result<Option<ProviderCacheEntry>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT name, analysis_version, model, token_count, expires_at FROM provider_cache \
+         WHERE analysis_version = ?1 AND model = ?2 LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![analysis_version, model])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(provider_cache_entry_from_row(row)?)),
+        None => Ok(None),
+    }
+}
+
+fn provider_cache_entry_from_row(row: &Row) -> Result<ProviderCacheEntry, StoreError> {
+    let analysis_version: i64 = row.get(1)?;
+    let token_count: i64 = row.get(3)?;
+    let expires_at_text: String = row.get(4)?;
+    let expires_at: i64 = expires_at_text
+        .parse()
+        .map_err(|e| StoreError::Unexpected(format!("provider_cache.expires_at: {e}")))?;
+    Ok(ProviderCacheEntry {
+        name: row.get(0)?,
+        analysis_version,
+        model: row.get(2)?,
+        token_count: token_count.max(0) as u64,
+        expires_at,
+    })
+}
+
+/// Inserts or replaces a `provider_cache` row (keyed by `name`). On a `name`
+/// conflict every column is overwritten so a re-created cache updates its row.
+pub fn upsert_provider_cache(
+    conn: &mut Connection,
+    entry: &ProviderCacheEntry,
+) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO provider_cache (name, analysis_version, model, token_count, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(name) DO UPDATE SET \
+           analysis_version = excluded.analysis_version, \
+           model = excluded.model, \
+           token_count = excluded.token_count, \
+           expires_at = excluded.expires_at",
+        params![
+            entry.name,
+            entry.analysis_version,
+            entry.model,
+            entry.token_count as i64,
+            entry.expires_at.to_string(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes the `provider_cache` row named `name`, returning the number removed.
+pub fn delete_provider_cache(conn: &mut Connection, name: &str) -> Result<usize, StoreError> {
+    let tx = conn.transaction()?;
+    let removed = tx.execute("DELETE FROM provider_cache WHERE name = ?1", params![name])?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
 // Store-backed trait implementations (the one llm↔store seam)
 // ---------------------------------------------------------------------------
 
@@ -234,5 +309,29 @@ impl UsageSink for Store {
         self.call(move |conn| insert_call(conn, &call).map(|_| ()))
             .await
             .map_err(|e| SinkError::Backend(e.to_string()))
+    }
+}
+
+impl ProviderCacheStore for Store {
+    async fn get(
+        &self,
+        analysis_version: i64,
+        model: String,
+    ) -> Result<Option<ProviderCacheEntry>, ProviderCacheStoreError> {
+        self.call(move |conn| get_provider_cache(conn, analysis_version, &model))
+            .await
+            .map_err(|e| ProviderCacheStoreError::Backend(e.to_string()))
+    }
+
+    async fn upsert(&self, entry: ProviderCacheEntry) -> Result<(), ProviderCacheStoreError> {
+        self.call(move |conn| upsert_provider_cache(conn, &entry))
+            .await
+            .map_err(|e| ProviderCacheStoreError::Backend(e.to_string()))
+    }
+
+    async fn delete(&self, name: String) -> Result<(), ProviderCacheStoreError> {
+        self.call(move |conn| delete_provider_cache(conn, &name).map(|_| ()))
+            .await
+            .map_err(|e| ProviderCacheStoreError::Backend(e.to_string()))
     }
 }

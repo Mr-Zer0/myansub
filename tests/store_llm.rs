@@ -65,6 +65,72 @@ async fn llm_cache_put_get_round_trips() {
     assert_eq!(row.usage, expected.usage);
 }
 
+// AC: M8-AC2 (store seam) — provider_cache get-by-(analysis_version, model), upsert,
+// and delete round-trip, and a name-conflict upsert replaces every column.
+#[tokio::test]
+async fn provider_cache_upsert_get_delete_round_trips() {
+    use myansub::llm::context_cache::ProviderCacheEntry;
+
+    let store = Store::open_in_memory().expect("open");
+
+    // No row for an unknown (version, model).
+    let missing = store
+        .call(|conn| repo_llm::get_provider_cache(conn, 3, "gemini-flash-latest"))
+        .await
+        .expect("get");
+    assert!(missing.is_none());
+
+    let entry = ProviderCacheEntry {
+        name: "cachedContents/abc".to_string(),
+        analysis_version: 3,
+        model: "gemini-flash-latest".to_string(),
+        token_count: 4096,
+        expires_at: 1_700_000_000,
+    };
+    let to_store = entry.clone();
+    store
+        .call(move |conn| repo_llm::upsert_provider_cache(conn, &to_store))
+        .await
+        .expect("upsert");
+
+    let read = store
+        .call(|conn| repo_llm::get_provider_cache(conn, 3, "gemini-flash-latest"))
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(read, entry);
+
+    // Re-upserting the same name replaces token_count and expires_at.
+    let updated = ProviderCacheEntry {
+        token_count: 8192,
+        expires_at: 1_700_009_999,
+        ..entry.clone()
+    };
+    let to_store = updated.clone();
+    store
+        .call(move |conn| repo_llm::upsert_provider_cache(conn, &to_store))
+        .await
+        .expect("upsert replace");
+    let read = store
+        .call(|conn| repo_llm::get_provider_cache(conn, 3, "gemini-flash-latest"))
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(read, updated);
+
+    // Delete removes exactly one row.
+    let removed = store
+        .call(|conn| repo_llm::delete_provider_cache(conn, "cachedContents/abc"))
+        .await
+        .expect("delete");
+    assert_eq!(removed, 1);
+    let gone = store
+        .call(|conn| repo_llm::get_provider_cache(conn, 3, "gemini-flash-latest"))
+        .await
+        .expect("get");
+    assert!(gone.is_none());
+}
+
 #[tokio::test]
 async fn llm_cache_get_missing_key_is_none() {
     let store = Store::open_in_memory().expect("open");
