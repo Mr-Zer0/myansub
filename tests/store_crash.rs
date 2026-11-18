@@ -56,7 +56,8 @@ async fn fresh_open_sets_user_version_and_creates_all_tables() {
     let store = Store::open(&dir.path().join("project.db")).expect("open");
 
     assert_eq!(user_version(&store).await, SCHEMA_VERSION as i64);
-    assert_eq!(SCHEMA_VERSION, 2);
+    // Migration 3 (M7-C) added `stage_state.approved_origin`.
+    assert_eq!(SCHEMA_VERSION, 3);
 
     let tables = table_names(&store).await;
     for expected in EXPECTED_TABLES {
@@ -319,10 +320,12 @@ async fn panic_in_closure_poisons_lock_for_next_call() {
 #[tokio::test]
 async fn failing_migration_rolls_back_and_leaves_schema_consistent() {
     let store = Store::open_in_memory().expect("open in-memory");
-    // Fresh store is at the current version (the real migrations 1 and 2).
-    assert_eq!(user_version(&store).await, 2);
+    // Fresh store is at the current version (the real migrations 1..3).
+    assert_eq!(user_version(&store).await, SCHEMA_VERSION as i64);
+    let current = SCHEMA_VERSION as i64;
 
-    // A migration set whose version-3 script creates one object then fails.
+    // A migration set whose next (version `current + 1`) script creates one object
+    // then fails; the already-applied scripts are skipped.
     let err = store
         .call(|conn| {
             run_migrations_with(
@@ -330,23 +333,26 @@ async fn failing_migration_rolls_back_and_leaves_schema_consistent() {
                 &[
                     "-- v1 already applied; skipped",
                     "-- v2 already applied; skipped",
-                    "CREATE TABLE migration_three_partial (x INTEGER); \
+                    "-- v3 already applied; skipped",
+                    "CREATE TABLE migration_next_partial (x INTEGER); \
                      CREATE TABLE this_is_not_valid_sql (;",
                 ],
             )
         })
         .await
         .expect_err("invalid migration script must error");
-    assert!(matches!(err, StoreError::Migration { version: 3, .. }));
+    assert!(
+        matches!(err, StoreError::Migration { version, .. } if version == (current + 1) as u32)
+    );
 
     // Rollback: version unchanged, and the partial table does not exist.
-    assert_eq!(user_version(&store).await, 2);
+    assert_eq!(user_version(&store).await, current);
     assert!(
-        !object_exists(&store, "migration_three_partial").await,
+        !object_exists(&store, "migration_next_partial").await,
         "a rolled-back migration must leave no partial objects"
     );
 
-    // A subsequent valid migration to version 3 succeeds.
+    // A subsequent valid migration to the next version succeeds.
     store
         .call(|conn| {
             run_migrations_with(
@@ -354,14 +360,15 @@ async fn failing_migration_rolls_back_and_leaves_schema_consistent() {
                 &[
                     "-- v1 already applied; skipped",
                     "-- v2 already applied; skipped",
-                    "CREATE TABLE migration_three (x INTEGER);",
+                    "-- v3 already applied; skipped",
+                    "CREATE TABLE migration_next (x INTEGER);",
                 ],
             )
         })
         .await
         .expect("valid migration applies");
-    assert_eq!(user_version(&store).await, 3);
-    assert!(object_exists(&store, "migration_three").await);
+    assert_eq!(user_version(&store).await, current + 1);
+    assert!(object_exists(&store, "migration_next").await);
 }
 
 // AC: M7-B / docs/DATA_MODEL.md §2 — migration 2 adds the output-preference

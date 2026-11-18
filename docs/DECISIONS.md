@@ -290,6 +290,46 @@ wiring (with an injected transport and updated `run` tests) is left to a follow-
 injection seam for `run` is designed. The minimal `approve_current_analysis` helper (for a future
 `--auto-approve analysis`) is implemented in `repo_analysis` but not yet wired into `run`.
 
+**SEAM CLOSED (M7-C).** The transport-injection seam this ADR deferred now exists: `orchestrator::run`
+is generic over `T: LlmClient + Clone + Send + Sync + 'static` and takes the bottom transport as its
+first argument, threading one instance to `run_analysis` then `run_translation` (each still wraps it in
+`Metered<Cached<Retrying<_>>>` per call). `main` builds the real `Gemini` transport (or `DryRun` for
+`--dry-run`, so a dry run needs no key) and calls `run`; tests pass a scripted `Fake`, keeping every
+`run` test offline. `run` now advances the whole pipeline — analysis → analysis-review gate →
+translation → translation-review gate → export — instead of stopping at the analysis boundary. The M4
+transitional `run` tests (which pinned `StoppedAtStage(Analysis)` / exit 0) were rewritten to the gated
+behavior: without `--auto-approve`, `run` executes analysis and stops at the analysis-review gate
+(exit 3, ADR-031); with `--auto-approve` it clears the named gate (origin `auto`, ADR-019) and
+continues. `--auto-approve analysis` is wired via `approve_current_analysis_in_tx`. The old
+`RunOutcome::StoppedAtStage` boundary stop is retained only as a safety variant; normal runs no longer
+produce it.
+
+### ADR-039 Approval origin stored on `stage_state`; reported only for approved gates (M7-C)
+Context (M7-C, `docs/CLI.md` §4, ADR-019, `docs/DATA_MODEL.md` §2): `status` must show whether a review
+gate was approved by a human or by `run --auto-approve` (`user` vs `auto`). Decision: migration 3 adds a
+nullable `approved_origin TEXT` column to `stage_state`. The two approve paths stamp it in the same
+transaction that sets the gate to `approved`: `review::analysis::approve` / `review::translation::approve`
+write `user`; `run`'s `auto_approve_analysis` / `auto_approve_translation` write `auto`. A plain
+`set_stage` (used when a stage moves to `running`/`completed`, e.g. an analysis edit re-opening the
+review) does **not** touch `approved_origin`, so a stale value can linger on a non-approved row;
+`status` therefore reports the origin **only when the stage's status is `approved`** and ignores it
+otherwise, which keeps the observable value correct without an extra write on every transition. The
+column is review-gate-specific in meaning but lives on the shared `stage_state` table (the cleanest
+place, no new table). Consequence: `status` shows `user`/`auto` for the two review gates once approved;
+re-approval overwrites the origin; and the lingering-value edge is masked by the status==approved guard.
+
+### ADR-040 `run` handles the zero-translatable project so it cannot deadlock (M7-C)
+Context (M7-C): a project whose cues are all non-translatable produces no translation batches, so
+`run_translation` returns `NothingToDo` **before** marking the translation stage `completed`. The
+orchestrator's `next_step` would then keep returning `Execute(Translation)`, and `run` would loop
+forever at a gate that can never open. Decision: in `run`, a `TranslationOutcome::NothingToDo` marks the
+translation stage `completed` (one short transaction) and then advances; the translation-review gate can
+then open, be auto-approved/approved, and `run` exports the (non-translatable) source cues. `run_translation`
+itself is left unchanged (its `NothingToDo` contract is relied on by the `translate` command tests);
+the completion is applied by the caller that owns stage transitions (the orchestrator, `ARCHITECTURE.md`
+§4). Consequence: `myansub run --auto-approve all` on an all-non-translatable file completes and writes
+the source cues instead of hanging.
+
 ### ADR-035 Analysis user-import: manual strict validation + provenance carry-forward (M5-B)
 Context (M5-B, M5-AC3, `DATA_MODEL.md` §3/§6): user import must reject unknown fields (strict) and the
 §3 rules **each with the field location** ("characters[3].gender", "address_matrix[1].from references

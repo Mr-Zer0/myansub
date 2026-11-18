@@ -30,7 +30,7 @@ use crate::domain::{Cue, QualityFlag};
 use crate::quality::checks::{self, AnalysisContext, GlossaryTerm, Limits};
 use crate::store::repo_analysis::{current_analysis, get_analysis_version};
 use crate::store::repo_cues::load_cues;
-use crate::store::repo_project::{get_project, get_stage, set_stage};
+use crate::store::repo_project::{get_project, get_stage, set_stage_with_origin};
 use crate::store::repo_translations::{
     TranslationRow, apply_user_edit_in_tx, cue_id_by_idx, list_translations, set_locked_in_tx,
 };
@@ -371,7 +371,14 @@ pub async fn approve(store: &Store) -> Result<(), ReviewError> {
     store
         .call(|conn| {
             let tx = conn.transaction()?;
-            set_stage(&tx, Stage::TranslationReview, StageStatus::Approved)?;
+            // A human ran `review approve`, so the gate's origin is `user`
+            // (`docs/CLI.md` §4, ADR-019).
+            set_stage_with_origin(
+                &tx,
+                Stage::TranslationReview,
+                StageStatus::Approved,
+                Some("user"),
+            )?;
             tx.commit()?;
             Ok(())
         })

@@ -17,27 +17,24 @@ use myansub::domain::SubtitleFormat;
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
 use myansub::llm::client::Secret;
 use myansub::llm::pricing::{Cost, PriceTable};
-use myansub::llm::{Estimator, Gemini, RetryConfig};
+use myansub::llm::{DryRun, Estimator, Gemini};
 use myansub::pipeline::analysis::{
-    AnalysisFlags, AnalysisModeKind, AnalysisOutcome, AnalysisParams, DryRunReport,
-    analysis_exit_code, dry_run_analysis, parse_thinking, parse_tier, prepare_analysis,
-    run_analysis,
+    AnalysisFlags, AnalysisModeKind, AnalysisOutcome, DryRunReport, analysis_exit_code,
+    dry_run_analysis, prepare_analysis, run_analysis,
 };
 use myansub::pipeline::input::check_source_unchanged;
 use myansub::pipeline::input::{InitOutcome, run_init};
 use myansub::pipeline::orchestrator::{
-    AutoApproveGate, RunOptions, RunOutcome, RunRequest, StatusReport, run as run_pipeline,
-    run_exit_code, status as gather_status,
+    AutoApproveGate, RunOptions, RunOutcome, RunReport, RunRequest, StatusReport, analysis_params,
+    run as run_pipeline, run_exit_code, status as gather_status, translation_params,
 };
 use myansub::pipeline::output::{
     OutputReport, resolve_output_format_from_flags, resolve_output_target, run_output,
     stored_output_prefs,
 };
-use myansub::pipeline::scheduler::SchedulerConfig;
 use myansub::pipeline::translation::{
     DryRunReport as TranslationDryRunReport, TranslationFlags, TranslationOutcome,
-    TranslationParams, dry_run_translation, prepare_translation, run_translation,
-    translation_exit_code,
+    dry_run_translation, prepare_translation, run_translation, translation_exit_code,
 };
 use myansub::project::{project_db_path, resolve_project};
 use myansub::review::EnvEditorLauncher;
@@ -88,10 +85,10 @@ fn init_tracing(verbose: u8) {
 }
 
 /// Dispatches a parsed command, returning the success-side exit code (0, 130 when
-/// interrupted, or 4 when `analyze` finished with failed chunks). Errors are mapped
-/// to codes by [`exit_code_for`]. `init`, `run` (up to the analysis boundary),
-/// `status`, and `analyze` are implemented; the rest map to a generic error until
-/// their milestones land.
+/// interrupted, 3 at an unapproved gate, or 4 when a stage finished with failed
+/// units). Errors are mapped to codes by [`exit_code_for`]. `run` now drives the
+/// whole pipeline (analysis → translation → export, M7-C); `list` and `cache` map to
+/// a generic error until their milestones land.
 fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
     match &cli.command {
         Command::Init(args) => run_init_command(cli, args).map(|()| exit::SUCCESS),
@@ -148,19 +145,23 @@ fn run_init_command(cli: &Cli, args: &InitArgs) -> anyhow::Result<()> {
 }
 
 /// Handles `myansub run [FILE] …` (docs/CLI.md §2/§6). Resolves or creates the
-/// project, advances stages up to the analysis boundary (M4), and maps the
+/// project, advances the whole pipeline (analysis → translation → export) with the
+/// injected transport, auto-approving the gates `--auto-approve` names, and maps the
 /// outcome to an exit code — preferring the interrupt code (130) on Ctrl-C.
+///
+/// The transport is the Gemini client built from `GEMINI_API_KEY` for a real run, or
+/// `DryRun` for `--dry-run` (so a dry run never needs a key). `run` wraps it in the
+/// `Metered<Cached<Retrying<_>>>` stack per LLM call (ADR-034, docs/ARCHITECTURE.md §5).
 fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir().context("determine current directory")?;
     let location = resolve_project(cli.project.as_deref(), args.file.as_deref(), &cwd)?;
     let config = load_config(cli, &location.dir)?;
 
     // Output-format flags are validated up front so a format/extension disagreement
-    // is a usage error (exit 2) before any work — on an existing project too, where
-    // `run` would otherwise ignore it (docs/CLI.md §3). The resolved preferences are
-    // threaded into the request and stored atomically when this invocation creates
-    // the project; on an existing project they would apply only to an export this
-    // invocation performs, which `run` does not do until M7-C.
+    // is a usage error (exit 2) before any work — on an existing project too
+    // (docs/CLI.md §3). The resolved preferences are threaded into the request,
+    // stored atomically when this invocation creates the project, and used when `run`
+    // exports the output.
     let flag_path = args.output.output.as_deref();
     let resolved_format = resolve_output_format_from_flags(
         args.output.output_format.map(map_output_format),
@@ -184,28 +185,79 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
 
     let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
     let token = CancellationToken::new();
+    let mut run_report = RunReport::default();
     let result = runtime.block_on(async {
         // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6,
-        // NFR-3). The orchestrator and (from M5) the scheduler watch the token.
+        // NFR-3). The orchestrator and each stage's scheduler watch the token.
         let signal_token = token.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 signal_token.cancel();
             }
         });
-        run_pipeline(request, &config, &token).await
+
+        if args.dry_run {
+            // A dry run estimates the stages and writes nothing, so it needs no API
+            // key. The dry-run path inside `run` builds its own `Cached<DryRun>` from
+            // config (ADR-033), so this `DryRun` instance only satisfies the generic
+            // transport bound; it is never used to send a request.
+            let transport = DryRun::new(
+                Estimator {
+                    bytes_per_token_latin: config.estimate.bytes_per_token_latin,
+                    bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
+                    bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
+                },
+                config.translation.output_ratio,
+            );
+            run_pipeline(transport, request, &config, &token, &mut run_report).await
+        } else {
+            let transport = build_gemini(&config)?;
+            run_pipeline(transport, request, &config, &token, &mut run_report).await
+        }
     });
 
     // The interrupt wins over any error: if cancellation was observed, report 130
-    // even when a stage errored out while shutting down (matters once stages do
-    // real work in M5+). Only propagate a non-cancellation error (docs/CLI.md §7).
+    // even when a stage errored out while shutting down. Only propagate a
+    // non-cancellation error (docs/CLI.md §7).
     if token.is_cancelled() {
         report_run_outcome(&RunOutcome::Interrupted);
         return Ok(exit::INTERRUPTED);
     }
     let outcome = result?;
     report_run_outcome(&outcome);
+    report_run_extras(&run_report);
     Ok(run_exit_code(token.is_cancelled(), &outcome))
+}
+
+/// Prints the side-information `run` surfaced: the suspect-cue count when the
+/// translation gate was auto-approved, and the `--dry-run` token/cost estimate
+/// (docs/CLI.md §4/§6, FR-9). All to stdout so a cost preview is visible regardless
+/// of `RUST_LOG`.
+fn report_run_extras(report: &RunReport) {
+    if let Some(suspect) = report.suspect_auto_approved {
+        if suspect > 0 {
+            println!(
+                "auto-approving translation; {suspect} cue(s) flagged suspect — \
+                 review with `myansub review list --suspect`."
+            );
+        } else {
+            println!("auto-approving translation; no cues flagged suspect.");
+        }
+    }
+    if let Some(estimate) = &report.dry_run {
+        println!("Dry run estimate:");
+        println!(
+            "  estimated tokens: input {} / output {}",
+            estimate.prompt_tokens, estimate.output_tokens
+        );
+        match estimate.cost {
+            Cost::Known(usd) => println!("  estimated cost:  ${usd:.4}"),
+            Cost::Unknown => {
+                println!("  estimated cost:  unknown (no price entry for the model)")
+            }
+        }
+        println!("(dry run: nothing was written to the database.)");
+    }
 }
 
 /// Maps the CLI auto-approve choice onto the orchestrator's gate enum (the
@@ -218,26 +270,35 @@ fn map_auto_approve(choice: AutoApprove) -> AutoApproveGate {
     }
 }
 
-/// Logs where `run` stopped and the next action for the user (docs/CLI.md §6).
+/// Prints where `run` stopped and the next action for the user (docs/CLI.md §6).
 fn report_run_outcome(outcome: &RunOutcome) {
     match outcome {
         RunOutcome::StoppedAtStage { stage, next_action } => {
-            tracing::info!(
+            println!(
                 "stopped at the {} stage; next: {next_action}",
                 stage.as_str()
             );
         }
         RunOutcome::StoppedAtGate { stage, next_action } => {
-            tracing::info!(
+            println!(
                 "stopped at the {} gate (not approved); next: {next_action}",
                 stage.as_str()
             );
         }
         RunOutcome::Interrupted => {
-            tracing::info!("interrupted; re-run the identical command to resume");
+            println!("interrupted; re-run the identical command to resume.");
         }
         RunOutcome::Completed => {
-            tracing::info!("nothing left to do");
+            println!("run complete; the output file was written.");
+        }
+        RunOutcome::CompletedWithFailures { failed } => {
+            println!(
+                "run complete with {failed} failed unit(s); the output used the source text \
+                 for the affected cues. See them with `myansub status`."
+            );
+        }
+        RunOutcome::DryRun => {
+            println!("dry run complete; nothing was written.");
         }
     }
 }
@@ -464,40 +525,6 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
     });
 
     code.map_err(anyhow::Error::new)
-}
-
-/// Builds [`TranslationParams`] from the resolved config (docs/CONFIG.md
-/// `[translation]`).
-fn translation_params(config: &Config) -> TranslationParams {
-    TranslationParams {
-        model: config.llm.models.translation.clone(),
-        tier: parse_tier(&config.llm.service_tier),
-        thinking: parse_thinking(&config.llm.thinking.translation),
-        batch_size: config.translation.batch_size,
-        context_before: config.translation.context_before,
-        context_after: config.translation.context_after,
-        max_content_attempts: config.translation.max_content_attempts,
-        output_ratio: config.translation.output_ratio,
-        estimator: Estimator {
-            bytes_per_token_latin: config.estimate.bytes_per_token_latin,
-            bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
-            bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
-        },
-        limits: (&config.quality).into(),
-        scheduler: SchedulerConfig {
-            concurrency: config.translation.concurrency.max(1) as usize,
-            warm_cache_first: config.translation.warm_cache_first,
-            grace: Duration::from_secs(config.output.grace_secs),
-        },
-        seed: clock_seed(),
-        retry: RetryConfig {
-            max_retries: config.llm.max_retries,
-            backoff_base_ms: config.llm.backoff_base_ms,
-            backoff_max_ms: config.llm.backoff_max_ms,
-            max_sheds_before_fallback: config.llm.max_sheds_before_fallback,
-            service_tier_fallback: config.llm.service_tier_fallback,
-        },
-    }
 }
 
 /// Prints where the translation stage stopped and the next action (docs/CLI.md §6).
@@ -878,38 +905,6 @@ fn print_review_listing(listing: &myansub::review::translation::ReviewListing) {
     );
 }
 
-/// Builds [`AnalysisParams`] from the resolved config and the project source hash.
-fn analysis_params(config: &Config, source_hash: &str) -> AnalysisParams {
-    AnalysisParams {
-        model: config.llm.models.analysis.clone(),
-        tier: parse_tier(&config.llm.service_tier),
-        thinking: parse_thinking(&config.llm.thinking.analysis),
-        source_digest: source_hash.to_string(),
-        max_content_attempts: config.translation.max_content_attempts,
-        single_pass_max_tokens: config.analysis.single_pass_max_tokens,
-        chunk_cues: config.analysis.chunk_cues,
-        estimator: Estimator {
-            bytes_per_token_latin: config.estimate.bytes_per_token_latin,
-            bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
-            bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
-        },
-        output_ratio: config.translation.output_ratio,
-        scheduler: SchedulerConfig {
-            concurrency: config.translation.concurrency.max(1) as usize,
-            warm_cache_first: config.translation.warm_cache_first,
-            grace: Duration::from_secs(config.output.grace_secs),
-        },
-        seed: clock_seed(),
-        retry: RetryConfig {
-            max_retries: config.llm.max_retries,
-            backoff_base_ms: config.llm.backoff_base_ms,
-            backoff_max_ms: config.llm.backoff_max_ms,
-            max_sheds_before_fallback: config.llm.max_sheds_before_fallback,
-            service_tier_fallback: config.llm.service_tier_fallback,
-        },
-    }
-}
-
 /// Builds the real Gemini transport from the environment and config
 /// (docs/LLM.md §1). The API key comes from `GEMINI_API_KEY` and is wrapped in a
 /// [`Secret`] so it never leaks through logging.
@@ -926,15 +921,6 @@ fn build_gemini(config: &Config) -> Result<Gemini, PipelineError> {
         Duration::from_secs(config.llm.timeout_secs),
     )
     .map_err(PipelineError::Llm)
-}
-
-/// A jitter seed from the system clock (docs/ARCHITECTURE.md §10: a local seed, no
-/// `rand` dependency).
-fn clock_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
 }
 
 /// The config label for a CLI service tier.

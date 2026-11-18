@@ -24,7 +24,7 @@ use crate::store::repo_analysis::{
     insert_analysis_version_in_tx,
 };
 use crate::store::repo_cues::load_cues;
-use crate::store::repo_project::set_stage;
+use crate::store::repo_project::{set_stage, set_stage_with_origin};
 use crate::store::{Stage, StageStatus, Store};
 
 use super::editor::{EditorLauncher, capture_edit, export_to_path};
@@ -275,7 +275,14 @@ pub async fn approve(store: &Store) -> Result<i64, ReviewError> {
             };
             let tx = conn.transaction()?;
             approve_current_analysis_in_tx(&tx)?;
-            set_stage(&tx, Stage::AnalysisReview, StageStatus::Approved)?;
+            // A human ran `analysis approve`, so the gate's origin is `user`
+            // (`docs/CLI.md` §4, ADR-019).
+            set_stage_with_origin(
+                &tx,
+                Stage::AnalysisReview,
+                StageStatus::Approved,
+                Some("user"),
+            )?;
             tx.commit()?;
             Ok(Some(current.version))
         })

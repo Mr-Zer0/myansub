@@ -211,6 +211,42 @@ pub fn set_stage(conn: &Connection, stage: Stage, status: StageStatus) -> Result
     Ok(())
 }
 
+/// Upserts a review stage's status together with its approval origin
+/// (`docs/DATA_MODEL.md` §2, `docs/CLI.md` §4, ADR-019). Used by the approve paths:
+/// `user` when a human runs `analysis approve` / `review approve`, `auto` when
+/// `run --auto-approve` clears the gate. A `None` origin leaves the column `NULL`.
+/// The origin is only meaningful while `status` is `approved`; a later
+/// [`set_stage`] that moves the stage off `approved` leaves this column untouched,
+/// and status reporting ignores it unless the stage is approved.
+pub fn set_stage_with_origin(
+    conn: &Connection,
+    stage: Stage,
+    status: StageStatus,
+    origin: Option<&str>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO stage_state (stage, status, approved_origin, updated_at) \
+         VALUES (?1, ?2, ?3, datetime('now')) \
+         ON CONFLICT(stage) DO UPDATE SET status = excluded.status, \
+         approved_origin = excluded.approved_origin, updated_at = excluded.updated_at",
+        params![stage.as_str(), status.as_str(), origin],
+    )?;
+    Ok(())
+}
+
+/// Reads a stage's recorded approval origin, if any (`docs/CLI.md` §4). The value
+/// is only meaningful when the stage's status is `approved`.
+pub fn get_stage_origin(conn: &Connection, stage: Stage) -> Result<Option<String>, StoreError> {
+    let origin: Option<Option<String>> = conn
+        .query_row(
+            "SELECT approved_origin FROM stage_state WHERE stage = ?1",
+            params![stage.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(origin.flatten())
+}
+
 /// Reads a stage's status, if a row exists.
 pub fn get_stage(conn: &Connection, stage: Stage) -> Result<Option<StageStatus>, StoreError> {
     let label: Option<String> = conn

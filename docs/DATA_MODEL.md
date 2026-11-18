@@ -45,9 +45,10 @@ CREATE TABLE project (
 );
 
 CREATE TABLE stage_state (
-  stage      TEXT PRIMARY KEY,                 -- input|analysis|analysis_review|translation|translation_review|output
-  status     TEXT NOT NULL,                    -- not_started|running|completed|approved
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  stage           TEXT PRIMARY KEY,            -- input|analysis|analysis_review|translation|translation_review|output
+  status          TEXT NOT NULL,               -- not_started|running|completed|approved
+  approved_origin TEXT,                        -- user|auto (review gates only; meaningful when status=approved); migration 3
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE cues (

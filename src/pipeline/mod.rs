@@ -22,8 +22,9 @@ pub use analysis::{
 };
 pub use error::PipelineError;
 pub use orchestrator::{
-    NextStep, ProjectState, RunOptions, RunOutcome, RunRequest, StatusReport, can_run, next_step,
-    run, run_exit_code, status,
+    NextStep, ProjectState, RunDryRunEstimate, RunOptions, RunOutcome, RunReport, RunRequest,
+    StatusReport, analysis_params, can_run, next_step, run, run_exit_code, status,
+    translation_params,
 };
 pub use output::{
     BuiltOutput, OutputReport, OutputWarning, ResolvedOutput, build_output_document,

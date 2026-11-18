@@ -9,24 +9,32 @@
 //!
 //! Division of labor with `pipeline::input`: the input stage is ensured once,
 //! before the advance loop, by [`run`] (it creates the project on first use and
-//! resumes it otherwise). The loop itself is the skeleton that M5/M6/M7 extend:
-//! each executable stage becomes a `match` arm that runs its units through the
-//! [`scheduler`](super::scheduler) and then `continue`s. In M4 no stage executes
-//! inside the loop, so the loop stops at the first executable stage
-//! (analysis) and prints `run \`myansub analyze\``.
+//! resumes it otherwise). The loop then advances the whole pipeline with an
+//! injected LLM transport (ADR-034): each executable stage (`analysis`,
+//! `translation`, `output`) runs its units through the
+//! [`scheduler`](super::scheduler) and `continue`s; a review gate is auto-approved
+//! when `--auto-approve` names it (origin `auto`, ADR-019) or else stops the run
+//! (exit 3); with both gates cleared `run` exports the output and finishes.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::domain::SubtitleFormat;
 use crate::error::exit;
-use crate::llm::client::ServiceTier;
+use crate::llm::client::{LlmClient, ServiceTier};
+use crate::llm::dry_run::Estimator;
 use crate::llm::pricing::{self, Cost, PriceTable};
+use crate::llm::retry::RetryConfig;
 use crate::project::project_db_path;
-use crate::store::repo_project::{get_project, get_stage};
+use crate::store::repo_analysis::approve_current_analysis_in_tx;
+use crate::store::repo_cues::load_cues;
+use crate::store::repo_project::{
+    get_project, get_stage, get_stage_origin, set_stage, set_stage_with_origin,
+};
 use crate::store::repo_units::{
     count_analysis_chunks_by_status, count_translation_batches_by_status,
 };
@@ -34,8 +42,17 @@ use crate::store::{
     Stage, StageStatus, Store, UnitStatus, current_analysis_approved, usage_by_model,
 };
 
+use super::analysis::{
+    AnalysisFlags, AnalysisOutcome, AnalysisParams, parse_thinking, parse_tier as parse_tier_label,
+    run_analysis,
+};
 use super::error::PipelineError;
 use super::input::{check_source_unchanged, run_input};
+use super::output::{ResolvedOutput, resolve_output_target, run_output, stored_output_prefs};
+use super::scheduler::SchedulerConfig;
+use super::translation::{
+    TranslationFlags, TranslationOutcome, TranslationParams, run_translation,
+};
 
 // ---------------------------------------------------------------------------
 // Stage state machine
@@ -223,39 +240,99 @@ pub struct RunRequest<'a> {
     pub options: RunOptions,
 }
 
+/// Side-information `run` surfaces to the caller for printing, kept out of
+/// [`RunOutcome`] so the outcome stays a small comparable enum (`docs/CLI.md`
+/// §4/§6, FR-9). The caller passes a mutable [`RunReport`] and prints from it after
+/// `run` returns.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunReport {
+    /// When `run` auto-approved the translation gate, the number of cues carrying at
+    /// least one quality flag (suspect) — printed but *not* blocking (`docs/CLI.md`
+    /// §4). `None` when the translation gate was not auto-approved this run.
+    pub suspect_auto_approved: Option<usize>,
+    /// The `--dry-run` cost/token estimate, summed over the stages that were
+    /// estimated (`docs/LLM.md` §9, FR-9). `None` on a non-dry run.
+    pub dry_run: Option<RunDryRunEstimate>,
+}
+
+/// The `run --dry-run` estimate, summed across the estimated stages
+/// (`docs/LLM.md` §9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunDryRunEstimate {
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub cost: Cost,
+}
+
 /// Where `run` stopped (`docs/CLI.md` §6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// Stopped at an executable stage whose execution is not yet implemented in
-    /// this milestone (analysis = M5, translation = M6, output = M7). The
-    /// `next_action` names the command to run.
+    /// Stopped at an executable stage that could not be advanced (e.g. the input
+    /// stage is somehow not completed). `next_action` names the command to run.
+    /// Normal runs no longer stop here — analysis/translation/output all execute
+    /// inside `run` (M7-C, ADR-034) — but the variant is kept as a safety stop.
     StoppedAtStage { stage: Stage, next_action: String },
-    /// Stopped at a review gate that is not approved. `next_action` names the
-    /// command that approves it.
+    /// Stopped at a review gate that is neither approved nor auto-approved (or a
+    /// translation gate that `run` refused to auto-approve because a batch failed
+    /// and `--allow-incomplete` was absent). `next_action` names the command that
+    /// clears it. Maps to exit 3 (`docs/CLI.md` §7, ADR-031).
     StoppedAtGate { stage: Stage, next_action: String },
-    /// Interrupted by cancellation (Ctrl-C).
+    /// Interrupted by cancellation (Ctrl-C). Maps to exit 130.
     Interrupted,
-    /// Nothing left to do: the output has been produced.
+    /// The whole pipeline ran and the output file was written, with no failed units.
+    /// Maps to exit 0.
     Completed,
+    /// The pipeline ran to completion (output written) but some units failed and
+    /// their source text was used (`--allow-incomplete`), or an executable stage
+    /// finished with failures that stopped the advance. `failed` is the count.
+    /// Maps to exit 4 (`docs/CLI.md` §7).
+    CompletedWithFailures { failed: usize },
+    /// A `--dry-run` finished: the stages were estimated and nothing was written.
+    /// Maps to exit 0.
+    DryRun,
 }
 
-/// Creates-or-resumes the project and advances stages until a gate or an
-/// unimplemented boundary (`docs/CLI.md` §6, `docs/ARCHITECTURE.md` §2/§4).
+/// Creates-or-resumes the project and advances it through the whole pipeline,
+/// executing each stage with the injected `transport` until it reaches a gate it
+/// cannot clear — or finishes by exporting the output (`docs/CLI.md` §6,
+/// `docs/ARCHITECTURE.md` §2/§4, ADR-034).
+///
+/// `transport` is the bottom of the LLM layer stack (Gemini for a real run, Fake in
+/// tests); `run_analysis`/`run_translation` wrap it in `Metered<Cached<Retrying<_>>>`
+/// per call. This is the transport-injection seam that keeps `run` tests offline
+/// (ADR-034): tests pass a Fake-backed transport, `main` the real Gemini one.
+///
+/// The loop advances `next_step`: an executable stage runs its units and `continue`s;
+/// an unapproved review gate is auto-approved when `--auto-approve` names it (origin
+/// `auto`, ADR-019), else `run` stops (exit 3). Translation auto-approval is refused
+/// (exit 3) when a batch failed unless `--allow-incomplete`. With both gates cleared
+/// `run` exports the output and finishes.
 ///
 /// The `token` is honored cooperatively: cancellation between stages yields
-/// [`RunOutcome::Interrupted`]. Once the scheduler runs units (M5+) the same token
-/// is handed to it so an in-flight stage stops within its grace window
-/// (`docs/ARCHITECTURE.md` §6 rule 6).
-pub async fn run(
+/// [`RunOutcome::Interrupted`], and the same token is handed to each stage's scheduler
+/// so an in-flight stage stops within its grace window (`docs/ARCHITECTURE.md` §6
+/// rule 6). A `--dry-run` estimates the stages, writes nothing, and returns
+/// [`RunOutcome::DryRun`].
+///
+/// `report` is an out-parameter the caller prints from (`docs/CLI.md` §4/§6, FR-9):
+/// the suspect-cue count when the translation gate is auto-approved, and the
+/// `--dry-run` token/cost estimate. It is left at [`RunReport::default`] (all `None`)
+/// when neither applies.
+pub async fn run<T>(
+    transport: T,
     req: RunRequest<'_>,
-    _config: &Config,
+    config: &Config,
     token: &CancellationToken,
-) -> Result<RunOutcome, PipelineError> {
+    report: &mut RunReport,
+) -> Result<RunOutcome, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+{
     tracing::debug!(
         auto_approve = ?req.options.auto_approve,
         allow_incomplete = req.options.allow_incomplete,
         dry_run = req.options.dry_run,
-        "run: options threaded (effective M5+)"
+        "run: advancing the pipeline"
     );
 
     let store = prepare_project(&req).await?;
@@ -263,12 +340,21 @@ pub async fn run(
     // (`docs/ARCHITECTURE.md` §6 rule 2). A no-op on a fresh project.
     store.recover().await?;
 
-    // The advance loop is the skeleton M5/M6/M7 extend: an executed stage will
-    // `continue` back to re-evaluate `next_step`. In M4 no stage executes inside
-    // the loop (input is ensured by `prepare_project`; analysis/translation/output
-    // execution land later), so every arm returns on the first iteration — hence
-    // the `never_loop` allow until an executable arm adds the `continue` path.
-    #[allow(clippy::never_loop)]
+    // The source path + hash drive the analysis version provenance and the export
+    // source-hash re-check; both come from the project row that `prepare_project`
+    // guaranteed.
+    let project = store.call(|conn| get_project(conn)).await?.ok_or_else(|| {
+        PipelineError::Uninitialized {
+            dir: req.project_dir.to_path_buf(),
+        }
+    })?;
+    let source_path = resume_source(&req, &project);
+    let source_hash = project.source_hash.clone();
+
+    if req.options.dry_run {
+        return dry_run_pipeline(&store, config, &source_hash, report).await;
+    }
+
     loop {
         if token.is_cancelled() {
             return Ok(RunOutcome::Interrupted);
@@ -276,14 +362,120 @@ pub async fn run(
 
         let state = load_state(&store).await?;
         match next_step(&state) {
-            // M4: stop at the first executable stage and name its command. M5
-            // replaces the analysis arm with real execution followed by `continue`.
+            NextStep::Execute(Stage::Analysis) => {
+                let cues = store.call(|conn| load_cues(conn)).await?;
+                let params = analysis_params(config, &source_hash);
+                let outcome = run_analysis(
+                    transport.clone(),
+                    &store,
+                    &cues,
+                    &params,
+                    AnalysisFlags::default(),
+                    token,
+                )
+                .await?;
+                match outcome {
+                    AnalysisOutcome::Completed { .. } | AnalysisOutcome::NothingToDo => continue,
+                    AnalysisOutcome::CompletedWithFailures { failed } => {
+                        // No version was stored, so the pipeline cannot advance;
+                        // stop rather than loop (exit 4).
+                        return Ok(RunOutcome::CompletedWithFailures { failed });
+                    }
+                    AnalysisOutcome::Interrupted => return Ok(RunOutcome::Interrupted),
+                }
+            }
+            NextStep::Execute(Stage::Translation) => {
+                let cues = store.call(|conn| load_cues(conn)).await?;
+                let params = translation_params(config);
+                let outcome = run_translation(
+                    transport.clone(),
+                    &store,
+                    &cues,
+                    &params,
+                    TranslationFlags::default(),
+                    token,
+                )
+                .await?;
+                match outcome {
+                    TranslationOutcome::Completed { .. } => continue,
+                    TranslationOutcome::NothingToDo => {
+                        // A project with no translatable cues: translation trivially
+                        // completes. Mark the stage completed so the review gate can
+                        // open rather than looping forever (zero-translatable edge).
+                        store
+                            .call(|conn| {
+                                set_stage(conn, Stage::Translation, StageStatus::Completed)
+                            })
+                            .await?;
+                        continue;
+                    }
+                    TranslationOutcome::CompletedWithFailures { failed, incomplete } => {
+                        if incomplete > 0 {
+                            // The stage did not complete, so the review gate can never
+                            // open; stop rather than loop (exit 4).
+                            return Ok(RunOutcome::CompletedWithFailures {
+                                failed: failed + incomplete,
+                            });
+                        }
+                        // Failed-only: the stage completed (failed batches are allowed,
+                        // ADR-038); advance to the review gate.
+                        continue;
+                    }
+                    TranslationOutcome::Interrupted => return Ok(RunOutcome::Interrupted),
+                }
+            }
+            NextStep::Execute(Stage::Output) => {
+                return export_output(&store, &source_path, &project, config, &req).await;
+            }
+            // `input` is ensured by `prepare_project`; any other executable stage is
+            // a safety stop (it should not occur in a normal run).
             NextStep::Execute(stage) => {
                 return Ok(RunOutcome::StoppedAtStage {
                     stage,
                     next_action: boundary_action(stage),
                 });
             }
+            NextStep::Approve(Stage::AnalysisReview, next_action) => {
+                if auto_approves(req.options.auto_approve, Stage::AnalysisReview) {
+                    auto_approve_analysis(&store).await?;
+                    continue;
+                }
+                return Ok(RunOutcome::StoppedAtGate {
+                    stage: Stage::AnalysisReview,
+                    next_action,
+                });
+            }
+            NextStep::Approve(Stage::TranslationReview, next_action) => {
+                if auto_approves(req.options.auto_approve, Stage::TranslationReview) {
+                    let failed = store
+                        .call(|conn| count_translation_batches_by_status(conn, UnitStatus::Failed))
+                        .await?;
+                    // Auto-approving translation is refused when a batch failed, unless
+                    // `--allow-incomplete` (`docs/CLI.md` §4, ADR-019). Suspect cues do
+                    // not block it.
+                    if failed > 0 && !req.options.allow_incomplete {
+                        return Ok(RunOutcome::StoppedAtGate {
+                            stage: Stage::TranslationReview,
+                            next_action: format!(
+                                "{failed} batch(es) failed; re-run with `--allow-incomplete` \
+                                 to auto-approve and export using the source text, or fix them \
+                                 with `myansub translate --retry-failed`"
+                            ),
+                        });
+                    }
+                    // Suspect cues do not block auto-approval, but their count is
+                    // surfaced for the user (`docs/CLI.md` §4). Reported via the
+                    // out-param so the caller can print it.
+                    report.suspect_auto_approved = Some(count_suspect_cues(&store).await?);
+                    auto_approve_translation(&store).await?;
+                    continue;
+                }
+                return Ok(RunOutcome::StoppedAtGate {
+                    stage: Stage::TranslationReview,
+                    next_action,
+                });
+            }
+            // Only the two review stages are returned via `Approve`.
             NextStep::Approve(stage, next_action) => {
                 return Ok(RunOutcome::StoppedAtGate { stage, next_action });
             }
@@ -292,8 +484,178 @@ pub async fn run(
     }
 }
 
-/// The command that advances past an executable `stage` boundary not yet wired in
-/// M4 (`docs/MILESTONES.md`).
+/// Whether `--auto-approve` clears `gate` (`docs/CLI.md` §4).
+fn auto_approves(choice: Option<AutoApproveGate>, gate: Stage) -> bool {
+    matches!(
+        (choice, gate),
+        (Some(AutoApproveGate::All), _)
+            | (Some(AutoApproveGate::Analysis), Stage::AnalysisReview)
+            | (Some(AutoApproveGate::Translation), Stage::TranslationReview)
+    )
+}
+
+/// Auto-approves the current analysis version and the analysis-review gate in one
+/// transaction, recording origin `auto` (`docs/CLI.md` §4, ADR-019). Mirrors
+/// `review::analysis::approve` but stamps `auto` instead of `user`.
+async fn auto_approve_analysis(store: &Store) -> Result<(), PipelineError> {
+    store
+        .call(|conn| {
+            let tx = conn.transaction()?;
+            approve_current_analysis_in_tx(&tx)?;
+            set_stage_with_origin(
+                &tx,
+                Stage::AnalysisReview,
+                StageStatus::Approved,
+                Some("auto"),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+/// Auto-approves the translation-review gate, recording origin `auto`
+/// (`docs/CLI.md` §4, ADR-019).
+async fn auto_approve_translation(store: &Store) -> Result<(), PipelineError> {
+    store
+        .call(|conn| {
+            let tx = conn.transaction()?;
+            set_stage_with_origin(
+                &tx,
+                Stage::TranslationReview,
+                StageStatus::Approved,
+                Some("auto"),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+/// Exports the output as the final `run` step and classifies the result
+/// (`docs/CLI.md` §6, `docs/REQUIREMENTS.md` FR-7). Resolves the target by the same
+/// precedence as `export` (command flag > stored value > default) and threads
+/// `--allow-incomplete`. A completed export with failed/missing cues finishes as
+/// [`RunOutcome::CompletedWithFailures`] (exit 4); otherwise [`RunOutcome::Completed`]
+/// (exit 0).
+async fn export_output(
+    store: &Store,
+    source_path: &Path,
+    project: &crate::store::Project,
+    config: &Config,
+    req: &RunRequest<'_>,
+) -> Result<RunOutcome, PipelineError> {
+    let source_format = project
+        .source_format
+        .parse::<SubtitleFormat>()
+        .map_err(|e| {
+            PipelineError::Store(crate::store::StoreError::Unexpected(format!(
+                "stored source_format: {e}"
+            )))
+        })?;
+    let (stored_format, stored_path) = stored_output_prefs(store).await?;
+    let resolved: ResolvedOutput = resolve_output_target(
+        req.output_format,
+        req.output_path,
+        stored_format,
+        stored_path.as_deref(),
+        source_path,
+        source_format,
+    )?;
+
+    // Count failed/missing translatable cues before the export so the final exit code
+    // reflects them (exit 4). A failed batch leaves its cues untranslated.
+    let failed = store
+        .call(|conn| count_translation_batches_by_status(conn, UnitStatus::Failed))
+        .await?;
+
+    run_output(
+        store,
+        source_path,
+        &resolved,
+        &config.output.ass_font_override,
+        config.output.utf8_bom,
+        req.options.allow_incomplete,
+    )
+    .await?;
+
+    if failed > 0 {
+        Ok(RunOutcome::CompletedWithFailures { failed })
+    } else {
+        Ok(RunOutcome::Completed)
+    }
+}
+
+/// Estimates the analysis (and, when an approved analysis exists, the translation)
+/// stages without writing anything (`docs/LLM.md` §9, ADR-033). Sums the per-stage
+/// token/cost estimates into `report.dry_run` so the caller can print the cost
+/// preview (FR-9); returns [`RunOutcome::DryRun`].
+async fn dry_run_pipeline(
+    store: &Store,
+    config: &Config,
+    source_hash: &str,
+    report: &mut RunReport,
+) -> Result<RunOutcome, PipelineError> {
+    let cues = store.call(|conn| load_cues(conn)).await?;
+    let prices = PriceTable::from_config(&config.pricing);
+
+    let analysis_params = analysis_params(config, source_hash);
+    let analysis =
+        super::analysis::dry_run_analysis(store, &cues, &analysis_params, &prices).await?;
+
+    let mut prompt_tokens = analysis.estimated_prompt_tokens;
+    let mut output_tokens = analysis.estimated_output_tokens;
+    let mut cost = analysis.estimated_cost;
+
+    // Translation can only be estimated once an approved analysis exists (it needs
+    // the analysis sheet for the cached prefix); skip it otherwise.
+    if current_analysis_approved_in(store).await? {
+        let translation_params = translation_params(config);
+        let translation =
+            super::translation::dry_run_translation(store, &cues, &translation_params, &prices)
+                .await?;
+        prompt_tokens += translation.estimated_prompt_tokens;
+        output_tokens += translation.estimated_output_tokens;
+        cost = add_cost(cost, translation.estimated_cost);
+    }
+
+    report.dry_run = Some(RunDryRunEstimate {
+        prompt_tokens,
+        output_tokens,
+        cost,
+    });
+    Ok(RunOutcome::DryRun)
+}
+
+/// Sums two [`Cost`]s; an unknown component makes the total unknown
+/// (`docs/LLM.md` §9).
+fn add_cost(acc: Cost, next: Cost) -> Cost {
+    match (acc, next) {
+        (Cost::Known(a), Cost::Known(b)) => Cost::Known(a + b),
+        _ => Cost::Unknown,
+    }
+}
+
+/// Whether the current analysis version is approved (one short read).
+async fn current_analysis_approved_in(store: &Store) -> Result<bool, PipelineError> {
+    Ok(store.call(|conn| current_analysis_approved(conn)).await?)
+}
+
+/// Counts cues carrying at least one quality flag (suspect cues, `docs/CLI.md` §4).
+async fn count_suspect_cues(store: &Store) -> Result<usize, PipelineError> {
+    let count = store
+        .call(|conn| {
+            let rows = crate::store::repo_translations::list_translations(conn)?;
+            Ok(rows.iter().filter(|r| !r.flags.is_empty()).count())
+        })
+        .await?;
+    Ok(count)
+}
+
+/// The command that advances past an executable `stage` boundary `run` does not
+/// itself drive (a safety message; normal runs do not reach it).
 fn boundary_action(stage: Stage) -> String {
     match stage {
         Stage::Input => "run `myansub run <FILE> --from <LANG>`".into(),
@@ -306,6 +668,81 @@ fn boundary_action(stage: Stage) -> String {
     }
 }
 
+/// Builds [`AnalysisParams`] from the resolved config and the project source hash
+/// (`docs/CONFIG.md`). Shared by `run` and `main`'s `analyze` handler so the two
+/// agree on how config maps to params.
+pub fn analysis_params(config: &Config, source_hash: &str) -> AnalysisParams {
+    AnalysisParams {
+        model: config.llm.models.analysis.clone(),
+        tier: parse_tier_label(&config.llm.service_tier),
+        thinking: parse_thinking(&config.llm.thinking.analysis),
+        source_digest: source_hash.to_string(),
+        max_content_attempts: config.translation.max_content_attempts,
+        single_pass_max_tokens: config.analysis.single_pass_max_tokens,
+        chunk_cues: config.analysis.chunk_cues,
+        estimator: estimator_from(config),
+        output_ratio: config.translation.output_ratio,
+        scheduler: scheduler_from(config),
+        seed: clock_seed(),
+        retry: retry_from(config),
+    }
+}
+
+/// Builds [`TranslationParams`] from the resolved config (`docs/CONFIG.md`
+/// `[translation]`). Shared by `run` and `main`'s `translate` handler.
+pub fn translation_params(config: &Config) -> TranslationParams {
+    TranslationParams {
+        model: config.llm.models.translation.clone(),
+        tier: parse_tier_label(&config.llm.service_tier),
+        thinking: parse_thinking(&config.llm.thinking.translation),
+        batch_size: config.translation.batch_size,
+        context_before: config.translation.context_before,
+        context_after: config.translation.context_after,
+        max_content_attempts: config.translation.max_content_attempts,
+        output_ratio: config.translation.output_ratio,
+        estimator: estimator_from(config),
+        limits: (&config.quality).into(),
+        scheduler: scheduler_from(config),
+        seed: clock_seed(),
+        retry: retry_from(config),
+    }
+}
+
+fn estimator_from(config: &Config) -> Estimator {
+    Estimator {
+        bytes_per_token_latin: config.estimate.bytes_per_token_latin,
+        bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
+        bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
+    }
+}
+
+fn scheduler_from(config: &Config) -> SchedulerConfig {
+    SchedulerConfig {
+        concurrency: config.translation.concurrency.max(1) as usize,
+        warm_cache_first: config.translation.warm_cache_first,
+        grace: Duration::from_secs(config.output.grace_secs),
+    }
+}
+
+fn retry_from(config: &Config) -> RetryConfig {
+    RetryConfig {
+        max_retries: config.llm.max_retries,
+        backoff_base_ms: config.llm.backoff_base_ms,
+        backoff_max_ms: config.llm.backoff_max_ms,
+        max_sheds_before_fallback: config.llm.max_sheds_before_fallback,
+        service_tier_fallback: config.llm.service_tier_fallback,
+    }
+}
+
+/// A jitter seed from the system clock (`docs/ARCHITECTURE.md` §10: a local seed, no
+/// `rand` dependency).
+fn clock_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+}
+
 /// Maps a `run` result to its process exit code, preferring the interrupt code
 /// whenever cancellation was observed (`docs/ARCHITECTURE.md` §6 rule 6,
 /// `docs/CLI.md` §7, ADR-031). This is the robust rule the scheduler's
@@ -313,12 +750,15 @@ fn boundary_action(stage: Stage) -> String {
 /// for the interrupt.
 ///
 /// - [`RunOutcome::Completed`] (all gates passed, output written) → `0`.
+/// - [`RunOutcome::DryRun`] (estimated, nothing written) → `0`.
 /// - [`RunOutcome::StoppedAtGate`] (a review gate needs approval; the next action
 ///   was printed) → `3`: this is a precondition/action-needed state, listed under
 ///   "gate not approved" in `docs/CLI.md` §7.
-/// - [`RunOutcome::StoppedAtStage`] is the M4-only transitional stop at the
-///   analysis boundary (analysis execution is M5) and maps to `0`; M5 replaces it
-///   with real gate/completion stops.
+/// - [`RunOutcome::CompletedWithFailures`] (pipeline finished with failed units) →
+///   `4` (`docs/CLI.md` §7).
+/// - [`RunOutcome::StoppedAtStage`] denotes an unexpected, un-advanceable state (it
+///   should not occur in a normal run); it maps to `3` (precondition/anomaly) rather
+///   than `0` so the anomaly is never masked as success.
 pub fn run_exit_code(cancelled: bool, outcome: &RunOutcome) -> i32 {
     if cancelled {
         return exit::INTERRUPTED;
@@ -326,11 +766,14 @@ pub fn run_exit_code(cancelled: bool, outcome: &RunOutcome) -> i32 {
     match outcome {
         RunOutcome::Interrupted => exit::INTERRUPTED,
         // Stopping at an unapproved review gate is a precondition/action-needed
-        // state (`docs/CLI.md` §7, ADR-031).
-        RunOutcome::StoppedAtGate { .. } => exit::PRECONDITION,
-        // The M4 transitional boundary stop and a completed run are both success
-        // (including nothing-to-do) in M4 (`docs/CLI.md` §7).
-        RunOutcome::StoppedAtStage { .. } | RunOutcome::Completed => exit::SUCCESS,
+        // state (`docs/CLI.md` §7, ADR-031). The safety boundary stop
+        // (`StoppedAtStage`) is an unexpected state and also maps to a precondition
+        // code so it is never reported as success.
+        RunOutcome::StoppedAtGate { .. } | RunOutcome::StoppedAtStage { .. } => exit::PRECONDITION,
+        // A completed run with failed units reports exit 4 (`docs/CLI.md` §7).
+        RunOutcome::CompletedWithFailures { .. } => exit::FAILED_UNITS,
+        // A completed run and a dry run are both success.
+        RunOutcome::Completed | RunOutcome::DryRun => exit::SUCCESS,
     }
 }
 
@@ -458,13 +901,23 @@ pub async fn load_state(store: &Store) -> Result<ProjectState, PipelineError> {
 // status
 // ---------------------------------------------------------------------------
 
-/// How a stage approval was obtained (`docs/CLI.md` §4/§6). Approval-origin
-/// tracking (user vs auto) is wired with the review stages (M5+); M4 reports
-/// `None` for every stage.
+/// How a stage approval was obtained (`docs/CLI.md` §4/§6, ADR-019): `user` when a
+/// human ran the approve command, `auto` when `run --auto-approve` cleared the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalOrigin {
     User,
     Auto,
+}
+
+impl ApprovalOrigin {
+    /// Parses the stored `approved_origin` label, if recognized.
+    fn from_label(label: &str) -> Option<ApprovalOrigin> {
+        match label {
+            "user" => Some(ApprovalOrigin::User),
+            "auto" => Some(ApprovalOrigin::Auto),
+            _ => None,
+        }
+    }
 }
 
 /// One stage's line in the `status` report.
@@ -549,11 +1002,19 @@ pub async fn status(project_dir: &Path, config: &Config) -> Result<StatusReport,
             let mut stages = Vec::with_capacity(6);
             for stage in STAGE_ORDER {
                 let status = get_stage(conn, stage)?.unwrap_or(StageStatus::NotStarted);
+                // The approval origin is only meaningful for an approved review gate
+                // (`docs/CLI.md` §4, ADR-019).
+                let approval_origin = if status == StageStatus::Approved {
+                    get_stage_origin(conn, stage)?
+                        .as_deref()
+                        .and_then(ApprovalOrigin::from_label)
+                } else {
+                    None
+                };
                 stages.push(StageLine {
                     stage,
                     status,
-                    // Approval-origin tracking arrives with the review stages (M5+).
-                    approval_origin: None,
+                    approval_origin,
                 });
             }
             let analysis_chunks = UnitCounts {

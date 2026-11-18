@@ -31,7 +31,8 @@ pub use repo_analysis::{
 pub use repo_cues::{insert_cues, insert_cues_in_tx, load_cues};
 pub use repo_llm::{CacheRow, ModelUsage, usage_by_model};
 pub use repo_project::{
-    Project, Stage, StageStatus, clear_all_data, get_output_prefs, set_output_prefs,
+    Project, Stage, StageStatus, clear_all_data, get_output_prefs, get_stage_origin,
+    set_output_prefs, set_stage_with_origin,
 };
 pub use repo_translations::{
     NewTranslation, TranslationHistoryRow, TranslationOrigin, TranslationRow,

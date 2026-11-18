@@ -8,12 +8,14 @@ use std::fs;
 
 use myansub::config::{Config, PriceEntry};
 use myansub::error::ExitCode;
+use myansub::llm::client::{CommitToken, LlmResponse, Usage};
+use myansub::llm::fake::Fake;
 use myansub::llm::metered::{CallOutcome, LlmCallRecord};
 use myansub::llm::pricing::Cost;
 use myansub::pipeline::PipelineError;
 use myansub::pipeline::orchestrator::{
-    NextStep, ProjectState, RunOptions, RunOutcome, RunRequest, UsageTotals, can_run, next_step,
-    run, run_exit_code, status,
+    NextStep, ProjectState, RunOptions, RunOutcome, RunReport, RunRequest, UsageTotals, can_run,
+    next_step, run, run_exit_code, status,
 };
 use myansub::project::{PROJECT_DB_FILE, project_dir_for_source};
 use myansub::store::repo_llm::insert_call;
@@ -22,6 +24,69 @@ use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
 const SRT: &str = "1\n00:00:01,000 --> 00:00:03,000\nGood morning, traveller.\n";
+
+/// A valid analysis document whose single scene covers the one SRT cue.
+const ANALYSIS_DOC: &str = r#"{"schema_version":1,"premise":"p","tone":"t",
+"characters":[],"address_matrix":[],"glossary":[],
+"scenes":[{"cue_range":[1,1],"summary":"s","speakers":[]}],
+"style_rules":[],"unresolved_ambiguities":[]}"#;
+
+fn resp(text: &str) -> LlmResponse {
+    LlmResponse {
+        text: text.to_string(),
+        usage: Usage {
+            prompt_tokens: 10,
+            output_tokens: 5,
+            ..Usage::default()
+        },
+        commit: CommitToken::noop(),
+    }
+}
+
+/// A Fake transport that answers the single-pass analysis call with [`ANALYSIS_DOC`]
+/// and every later (translation) call with a Burmese line covering cue 1. The first
+/// scripted response is popped by the analysis call; translation falls through to the
+/// `always` fallback.
+fn fake_full() -> Fake {
+    let lines = serde_json::json!({"lines":[{"id":1,"t":"မင်္ဂလာပါ"}]}).to_string();
+    Fake::new()
+        .push_response(resp(ANALYSIS_DOC))
+        .always(move || Ok(resp(&lines)))
+}
+
+/// Builds a `RunRequest` for a fresh `source` with the given options.
+fn fresh_request<'a>(
+    project_dir: &'a std::path::Path,
+    source: &'a std::path::Path,
+    options: RunOptions,
+) -> RunRequest<'a> {
+    RunRequest {
+        project_dir,
+        source_path: Some(source),
+        from_lang: Some("en"),
+        encoding: None,
+        output_format: None,
+        output_path: None,
+        options,
+    }
+}
+
+/// Creates a project with only the input stage completed, by running with a
+/// pre-cancelled token so `run` initializes and then stops before analysis.
+async fn init_only(project_dir: &std::path::Path, source: &std::path::Path) {
+    let token = CancellationToken::new();
+    token.cancel();
+    let outcome = run(
+        fake_full(),
+        fresh_request(project_dir, source, RunOptions::default()),
+        &Config::default(),
+        &token,
+        &mut RunReport::default(),
+    )
+    .await
+    .expect("initialize project");
+    assert_eq!(outcome, RunOutcome::Interrupted);
+}
 
 /// A state with the input stage completed and nothing else done.
 fn input_done() -> ProjectState {
@@ -218,10 +283,11 @@ async fn stage_status(project_dir: &std::path::Path, stage: Stage) -> StageStatu
         .expect("stage row present")
 }
 
-// run on a fresh FILE creates the project, completes input, and stops at the
-// analysis boundary (exit 0), naming `analyze`.
+// run on a fresh FILE creates the project, completes input, EXECUTES analysis (via
+// the injected Fake transport), and stops at the analysis-review gate (exit 3)
+// because `--auto-approve` was not given (ADR-031/034). Updated M4 transitional test.
 #[tokio::test]
-async fn run_fresh_file_creates_project_and_stops_at_analysis() {
+async fn run_fresh_file_executes_analysis_and_stops_at_review_gate() {
     let tmp = tempdir().expect("tempdir");
     let source = tmp.path().join("movie.srt");
     fs::write(&source, SRT).expect("write source");
@@ -229,65 +295,66 @@ async fn run_fresh_file_creates_project_and_stops_at_analysis() {
 
     let token = CancellationToken::new();
     let outcome = run(
-        RunRequest {
-            project_dir: &project_dir,
-            source_path: Some(&source),
-            from_lang: Some("en"),
-            encoding: None,
-            output_format: None,
-            output_path: None,
-            options: RunOptions::default(),
-        },
+        fake_full(),
+        fresh_request(&project_dir, &source, RunOptions::default()),
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect("run fresh");
 
     match &outcome {
-        RunOutcome::StoppedAtStage { stage, next_action } => {
-            assert_eq!(*stage, Stage::Analysis);
-            assert!(next_action.contains("analyze"), "got: {next_action}");
+        RunOutcome::StoppedAtGate { stage, .. } => {
+            assert_eq!(*stage, Stage::AnalysisReview);
         }
-        other => panic!("expected StoppedAtStage(Analysis), got {other:?}"),
+        other => panic!("expected StoppedAtGate(AnalysisReview), got {other:?}"),
     }
-    assert_eq!(run_exit_code(token.is_cancelled(), &outcome), 0);
+    assert_eq!(run_exit_code(token.is_cancelled(), &outcome), 3);
     assert!(project_dir.join(PROJECT_DB_FILE).is_file());
     assert_eq!(
         stage_status(&project_dir, Stage::Input).await,
         StageStatus::Completed
     );
+    // Analysis actually ran and completed.
+    assert_eq!(
+        stage_status(&project_dir, Stage::Analysis).await,
+        StageStatus::Completed
+    );
 }
 
-// run on an existing input-completed project resumes (no FILE/--from) and stops at
-// analysis again (nothing to do beyond input), exit 0.
+// run on an existing project with an unapproved analysis resumes (no FILE/--from),
+// does not re-run analysis (NothingToDo), and stops at the analysis-review gate
+// (exit 3) again. Updated M4 transitional test.
 #[tokio::test]
-async fn run_resumes_existing_project_and_stops_at_analysis() {
+async fn run_resumes_existing_project_and_stops_at_review_gate() {
     let tmp = tempdir().expect("tempdir");
     let source = tmp.path().join("movie.srt");
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
     let token = CancellationToken::new();
 
-    run(
-        RunRequest {
-            project_dir: &project_dir,
-            source_path: Some(&source),
-            from_lang: Some("en"),
-            encoding: None,
-            output_format: None,
-            output_path: None,
-            options: RunOptions::default(),
-        },
+    let first = run(
+        fake_full(),
+        fresh_request(&project_dir, &source, RunOptions::default()),
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect("initial run");
+    assert!(matches!(
+        first,
+        RunOutcome::StoppedAtGate {
+            stage: Stage::AnalysisReview,
+            ..
+        }
+    ));
 
     // Resume with just --project (no FILE, no --from): must hash-check the stored
-    // source and stop at analysis.
+    // source and stop at the analysis-review gate again (analysis already exists).
     let outcome = run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: None,
@@ -299,18 +366,19 @@ async fn run_resumes_existing_project_and_stops_at_analysis() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect("resume run");
 
     assert!(matches!(
         outcome,
-        RunOutcome::StoppedAtStage {
-            stage: Stage::Analysis,
+        RunOutcome::StoppedAtGate {
+            stage: Stage::AnalysisReview,
             ..
         }
     ));
-    assert_eq!(run_exit_code(token.is_cancelled(), &outcome), 0);
+    assert_eq!(run_exit_code(token.is_cancelled(), &outcome), 3);
 }
 
 // run with a --from that disagrees with the stored source language → exit 3.
@@ -323,6 +391,7 @@ async fn run_from_disagreement_is_exit_3() {
     let token = CancellationToken::new();
 
     run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: Some(&source),
@@ -334,11 +403,13 @@ async fn run_from_disagreement_is_exit_3() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect("initial run with --from ja");
 
     let err = run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: Some(&source),
@@ -350,6 +421,7 @@ async fn run_from_disagreement_is_exit_3() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect_err("disagreeing --from must be refused");
@@ -371,6 +443,7 @@ async fn run_changed_source_is_exit_3_pointing_to_force() {
     let token = CancellationToken::new();
 
     run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: Some(&source),
@@ -382,6 +455,7 @@ async fn run_changed_source_is_exit_3_pointing_to_force() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect("initial run");
@@ -393,6 +467,7 @@ async fn run_changed_source_is_exit_3_pointing_to_force() {
     .expect("modify source");
 
     let err = run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: Some(&source),
@@ -404,6 +479,7 @@ async fn run_changed_source_is_exit_3_pointing_to_force() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect_err("changed source must be refused");
@@ -430,6 +506,7 @@ async fn run_empty_db_without_from_is_helpful_exit_3() {
 
     let token = CancellationToken::new();
     let err = run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: Some(&source),
@@ -441,6 +518,7 @@ async fn run_empty_db_without_from_is_helpful_exit_3() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect_err("uninitialized db without --from must be refused");
@@ -464,6 +542,7 @@ async fn run_with_cancelled_token_is_interrupted() {
     token.cancel();
 
     let outcome = run(
+        fake_full(),
         RunRequest {
             project_dir: &project_dir,
             source_path: Some(&source),
@@ -475,6 +554,7 @@ async fn run_with_cancelled_token_is_interrupted() {
         },
         &Config::default(),
         &token,
+        &mut RunReport::default(),
     )
     .await
     .expect("run with cancelled token");
@@ -487,9 +567,9 @@ async fn run_with_cancelled_token_is_interrupted() {
 // cancellation exit mapping
 // ---------------------------------------------------------------------------
 
-// AC: CLI.md §7 — a cancelled run maps to 130 regardless of the outcome; an
-// uninterrupted stop-at-boundary (M4 transitional analysis stage) maps to 0, and a
-// completed pipeline maps to 0.
+// AC: CLI.md §7 — a cancelled run maps to 130 regardless of the outcome; a completed
+// pipeline maps to 0; and the unexpected safety boundary stop (`StoppedAtStage`) maps
+// to a non-success precondition code (3) so an anomaly is never masked as success.
 #[test]
 fn run_exit_code_prefers_interrupt_on_cancellation() {
     let at_boundary = RunOutcome::StoppedAtStage {
@@ -497,7 +577,8 @@ fn run_exit_code_prefers_interrupt_on_cancellation() {
         next_action: "run `myansub analyze`".to_string(),
     };
     assert_eq!(run_exit_code(true, &at_boundary), 130);
-    assert_eq!(run_exit_code(false, &at_boundary), 0);
+    // An unexpected un-advanceable stage is a precondition/anomaly, not success.
+    assert_eq!(run_exit_code(false, &at_boundary), 3);
     assert_eq!(run_exit_code(false, &RunOutcome::Interrupted), 130);
     assert_eq!(run_exit_code(false, &RunOutcome::Completed), 0);
 }
@@ -526,23 +607,8 @@ async fn status_on_input_completed_project() {
     let source = tmp.path().join("movie.srt");
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
-    let token = CancellationToken::new();
 
-    run(
-        RunRequest {
-            project_dir: &project_dir,
-            source_path: Some(&source),
-            from_lang: Some("en"),
-            encoding: None,
-            output_format: None,
-            output_path: None,
-            options: RunOptions::default(),
-        },
-        &Config::default(),
-        &token,
-    )
-    .await
-    .expect("run to initialize");
+    init_only(&project_dir, &source).await;
 
     let report = status(&project_dir, &Config::default())
         .await
@@ -578,23 +644,8 @@ async fn status_aggregates_usage_and_prices_known_models() {
     let source = tmp.path().join("movie.srt");
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
-    let token = CancellationToken::new();
 
-    run(
-        RunRequest {
-            project_dir: &project_dir,
-            source_path: Some(&source),
-            from_lang: Some("en"),
-            encoding: None,
-            output_format: None,
-            output_path: None,
-            options: RunOptions::default(),
-        },
-        &Config::default(),
-        &token,
-    )
-    .await
-    .expect("run to initialize");
+    init_only(&project_dir, &source).await;
 
     // Insert two llm_calls rows: one for a priced model, one for an unpriced one.
     let store = Store::open(&project_dir.join(PROJECT_DB_FILE)).expect("open store");

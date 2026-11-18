@@ -12,7 +12,7 @@ use super::db::StoreError;
 
 /// Migration scripts in order. Index `i` (0-based) upgrades the database to
 /// `user_version = i + 1`. Append new scripts here; never edit a released one.
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2];
+const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3];
 
 /// The current schema version (highest migration applied by a fresh open).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -197,6 +197,16 @@ ALTER TABLE project ADD COLUMN output_format TEXT;
 ALTER TABLE project ADD COLUMN output_path TEXT;
 "#;
 
+/// Migration 3: the approval origin of a review gate (`docs/DATA_MODEL.md` §2,
+/// `docs/CLI.md` §4, ADR-019). `approved_origin` is nullable and only meaningful
+/// when a review stage's `status` is `approved`: `user` when a human ran the
+/// approve command (`analysis approve` / `review approve`), `auto` when
+/// `run --auto-approve` cleared the gate. `ALTER TABLE ADD COLUMN` is append-only,
+/// so existing projects migrate without data loss (a migrated row reads `NULL`).
+const MIGRATION_3: &str = r#"
+ALTER TABLE stage_state ADD COLUMN approved_origin TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,8 +239,10 @@ mod tests {
         )
         .expect("insert cue");
 
-        // Apply the full migration set: version 1 is skipped, version 2 is applied.
-        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 2");
+        // Apply through version 2: version 1 is skipped, version 2 is applied. Scoped
+        // to the first two scripts so this stays a migration-2 test as later
+        // migrations are appended to `MIGRATIONS`.
+        run_migrations_with(&mut conn, &[MIGRATION_1, MIGRATION_2]).expect("apply migration 2");
         let v2: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
@@ -262,5 +274,39 @@ mod tests {
             .expect("read new columns");
         assert_eq!(out_fmt, None);
         assert_eq!(out_path, None);
+    }
+
+    // AC: M7-C — migration 3 adds `stage_state.approved_origin` without losing an
+    // existing approved stage row: the prior status survives and the new column reads
+    // NULL for a row written before the migration, and user_version → 3.
+    #[test]
+    fn migration_three_adds_approved_origin_column() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Bring the database up to version 2 only, then record an approved stage.
+        run_migrations_with(&mut conn, &[MIGRATION_1, MIGRATION_2]).expect("apply 1+2");
+        conn.execute(
+            "INSERT INTO stage_state (stage, status) VALUES ('analysis_review', 'approved')",
+            [],
+        )
+        .expect("insert stage");
+
+        // Apply the full set: versions 1 and 2 skipped, version 3 applied.
+        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 3");
+        let v3: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(v3, 3);
+
+        // The pre-existing stage row and its status survive; the new column is NULL.
+        let (status, origin): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, approved_origin FROM stage_state WHERE stage = 'analysis_review'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read stage row");
+        assert_eq!(status, "approved");
+        assert_eq!(origin, None);
     }
 }
