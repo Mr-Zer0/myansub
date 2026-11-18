@@ -85,6 +85,9 @@ gives a clear error with the key name.
 - Batching, prompt assembly, response validation, content retries.
 - `quality/checks.rs` with all checks in `LLM.md` §8.
 - `input_hash` reuse; `--retry-failed`, `--redo`.
+- Wire `run` to execute analysis + translation via a transport-injection seam, and the
+  `--auto-approve analysis` approval; update the M4 transitional `run` tests (ADR-031/034).
+  Must land by M7 (when `run` ends by exporting). (Carried from M5-A, ADR-034.)
 
 **Accept:**
 - Fake LLM end-to-end translation; all batches `done`.

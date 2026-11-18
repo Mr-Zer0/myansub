@@ -1,0 +1,1109 @@
+//! The analysis stage: single-pass and map-reduce execution, content retries,
+//! versioning with provenance, and the `--dry-run` estimate
+//! (`docs/LLM.md` §2/§5/§6/§9, `docs/ARCHITECTURE.md` §4/§6, `docs/DATA_MODEL.md`
+//! §2/§3).
+//!
+//! The transcript is estimated (`ceil(utf8_bytes / bytes_per_token)` per script,
+//! `docs/LLM.md` §9): at or below `analysis.single_pass_max_tokens` it is analyzed
+//! in one call; above it, in a map-reduce where each chunk (≈ `analysis.chunk_cues`
+//! cues) is a scheduler unit producing a partial document, and one reduce call
+//! merges the partials in chunk order (`docs/LLM.md` §2).
+//!
+//! Crash-safety (`docs/ARCHITECTURE.md` §6): every chunk writes its partial result
+//! and its `done` status in one transaction, and `Store::open` recovers `in_flight`
+//! chunks to `pending`, so a rerun skips `done` chunks and reruns the rest without
+//! re-sending a completed chunk's map call.
+//!
+//! Content retries (`docs/LLM.md` §6) live here, counted separately from the
+//! transport retries inside `Retrying`: a transport-successful response that is not
+//! valid JSON matching the analysis schema is retried — the whole unit — with a
+//! strict reminder, up to `max_content_attempts`, after which the unit is failed.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use tokio_util::sync::CancellationToken;
+
+use crate::domain::Cue;
+use crate::llm::assemble_stack;
+use crate::llm::cache::Cached;
+use crate::llm::client::{
+    CommitToken, ContentBlock, GenerationConfig, LlmClient, LlmError, LlmRequest, ServiceTier,
+    ThinkingSetting,
+};
+use crate::llm::dry_run::{DryRun, Estimator};
+use crate::llm::metered::CallContext;
+use crate::llm::pricing::{self, Cost, PriceTable};
+use crate::llm::prompts::{
+    PROMPT_VERSION, analysis_input_line, analysis_reduce_instruction, analysis_system_instruction,
+    strict_retry_reminder,
+};
+use crate::llm::retry::RetryConfig;
+use crate::llm::schemas::analysis_response_schema;
+use crate::store::repo_analysis::{
+    AnalysisOrigin, current_analysis, insert_analysis_version_in_tx,
+};
+use crate::store::repo_cues::load_cues;
+use crate::store::repo_llm::put_cache_in_tx;
+use crate::store::repo_project::set_stage;
+use crate::store::repo_units::{
+    claim_analysis_chunk, clear_analysis_chunks, complete_analysis_chunk_in_tx,
+    count_analysis_chunks_by_status, create_analysis_chunk, fail_analysis_chunk,
+    list_all_analysis_chunks, list_analysis_chunks_by_status, requeue_failed_analysis_chunks,
+    reset_analysis_chunk,
+};
+use crate::store::{Stage, StageStatus, Store, UnitStatus};
+
+use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
+use super::error::PipelineError;
+use super::input::check_source_unchanged;
+use super::orchestrator::{can_run, load_state};
+use super::scheduler::{self, SchedulerConfig, UnitOutcome, UnitState, WorkUnit};
+
+/// Characters per output token for the analysis-document estimate. The document is
+/// predominantly English JSON, for which ~4 chars/token is standard; the few Burmese
+/// fields (`self_ref`, `addressee_ref`, `particle`, glossary `target`) are short.
+const OUTPUT_CHARS_PER_TOKEN: u64 = 4;
+
+/// Headroom (in tokens) for thinking, which `maxOutputTokens` **includes** (verified
+/// against the live Gemini `generateContent` docs, 2026-11); analysis runs with
+/// `thinking = low`. Added on top of the worst-case document so a thinking budget
+/// never eats into the document's room.
+const ANALYSIS_THINKING_HEADROOM: u64 = 8_192;
+
+/// The largest `maxOutputTokens` we will ever request for analysis — a value within
+/// current Gemini Flash/Pro output-token limits, so the request itself is never
+/// rejected for an out-of-range budget. The absolute schema-maximum document can
+/// exceed this; such a pathological input may still truncate, but every realistic
+/// large-cast analysis fits well under it (see `analysis_output_budget`).
+const ANALYSIS_OUTPUT_CEILING: u32 = 65_536;
+
+// ---------------------------------------------------------------------------
+// Public surface
+// ---------------------------------------------------------------------------
+
+/// Everything the analysis executor needs that is not the transport, the store, or
+/// the cues. Built from config + CLI overrides by the command handler; held as
+/// plain data so the executor and its tests do not depend on the `config` type.
+#[derive(Debug, Clone)]
+pub struct AnalysisParams {
+    /// The analysis model (`[llm.models].analysis`, overridable by `--model`).
+    pub model: String,
+    /// The service tier (`[llm].service_tier`, overridable by `--tier`).
+    pub tier: ServiceTier,
+    /// The analysis thinking setting (`[llm.thinking].analysis`).
+    pub thinking: ThinkingSetting,
+    /// The project source hash, stored as the version's `source_digest`
+    /// (`docs/DATA_MODEL.md` §2).
+    pub source_digest: String,
+    /// Content-retry budget (`[translation].max_content_attempts`, reused for
+    /// analysis — see the module/ADR notes).
+    pub max_content_attempts: u32,
+    /// Single-pass threshold in estimated tokens (`[analysis].single_pass_max_tokens`).
+    pub single_pass_max_tokens: u64,
+    /// Chunk size in cues for the map phase (`[analysis].chunk_cues`).
+    pub chunk_cues: u32,
+    /// Per-script token estimator (`[estimate]`).
+    pub estimator: Estimator,
+    /// Output-token ratio for the dry-run estimate (`[translation].output_ratio`).
+    pub output_ratio: f64,
+    /// Scheduler tuning for the map phase (`[translation].concurrency`/`warm_cache_first`,
+    /// `[output].grace_secs`).
+    pub scheduler: SchedulerConfig,
+    /// Jitter seed for the transport retry backoff.
+    pub seed: u64,
+    /// Transport retry policy (`[llm]`).
+    pub retry: RetryConfig,
+}
+
+/// Run shaping flags from the `analyze` command (`docs/CLI.md` §6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AnalysisFlags {
+    /// Produce a new analysis version even if a current one exists.
+    pub redo: bool,
+    /// Rerun only failed chunks.
+    pub retry_failed: bool,
+}
+
+/// Where the analysis executor stopped (`docs/CLI.md` §6/§7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisOutcome {
+    /// A current analysis version already exists and `--redo` was not given.
+    NothingToDo,
+    /// A new analysis version was stored (single-pass, or a completed map-reduce).
+    Completed { version: i64 },
+    /// Some units failed after their content-retry budget; no version was stored.
+    /// Maps to exit code 4 (`docs/CLI.md` §7).
+    CompletedWithFailures { failed: usize },
+    /// Interrupted by cancellation (Ctrl-C).
+    Interrupted,
+}
+
+/// Whether a plan is single-pass or map-reduce (`docs/LLM.md` §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisModeKind {
+    SinglePass,
+    MapReduce,
+}
+
+/// The `analyze --dry-run` report (`docs/LLM.md` §9, `docs/CLI.md` §6). Estimated,
+/// never persisted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DryRunReport {
+    pub mode: AnalysisModeKind,
+    /// Number of map chunks (0 for single-pass).
+    pub chunk_count: usize,
+    /// Total logical calls the real run would make (1 for single-pass; chunks + 1
+    /// reduce for map-reduce).
+    pub calls: usize,
+    pub estimated_prompt_tokens: u64,
+    pub estimated_output_tokens: u64,
+    pub estimated_cost: Cost,
+}
+
+/// The `"prompt_v{N}|{model}"` signature stored on an analysis version
+/// (`docs/DATA_MODEL.md` §2). `N` is the current [`PROMPT_VERSION`].
+pub fn analysis_signature(model: &str) -> String {
+    format!("prompt_v{PROMPT_VERSION}|{model}")
+}
+
+/// The worst-case analysis-document size in output tokens, derived from the schema
+/// caps (`docs/DATA_MODEL.md` §3) at [`OUTPUT_CHARS_PER_TOKEN`], including per-element
+/// key/structure overhead. Used to size [`analysis_output_budget`].
+pub fn worst_case_doc_tokens() -> u64 {
+    // maxLength budgets × caps, plus a per-element allowance for ids, enums, keys,
+    // quotes, and separators. (`docs/DATA_MODEL.md` §3.)
+    let characters = 40 * (120 + 8 * 80 + 260 + 180 + 120); // name, aliases, role, speech_style, +ids/enums/keys
+    let address_matrix = 80 * (160 + 120 + 120 + 60 + 120); // relation, self_ref, addressee_ref, particle, +from/to/register/keys
+    let glossary = 120 * (120 + 120 + 180 + 60); // term, target, note, +keep/keys
+    let scenes = 120 * (300 + 80 + 60 + 60); // summary, mood, +cue_range/speakers/keys
+    let lists = 12 * 180 + 12 * 220; // style_rules + unresolved_ambiguities
+    let top = 500 + 160 + 256; // premise + tone + schema_version/outer braces
+    let chars: u64 = characters + address_matrix + glossary + scenes + lists + top;
+    chars / OUTPUT_CHARS_PER_TOKEN
+}
+
+/// The analysis `maxOutputTokens` budget (`docs/LLM.md` §5: "Always set
+/// `maxOutputTokens`"). The worst-case document plus thinking headroom (since
+/// `maxOutputTokens` includes thinking tokens), bounded by [`ANALYSIS_OUTPUT_CEILING`]
+/// so the request stays within the model's output limit. Comfortably above the old
+/// fixed 16 384, so a large-cast single-pass or a full merged reduce is not truncated
+/// into a content-retry failure for an input the schema permits.
+pub fn analysis_output_budget() -> u32 {
+    let want = worst_case_doc_tokens().saturating_add(ANALYSIS_THINKING_HEADROOM);
+    want.min(u64::from(ANALYSIS_OUTPUT_CEILING)) as u32
+}
+
+/// Parses an `[llm.thinking]` label into a [`ThinkingSetting`]. A bare integer is a
+/// token budget; an unrecognized label defaults to `low` (the analysis default,
+/// `docs/LLM.md` §5.7).
+pub fn parse_thinking(label: &str) -> ThinkingSetting {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "off" => ThinkingSetting::Off,
+        "minimal" => ThinkingSetting::Minimal,
+        "low" => ThinkingSetting::Low,
+        "medium" => ThinkingSetting::Medium,
+        "high" => ThinkingSetting::High,
+        other => other
+            .parse::<u32>()
+            .map(ThinkingSetting::Budget)
+            .unwrap_or(ThinkingSetting::Low),
+    }
+}
+
+/// Parses a service-tier label, defaulting to `flex` (the cost default,
+/// `docs/LLM.md` §5).
+pub fn parse_tier(label: &str) -> ServiceTier {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "standard" => ServiceTier::Standard,
+        _ => ServiceTier::Flex,
+    }
+}
+
+/// Maps an [`AnalysisOutcome`] to its process exit code (`docs/CLI.md` §7).
+/// Cancellation wins (130), then failed units (4), otherwise success (0).
+pub fn analysis_exit_code(cancelled: bool, outcome: &AnalysisOutcome) -> i32 {
+    use crate::error::exit;
+    if cancelled {
+        return exit::INTERRUPTED;
+    }
+    match outcome {
+        AnalysisOutcome::Interrupted => exit::INTERRUPTED,
+        AnalysisOutcome::CompletedWithFailures { .. } => exit::FAILED_UNITS,
+        AnalysisOutcome::Completed { .. } | AnalysisOutcome::NothingToDo => exit::SUCCESS,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_analysis
+// ---------------------------------------------------------------------------
+
+/// Runs the analysis stage over `cues` using `transport` for LLM calls
+/// (`docs/ARCHITECTURE.md` §4). Decides single-pass vs map-reduce from the token
+/// estimate, honours `--redo`/`--retry-failed`, and stores a new, unapproved
+/// analysis version on success. The caller supplies a [`CancellationToken`] that is
+/// threaded to the scheduler and every LLM call.
+pub async fn run_analysis<T>(
+    transport: T,
+    store: &Store,
+    cues: &[Cue],
+    params: &AnalysisParams,
+    flags: AnalysisFlags,
+    token: &CancellationToken,
+) -> Result<AnalysisOutcome, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+{
+    // A current analysis version plus no `--redo` is nothing to do: editing uses
+    // `--redo` to mint a new version (`docs/CLI.md` §6). A crashed map-reduce has no
+    // version yet, so it is *not* nothing-to-do and resumes below.
+    let current = store.call(|conn| current_analysis(conn)).await?;
+    if current.is_some() && !flags.redo {
+        return Ok(AnalysisOutcome::NothingToDo);
+    }
+
+    if flags.redo {
+        // A fresh version starts from a clean map phase.
+        store
+            .call(|conn| clear_analysis_chunks(conn).map(|_| ()))
+            .await?;
+    }
+    if flags.retry_failed {
+        store
+            .call(|conn| requeue_failed_analysis_chunks(conn).map(|_| ()))
+            .await?;
+    }
+
+    let plan = plan_mode(
+        cues,
+        params.chunk_cues,
+        params.single_pass_max_tokens,
+        &params.estimator,
+    );
+    match plan.kind {
+        AnalysisModeKind::SinglePass => {
+            run_single_pass(&transport, store, cues, params, token).await
+        }
+        AnalysisModeKind::MapReduce => {
+            run_map_reduce(transport, store, cues, plan.chunks, params, token).await
+        }
+    }
+}
+
+/// Runs the analysis stage behind the cost-confirmation gate (`docs/CLI.md` §5,
+/// `docs/LLM.md` §9). Computes the pre-flight estimate with the dry-run estimator
+/// (no LLM call), then [`confirm::gate`]s the real run: `make_transport` — and thus
+/// the API key it needs — is only built once the gate is cleared, so a refused run
+/// (non-TTY, no `--yes`) returns [`PipelineError::ConfirmationNeeded`] (exit 3)
+/// without spending or requiring a key. `--yes` or an estimate at/under the
+/// threshold proceeds silently.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_analysis_confirmed<T, MK>(
+    make_transport: MK,
+    store: &Store,
+    cues: &[Cue],
+    params: &AnalysisParams,
+    flags: AnalysisFlags,
+    token: &CancellationToken,
+    prices: &PriceTable,
+    settings: ConfirmSettings,
+) -> Result<ConfirmedRun<AnalysisOutcome>, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+    MK: FnOnce() -> Result<T, PipelineError>,
+{
+    let report = dry_run_analysis(store, cues, params, prices).await?;
+    let estimate = CostEstimate {
+        prompt_tokens: report.estimated_prompt_tokens,
+        output_tokens: report.estimated_output_tokens,
+        cost: report.estimated_cost,
+    };
+    confirm::gate(estimate, settings, make_transport, |transport| {
+        run_analysis(transport, store, cues, params, flags, token)
+    })
+    .await
+}
+
+/// Enforces the analysis stage's preconditions and loads the cues it will analyze
+/// (`docs/ARCHITECTURE.md` §2/§6). This is the command handler's shared front door:
+/// it verifies the source has not changed since init (§6 rule 5), checks the
+/// analysis gate (input completed, [`can_run`]), and returns the cues. A failed gate
+/// is a [`PipelineError::GateViolation`] (exit 3); a changed source is
+/// [`PipelineError::SourceChanged`] (exit 3).
+pub async fn prepare_analysis(
+    store: &Store,
+    source_path: &Path,
+) -> Result<Vec<Cue>, PipelineError> {
+    check_source_unchanged(store, source_path).await?;
+    let state = load_state(store).await?;
+    can_run(Stage::Analysis, &state)?;
+    let cues = store.call(|conn| load_cues(conn)).await?;
+    Ok(cues)
+}
+
+async fn run_single_pass<T>(
+    transport: &T,
+    store: &Store,
+    cues: &[Cue],
+    params: &AnalysisParams,
+    token: &CancellationToken,
+) -> Result<AnalysisOutcome, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+{
+    let req = transcript_request(full_transcript(cues), params);
+    let env = CallEnv::new(transport, store, params, token);
+    match call_validated(&env, None, req, validate_full).await {
+        CallResult::Valid { text, commit } => {
+            let version = store_version(store, text, commit, params).await?;
+            Ok(AnalysisOutcome::Completed { version })
+        }
+        CallResult::Exhausted => Ok(AnalysisOutcome::CompletedWithFailures { failed: 1 }),
+        CallResult::Cancelled => Ok(AnalysisOutcome::Interrupted),
+        CallResult::Transport(err) => Err(PipelineError::Llm(err)),
+    }
+}
+
+async fn run_map_reduce<T>(
+    transport: T,
+    store: &Store,
+    cues: &[Cue],
+    chunks: Vec<ChunkBounds>,
+    params: &AnalysisParams,
+    token: &CancellationToken,
+) -> Result<AnalysisOutcome, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+{
+    // On a fresh run, create the chunk rows and mark the stage running, all in one
+    // transaction. On a resume the rows already exist and this is skipped, so a
+    // `done` chunk keeps its committed result (`docs/ARCHITECTURE.md` §6).
+    store
+        .call(move |conn| {
+            if list_all_analysis_chunks(conn)?.is_empty() {
+                let tx = conn.transaction()?;
+                for cb in &chunks {
+                    create_analysis_chunk(&tx, cb.chunk_no, cb.first_cue, cb.last_cue)?;
+                }
+                set_stage(&tx, Stage::Analysis, StageStatus::Running)?;
+                tx.commit()?;
+            }
+            Ok(())
+        })
+        .await?;
+
+    // Build one unit per chunk from the authoritative DB rows (so resumes honour the
+    // persisted bounds and statuses), with its transcript sliced from the cues.
+    let rows = store.call(|conn| list_all_analysis_chunks(conn)).await?;
+    let cues_arc = Arc::new(cues.to_vec());
+    let ctx = Arc::new(ChunkExecCtx {
+        transport,
+        store: store.clone(),
+        retry: params.retry.clone(),
+        token: token.clone(),
+        seed: params.seed,
+        model: params.model.clone(),
+        tier: params.tier,
+        thinking: params.thinking,
+        max_content_attempts: params.max_content_attempts.max(1),
+    });
+    let units: Vec<Arc<AnalysisChunkUnit<T>>> = rows
+        .iter()
+        .map(|row| {
+            let transcript = range_transcript(&cues_arc, row.first_cue, row.last_cue);
+            Arc::new(AnalysisChunkUnit::new(
+                row.chunk_no,
+                transcript,
+                row.status,
+                ctx.clone(),
+            ))
+        })
+        .collect();
+
+    let _summary = scheduler::run(units, params.scheduler, token).await;
+
+    if token.is_cancelled() {
+        return Ok(AnalysisOutcome::Interrupted);
+    }
+
+    // The DB is authoritative for the final decision, not the scheduler summary.
+    let (failed, incomplete) = store
+        .call(|conn| {
+            let failed = count_analysis_chunks_by_status(conn, UnitStatus::Failed)?;
+            let pending = count_analysis_chunks_by_status(conn, UnitStatus::Pending)?;
+            let in_flight = count_analysis_chunks_by_status(conn, UnitStatus::InFlight)?;
+            Ok((failed, pending + in_flight))
+        })
+        .await?;
+    if failed > 0 || incomplete > 0 {
+        // Never fabricate a reduce from incomplete partials (`docs/LLM.md` §2).
+        return Ok(AnalysisOutcome::CompletedWithFailures {
+            failed: failed + incomplete,
+        });
+    }
+
+    // All chunks done → reduce their partials in chunk order.
+    let partials: Vec<String> = store
+        .call(|conn| list_analysis_chunks_by_status(conn, UnitStatus::Done))
+        .await?
+        .into_iter()
+        .filter_map(|c| c.result)
+        .collect();
+
+    let req = reduce_request(&partials, params);
+    let env = CallEnv::new(&ctx.transport, store, params, token);
+    match call_validated(&env, None, req, validate_full).await {
+        CallResult::Valid { text, commit } => {
+            let version = store_version(store, text, commit, params).await?;
+            Ok(AnalysisOutcome::Completed { version })
+        }
+        CallResult::Exhausted => Ok(AnalysisOutcome::CompletedWithFailures { failed: 1 }),
+        CallResult::Cancelled => Ok(AnalysisOutcome::Interrupted),
+        CallResult::Transport(err) => Err(PipelineError::Llm(err)),
+    }
+}
+
+/// Stores a new analysis version plus its cache payload and the completed stage
+/// state, all in one transaction (`docs/ARCHITECTURE.md` §6 rule 1).
+async fn store_version(
+    store: &Store,
+    doc: String,
+    commit: CommitToken,
+    params: &AnalysisParams,
+) -> Result<i64, PipelineError> {
+    let digest = params.source_digest.clone();
+    let signature = analysis_signature(&params.model);
+    let version = store
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            let version =
+                insert_analysis_version_in_tx(&tx, &doc, AnalysisOrigin::Llm, &digest, &signature)?;
+            if let Some(payload) = commit.payload() {
+                put_cache_in_tx(&tx, payload)?;
+            }
+            set_stage(&tx, Stage::Analysis, StageStatus::Completed)?;
+            tx.commit()?;
+            Ok(version)
+        })
+        .await?;
+    Ok(version)
+}
+
+// ---------------------------------------------------------------------------
+// Dry run
+// ---------------------------------------------------------------------------
+
+/// Produces the `analyze --dry-run` report without persisting anything
+/// (`docs/LLM.md` §9). The real plan is computed and the real prompts are built;
+/// each would-be call is estimated through the `DryRun` transport behind the local
+/// cache (a hit is free), and nothing is written to the database.
+pub async fn dry_run_analysis(
+    store: &Store,
+    cues: &[Cue],
+    params: &AnalysisParams,
+    prices: &PriceTable,
+) -> Result<DryRunReport, PipelineError> {
+    let plan = plan_mode(
+        cues,
+        params.chunk_cues,
+        params.single_pass_max_tokens,
+        &params.estimator,
+    );
+
+    // DryRun behind Cached: real local-cache lookups, estimated misses, no writes
+    // (nothing is ever committed, so the cache is only read).
+    let client = Cached::new(
+        DryRun::new(params.estimator, params.output_ratio),
+        store.clone(),
+    );
+
+    let requests: Vec<LlmRequest> = match plan.kind {
+        AnalysisModeKind::SinglePass => vec![transcript_request(full_transcript(cues), params)],
+        AnalysisModeKind::MapReduce => {
+            let mut reqs: Vec<LlmRequest> = plan
+                .chunks
+                .iter()
+                .map(|cb| {
+                    transcript_request(range_transcript(cues, cb.first_cue, cb.last_cue), params)
+                })
+                .collect();
+            // Approximate the reduce input by the chunk transcripts (we have no real
+            // partials in a dry run); this tends to overestimate, which is the safe
+            // direction for a cost estimate (ADR-029).
+            let proxy: Vec<String> = plan
+                .chunks
+                .iter()
+                .map(|cb| range_transcript(cues, cb.first_cue, cb.last_cue))
+                .collect();
+            reqs.push(reduce_request(&proxy, params));
+            reqs
+        }
+    };
+
+    let mut prompt_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cost = Cost::Known(0.0);
+    let mut calls = 0usize;
+    for req in requests {
+        let resp = client.generate(req).await.map_err(PipelineError::Llm)?;
+        prompt_tokens += resp.usage.prompt_tokens;
+        output_tokens += resp.usage.output_tokens;
+        cost = add_cost(
+            cost,
+            pricing::cost(&params.model, params.tier, &resp.usage, prices),
+        );
+        calls += 1;
+    }
+
+    Ok(DryRunReport {
+        mode: plan.kind,
+        chunk_count: plan.chunks.len(),
+        calls,
+        estimated_prompt_tokens: prompt_tokens,
+        estimated_output_tokens: output_tokens,
+        estimated_cost: cost,
+    })
+}
+
+/// Sums two [`Cost`]s; an unknown component makes the total unknown
+/// (`docs/LLM.md` §9).
+fn add_cost(acc: Cost, next: Cost) -> Cost {
+    match (acc, next) {
+        (Cost::Known(a), Cost::Known(b)) => Cost::Known(a + b),
+        _ => Cost::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Planning + transcript
+// ---------------------------------------------------------------------------
+
+/// A map-phase chunk's cue-index bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkBounds {
+    chunk_no: i64,
+    first_cue: i64,
+    last_cue: i64,
+}
+
+/// A chosen analysis plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Plan {
+    kind: AnalysisModeKind,
+    /// Empty for single-pass.
+    chunks: Vec<ChunkBounds>,
+}
+
+/// Chooses single-pass vs map-reduce from the full-transcript token estimate
+/// (`docs/LLM.md` §2/§9).
+fn plan_mode(
+    cues: &[Cue],
+    chunk_cues: u32,
+    single_pass_max_tokens: u64,
+    estimator: &Estimator,
+) -> Plan {
+    let transcript = full_transcript(cues);
+    let tokens = estimator.estimate_tokens(&transcript);
+    if tokens <= single_pass_max_tokens {
+        return Plan {
+            kind: AnalysisModeKind::SinglePass,
+            chunks: Vec::new(),
+        };
+    }
+
+    let included: Vec<&Cue> = included_cues(cues);
+    let size = (chunk_cues.max(1)) as usize;
+    let mut chunks = Vec::new();
+    for (i, group) in included.chunks(size).enumerate() {
+        if let (Some(first), Some(last)) = (group.first(), group.last()) {
+            chunks.push(ChunkBounds {
+                chunk_no: i as i64 + 1,
+                first_cue: i64::from(first.idx),
+                last_cue: i64::from(last.idx),
+            });
+        }
+    }
+    Plan {
+        kind: AnalysisModeKind::MapReduce,
+        chunks,
+    }
+}
+
+/// The cues that contribute transcript lines: translatable cues with non-blank
+/// masked text (`docs/LLM.md` §2 "tags removed").
+fn included_cues(cues: &[Cue]) -> Vec<&Cue> {
+    cues.iter()
+        .filter(|c| c.translatable && !c.text_masked.trim().is_empty())
+        .collect()
+}
+
+/// Renders one transcript line as `[idx] Speaker: text` / `[idx] text`
+/// (`docs/LLM.md` §2).
+fn render_line(cue: &Cue) -> String {
+    analysis_input_line(cue.idx, cue.speaker.as_deref(), &cue.text_masked)
+}
+
+/// The full transcript of all included cues.
+fn full_transcript(cues: &[Cue]) -> String {
+    included_cues(cues)
+        .into_iter()
+        .map(render_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The transcript of the included cues whose index lies in `[first, last]`.
+fn range_transcript(cues: &[Cue], first: i64, last: i64) -> String {
+    included_cues(cues)
+        .into_iter()
+        .filter(|c| {
+            let idx = i64::from(c.idx);
+            idx >= first && idx <= last
+        })
+        .map(render_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Request builders
+// ---------------------------------------------------------------------------
+
+/// Builds an analysis request carrying `transcript` (single-pass, or one map
+/// chunk). The system instruction and schema are fixed per [`PROMPT_VERSION`].
+fn transcript_request(transcript: String, params: &AnalysisParams) -> LlmRequest {
+    LlmRequest {
+        model: params.model.clone(),
+        service_tier: params.tier,
+        system_instruction: analysis_system_instruction(),
+        contents: vec![ContentBlock::user(transcript)],
+        generation_config: generation_config(params.thinking),
+    }
+}
+
+/// Builds the reduce request: the partial documents, in chunk order, under the
+/// reduce instruction (`docs/LLM.md` §2).
+fn reduce_request(partials: &[String], params: &AnalysisParams) -> LlmRequest {
+    let joined = partials
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("PARTIAL {}:\n{p}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let text = format!("{}\n\n{joined}", analysis_reduce_instruction());
+    LlmRequest {
+        model: params.model.clone(),
+        service_tier: params.tier,
+        system_instruction: analysis_system_instruction(),
+        contents: vec![ContentBlock::user(text)],
+        generation_config: generation_config(params.thinking),
+    }
+}
+
+fn generation_config(thinking: ThinkingSetting) -> GenerationConfig {
+    GenerationConfig {
+        max_output_tokens: analysis_output_budget(),
+        response_mime_type: "application/json".to_string(),
+        response_schema: Some(analysis_response_schema()),
+        thinking,
+    }
+}
+
+/// Appends the strict reminder as a trailing user block for a content retry
+/// (`docs/LLM.md` §6).
+fn with_reminder(mut req: LlmRequest) -> LlmRequest {
+    req.contents
+        .push(ContentBlock::user(strict_retry_reminder()));
+    req
+}
+
+// ---------------------------------------------------------------------------
+// LLM call + content retry
+// ---------------------------------------------------------------------------
+
+/// The shared inputs for a validated LLM call (avoids threading five arguments).
+struct CallEnv<'a, T> {
+    transport: &'a T,
+    store: &'a Store,
+    retry: &'a RetryConfig,
+    seed: u64,
+    token: &'a CancellationToken,
+    max_content_attempts: u32,
+}
+
+impl<'a, T> CallEnv<'a, T> {
+    fn new(
+        transport: &'a T,
+        store: &'a Store,
+        params: &'a AnalysisParams,
+        token: &'a CancellationToken,
+    ) -> Self {
+        Self {
+            transport,
+            store,
+            retry: &params.retry,
+            seed: params.seed,
+            token,
+            max_content_attempts: params.max_content_attempts.max(1),
+        }
+    }
+}
+
+/// The outcome of a validated call (`docs/LLM.md` §6).
+enum CallResult {
+    /// A transport-successful, schema-valid response and its cache-commit token.
+    Valid { text: String, commit: CommitToken },
+    /// The content-retry budget was exhausted on invalid responses.
+    Exhausted,
+    /// The operation was cancelled.
+    Cancelled,
+    /// A terminal transport error (after transport retries).
+    Transport(LlmError),
+}
+
+/// Calls the LLM stack and validates the response, retrying the whole call with a
+/// strict reminder on a content failure, up to `max_content_attempts`
+/// (`docs/LLM.md` §6). The content-attempt counter here is separate from the
+/// transport retries inside `Retrying`.
+async fn call_validated<T, V>(
+    env: &CallEnv<'_, T>,
+    unit: Option<i64>,
+    base_req: LlmRequest,
+    validate: V,
+) -> CallResult
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+    V: Fn(&str) -> Result<(), ValidationError>,
+{
+    let mut attempt = 0u32;
+    loop {
+        if env.token.is_cancelled() {
+            return CallResult::Cancelled;
+        }
+        let req = if attempt == 0 {
+            base_req.clone()
+        } else {
+            with_reminder(base_req.clone())
+        };
+
+        let ctx = CallContext {
+            stage: Stage::Analysis.as_str().to_string(),
+            unit,
+            dry_run: false,
+        };
+        let stack = assemble_stack(
+            env.transport.clone(),
+            env.retry.clone(),
+            env.token.clone(),
+            env.seed,
+            env.store.clone(),
+            env.store.clone(),
+            ctx,
+        );
+
+        match stack.generate(req).await {
+            Ok(resp) => match validate(&resp.text) {
+                Ok(()) => {
+                    return CallResult::Valid {
+                        text: resp.text,
+                        commit: resp.commit,
+                    };
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        attempt,
+                        "analysis response failed validation ({err}); content retry"
+                    );
+                    attempt += 1;
+                    if attempt >= env.max_content_attempts {
+                        return CallResult::Exhausted;
+                    }
+                }
+            },
+            Err(LlmError::Cancelled) => return CallResult::Cancelled,
+            Err(err) => return CallResult::Transport(err),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Why a response is not a usable analysis document (`docs/DATA_MODEL.md` §3). Used
+/// only to drive the content retry; the message is logged, not surfaced to the user.
+#[derive(Debug, thiserror::Error)]
+enum ValidationError {
+    #[error("response is not valid JSON: {0}")]
+    Parse(String),
+    #[error("response is not a JSON object")]
+    NotObject,
+    #[error("missing required field `{0}`")]
+    Missing(&'static str),
+    #[error("field `{0}` has the wrong type")]
+    WrongType(&'static str),
+    #[error("array `{0}` exceeds its cap")]
+    CapExceeded(&'static str),
+}
+
+/// Validates a full analysis document leniently (`docs/DATA_MODEL.md` §3): it must
+/// parse, be an object, carry the required fields with the right JSON types, and
+/// respect the array caps. Unknown fields are ignored (lenient on LLM output).
+fn validate_full(text: &str) -> Result<(), ValidationError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| ValidationError::Parse(e.to_string()))?;
+    let obj = value.as_object().ok_or(ValidationError::NotObject)?;
+
+    if !obj.get("schema_version").is_some_and(|v| v.is_number()) {
+        return Err(if obj.contains_key("schema_version") {
+            ValidationError::WrongType("schema_version")
+        } else {
+            ValidationError::Missing("schema_version")
+        });
+    }
+    if !obj.get("premise").is_some_and(|v| v.is_string()) {
+        return Err(if obj.contains_key("premise") {
+            ValidationError::WrongType("premise")
+        } else {
+            ValidationError::Missing("premise")
+        });
+    }
+    require_array_within(obj, "characters", 40)?;
+    require_array_within(obj, "scenes", 120)?;
+    // These are optional, but when present must respect their caps.
+    optional_array_within(obj, "address_matrix", 80)?;
+    optional_array_within(obj, "glossary", 120)?;
+    Ok(())
+}
+
+/// Validates a map-phase partial leniently: it must parse and be a JSON object
+/// (`docs/LLM.md` §2). Partials are merged by the reduce call, so field-level
+/// completeness is not required here.
+fn validate_partial(text: &str) -> Result<(), ValidationError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| ValidationError::Parse(e.to_string()))?;
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(ValidationError::NotObject)
+    }
+}
+
+fn require_array_within(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    cap: usize,
+) -> Result<(), ValidationError> {
+    match obj.get(field) {
+        Some(serde_json::Value::Array(a)) if a.len() <= cap => Ok(()),
+        Some(serde_json::Value::Array(_)) => Err(ValidationError::CapExceeded(field)),
+        Some(_) => Err(ValidationError::WrongType(field)),
+        None => Err(ValidationError::Missing(field)),
+    }
+}
+
+fn optional_array_within(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    cap: usize,
+) -> Result<(), ValidationError> {
+    match obj.get(field) {
+        Some(serde_json::Value::Array(a)) if a.len() <= cap => Ok(()),
+        Some(serde_json::Value::Array(_)) => Err(ValidationError::CapExceeded(field)),
+        Some(_) => Err(ValidationError::WrongType(field)),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Map-phase work unit
+// ---------------------------------------------------------------------------
+
+const ST_PENDING: u8 = 0;
+const ST_IN_FLIGHT: u8 = 1;
+const ST_DONE: u8 = 2;
+const ST_FAILED: u8 = 3;
+
+fn status_to_atom(status: UnitStatus) -> u8 {
+    match status {
+        UnitStatus::Pending => ST_PENDING,
+        UnitStatus::InFlight => ST_IN_FLIGHT,
+        UnitStatus::Done => ST_DONE,
+        UnitStatus::Failed => ST_FAILED,
+    }
+}
+
+fn atom_to_state(atom: u8) -> UnitState {
+    match atom {
+        ST_IN_FLIGHT => UnitState::InFlight,
+        ST_DONE => UnitState::Done,
+        ST_FAILED => UnitState::Failed,
+        _ => UnitState::Pending,
+    }
+}
+
+/// Shared execution context for every map chunk of one run.
+struct ChunkExecCtx<T> {
+    transport: T,
+    store: Store,
+    retry: RetryConfig,
+    token: CancellationToken,
+    seed: u64,
+    model: String,
+    tier: ServiceTier,
+    thinking: ThinkingSetting,
+    max_content_attempts: u32,
+}
+
+/// One map-phase chunk as a [`WorkUnit`] (`docs/ARCHITECTURE.md` §4/§6). Its `run`
+/// claims the chunk, calls the LLM with the chunk transcript, validates the partial
+/// (with content retries), and writes the partial result and `done` status in one
+/// transaction.
+struct AnalysisChunkUnit<T> {
+    chunk_no: i64,
+    transcript: String,
+    /// The scheduler reads [`WorkUnit::state`] synchronously, so the DB status is
+    /// cached here and updated as the unit progresses.
+    state: AtomicU8,
+    ctx: Arc<ChunkExecCtx<T>>,
+}
+
+impl<T> AnalysisChunkUnit<T> {
+    fn new(
+        chunk_no: i64,
+        transcript: String,
+        status: UnitStatus,
+        ctx: Arc<ChunkExecCtx<T>>,
+    ) -> Self {
+        Self {
+            chunk_no,
+            transcript,
+            state: AtomicU8::new(status_to_atom(status)),
+            ctx,
+        }
+    }
+
+    fn call_env(&self) -> CallEnv<'_, T> {
+        CallEnv {
+            transport: &self.ctx.transport,
+            store: &self.ctx.store,
+            retry: &self.ctx.retry,
+            seed: self.ctx.seed,
+            token: &self.ctx.token,
+            max_content_attempts: self.ctx.max_content_attempts,
+        }
+    }
+}
+
+impl<T> WorkUnit for AnalysisChunkUnit<T>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+{
+    fn id(&self) -> u64 {
+        self.chunk_no.max(0) as u64
+    }
+
+    fn kind(&self) -> &str {
+        "analysis_chunk"
+    }
+
+    fn state(&self) -> UnitState {
+        atom_to_state(self.state.load(Ordering::Relaxed))
+    }
+
+    async fn reset(&self) {
+        let chunk_no = self.chunk_no;
+        let store = self.ctx.store.clone();
+        let _ = store
+            .call(move |conn| reset_analysis_chunk(conn, chunk_no).map(|_| ()))
+            .await;
+        self.state.store(ST_PENDING, Ordering::Relaxed);
+    }
+
+    async fn run(&self) -> UnitOutcome {
+        let chunk_no = self.chunk_no;
+
+        // Claim: pending → in_flight. A lost claim means the chunk is no longer
+        // pending (already done/claimed); skip it as done.
+        let store = self.ctx.store.clone();
+        match store
+            .call(move |conn| claim_analysis_chunk(conn, chunk_no))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.state.store(ST_DONE, Ordering::Relaxed);
+                return UnitOutcome::Done;
+            }
+            Err(_) => {
+                self.state.store(ST_FAILED, Ordering::Relaxed);
+                return UnitOutcome::Failed;
+            }
+        }
+        self.state.store(ST_IN_FLIGHT, Ordering::Relaxed);
+
+        let params_thinking = self.ctx.thinking;
+        let req = LlmRequest {
+            model: self.ctx.model.clone(),
+            service_tier: self.ctx.tier,
+            system_instruction: analysis_system_instruction(),
+            contents: vec![ContentBlock::user(self.transcript.clone())],
+            generation_config: generation_config(params_thinking),
+        };
+
+        let env = self.call_env();
+        match call_validated(&env, Some(chunk_no), req, validate_partial).await {
+            CallResult::Valid { text, commit } => {
+                let store = self.ctx.store.clone();
+                let committed = store
+                    .call(move |conn| {
+                        let tx = conn.transaction()?;
+                        let ok = complete_analysis_chunk_in_tx(&tx, chunk_no, &text)?;
+                        if let Some(payload) = commit.payload() {
+                            put_cache_in_tx(&tx, payload)?;
+                        }
+                        tx.commit()?;
+                        Ok(ok)
+                    })
+                    .await;
+                match committed {
+                    Ok(true) => {
+                        self.state.store(ST_DONE, Ordering::Relaxed);
+                        UnitOutcome::Done
+                    }
+                    _ => {
+                        self.state.store(ST_FAILED, Ordering::Relaxed);
+                        UnitOutcome::Failed
+                    }
+                }
+            }
+            CallResult::Exhausted => {
+                self.mark_failed(chunk_no, "content validation failed after retries")
+                    .await;
+                UnitOutcome::Failed
+            }
+            CallResult::Transport(err) => {
+                let message = err.to_string();
+                self.mark_failed(chunk_no, &message).await;
+                UnitOutcome::Failed
+            }
+            CallResult::Cancelled => {
+                // Leave the chunk `in_flight`; `Store::open` recovers it to `pending`
+                // so the rerun resumes it without re-sending a completed map call.
+                UnitOutcome::Failed
+            }
+        }
+    }
+}
+
+impl<T> AnalysisChunkUnit<T> {
+    async fn mark_failed(&self, chunk_no: i64, message: &str) {
+        let store = self.ctx.store.clone();
+        let message = message.to_string();
+        let _ = store
+            .call(move |conn| fail_analysis_chunk(conn, chunk_no, &message).map(|_| ()))
+            .await;
+        self.state.store(ST_FAILED, Ordering::Relaxed);
+    }
+}

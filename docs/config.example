@@ -1,5 +1,6 @@
-# subtrans configuration. Values shown are the defaults.
-# Copy to <project>/subtrans.toml or the global config dir and edit.
+# myansub configuration. Values shown are the defaults.
+# Copy to <project>/myansub.toml or the global config dir
+# (<config_dir>/myansub/config.toml) and edit.
 
 [llm]
 base_url = "https://generativelanguage.googleapis.com/v1beta"
@@ -63,7 +64,7 @@ grace_secs = 10                  # Ctrl-C grace period for in-flight calls
 # input = 0.0
 # cached_input = 0.0
 # output = 0.0                   # thinking tokens are billed as output
-# storage_per_hour = 0.0         # explicit cache storage
+# storage_per_hour = 0.0         # explicit cache storage, USD per 1M tokens per hour
 # flex_multiplier = 0.5
 # long_prompt_threshold = 200000 # optional bracket
 # long_input = 0.0

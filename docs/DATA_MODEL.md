@@ -41,12 +41,14 @@ CREATE TABLE project (
   target_lang         TEXT NOT NULL DEFAULT 'my',
   format_meta         TEXT,                    -- JSON
   created_at          TEXT NOT NULL DEFAULT (datetime('now'))
+  -- output_format, output_path added by migration 2 (below)
 );
 
 CREATE TABLE stage_state (
-  stage      TEXT PRIMARY KEY,                 -- input|analysis|analysis_review|translation|translation_review|output
-  status     TEXT NOT NULL,                    -- not_started|running|completed|approved
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  stage           TEXT PRIMARY KEY,            -- input|analysis|analysis_review|translation|translation_review|output
+  status          TEXT NOT NULL,               -- not_started|running|completed|approved
+  approved_origin TEXT,                        -- user|auto (review gates only; meaningful when status=approved); migration 3
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE cues (
@@ -153,6 +155,22 @@ CREATE TABLE provider_cache (
 ```
 
 `stale` is set by selective invalidation (`LLM.md` §7). `locked` cues are never set stale.
+
+### Migration 2 — output preferences
+
+```sql
+ALTER TABLE project ADD COLUMN output_format TEXT;  -- srt|vtt|ass|ssa|sbv, nullable
+ALTER TABLE project ADD COLUMN output_path   TEXT;  -- nullable
+```
+
+Both columns are nullable and default to `NULL`, meaning "no stored preference".
+`init` (and `run` when it creates the project) persist the `--output-format` /
+`--output` values given at creation (`CLI.md` §3); later commands apply their flags
+per-invocation and do not overwrite these. When a column is `NULL`, the export stage
+falls back to its defaults: output format = source format, output path =
+`<source-stem>.my.<ext>` next to the source. `ALTER TABLE ADD COLUMN` is append-only,
+so existing projects migrate without data loss (fills the output-preference gap
+deferred from M4-B).
 
 ## 3. Analysis document (schema_version 1)
 
