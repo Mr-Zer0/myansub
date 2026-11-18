@@ -183,7 +183,8 @@ where
     let value = load_current_value(store).await?;
     let bytes = render_json(&value)?.into_bytes();
     let work_dir = work_dir.to_path_buf();
-    let edited = on_blocking(move || capture_edit(&launcher, &work_dir, &bytes)).await?;
+    let edited =
+        on_blocking(move || capture_edit(&launcher, &work_dir, "analysis", &bytes)).await?;
     import_doc(store, &edited).await
 }
 

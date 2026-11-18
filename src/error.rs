@@ -102,12 +102,16 @@ impl ExitCode for PipelineError {
 }
 
 impl ExitCode for ReviewError {
-    /// A missing current analysis is a precondition (exit 3, `docs/CLI.md` §7).
-    /// Parse failures, validation violations, editor failures, I/O, and wrapped
-    /// store errors are generic errors (exit 1).
+    /// A missing current analysis and a not-yet-completed translation are
+    /// preconditions (exit 3, `docs/CLI.md` §7). An unknown `--flag` and a bad cue
+    /// id/range are usage errors (exit 2). Parse failures, validation violations,
+    /// import rejections (hash mismatch, unknown cue, placeholder mismatch), editor
+    /// failures, background-task failures, I/O, and wrapped store errors are generic
+    /// errors (exit 1).
     fn exit_code(&self) -> i32 {
         match self {
-            ReviewError::NoCurrentAnalysis => exit::PRECONDITION,
+            ReviewError::NoCurrentAnalysis | ReviewError::TranslationNotReady => exit::PRECONDITION,
+            ReviewError::UnknownFlag(_) | ReviewError::InvalidArgument(_) => exit::USAGE,
             ReviewError::Store(err) => err.exit_code(),
             _ => exit::ERROR,
         }

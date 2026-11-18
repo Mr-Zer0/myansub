@@ -344,15 +344,20 @@ where
             Ok((failed, pending + in_flight))
         })
         .await?;
+    // The translation stage completes once no unit is still pending/in_flight, even
+    // when some batches FAILED: a failed batch does not block the translation-review
+    // gate (`docs/ARCHITECTURE.md` §2, ADR-030). The gate lists the failed cues; the
+    // run's exit code still reflects the failures (4). `translate --retry-failed`
+    // later resets the stage to `running` when it requeues a failed batch.
+    if incomplete == 0 {
+        store
+            .call(|conn| set_stage(conn, Stage::Translation, StageStatus::Completed))
+            .await?;
+    }
+
     if failed > 0 || incomplete > 0 {
         return Ok(TranslationOutcome::CompletedWithFailures { failed, incomplete });
     }
-
-    // Every batch is done → the translation stage is complete, opening the
-    // translation-review gate (`docs/ARCHITECTURE.md` §2).
-    store
-        .call(|conn| set_stage(conn, Stage::Translation, StageStatus::Completed))
-        .await?;
     Ok(TranslationOutcome::Completed { batches: total })
 }
 
@@ -468,8 +473,15 @@ async fn apply_run_flags(
                 for id in &clear_ids {
                     delete_unlocked_translation(&tx, *id)?;
                 }
+                let mut requeued = false;
                 for no in &reset_nos {
-                    requeue_translation_batch(&tx, *no)?;
+                    requeued |= requeue_translation_batch(&tx, *no)?;
+                }
+                // Requeuing re-opens pending work, so the stage returns to `running`
+                // (it may have been `completed` from a prior failed/finished run); this
+                // keeps the stage consistent with the pending batches (ADR-030).
+                if requeued {
+                    set_stage(&tx, Stage::Translation, StageStatus::Running)?;
                 }
                 tx.commit()?;
                 Ok(())
@@ -482,7 +494,15 @@ async fn apply_run_flags(
     // set) is retried regardless of the other flags.
     if flags.retry_failed {
         store
-            .call(|conn| requeue_failed_translation_batches(conn).map(|_| ()))
+            .call(|conn| {
+                let tx = conn.transaction()?;
+                let requeued = requeue_failed_translation_batches(&tx)?;
+                if requeued > 0 {
+                    set_stage(&tx, Stage::Translation, StageStatus::Running)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
             .await?;
     }
 

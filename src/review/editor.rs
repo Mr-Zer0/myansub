@@ -93,15 +93,17 @@ pub fn read_file(path: &Path) -> Result<String, ReviewError> {
 /// scratch file is removed before returning, whatever the outcome.
 ///
 /// The scratch file lives in `work_dir` (the project directory) so it shares the
-/// filesystem with the project. This does not itself apply the edit: the caller
-/// feeds the returned string to its validate/apply step, keeping this function
-/// content-agnostic.
+/// filesystem with the project; its name includes `flow` (e.g. `analysis`,
+/// `translation`) so the two review flows never collide on one scratch path. This
+/// does not itself apply the edit: the caller feeds the returned string to its
+/// validate/apply step, keeping this function content-agnostic.
 pub fn capture_edit<L: EditorLauncher>(
     launcher: &L,
     work_dir: &Path,
+    flow: &str,
     initial: &[u8],
 ) -> Result<String, ReviewError> {
-    let scratch = scratch_path(work_dir);
+    let scratch = scratch_path(work_dir, flow);
     std::fs::write(&scratch, initial).map_err(|source| ReviewError::Io {
         path: scratch.clone(),
         source,
@@ -114,7 +116,8 @@ pub fn capture_edit<L: EditorLauncher>(
     result
 }
 
-/// The scratch path used for an in-editor edit, a hidden sibling in `work_dir`.
-fn scratch_path(work_dir: &Path) -> PathBuf {
-    work_dir.join(".myansub-analysis-edit.json")
+/// The scratch path used for an in-editor edit, a hidden `flow`-specific sibling in
+/// `work_dir`.
+fn scratch_path(work_dir: &Path, flow: &str) -> PathBuf {
+    work_dir.join(format!(".myansub-{flow}-edit.json"))
 }

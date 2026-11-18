@@ -363,3 +363,45 @@ misleading. Added `translation_missing_ids_reminder` and `translation_per_line_r
 its own tier. Because this edits the translation prompt surface, `PROMPT_VERSION` is bumped `1 → 2`
 (superseding ADR-036's "ships at version 1" note now that the surface has changed). The bump changes every
 translation `input_hash`; this is acceptable at M6-B2 (no production translations depend on version 1).
+
+### ADR-038 Translation review gate opens with failed cues; semantics replicated, not imported (M7-A)
+Context (M7-A review, `ARCHITECTURE.md` §2/§3, `DATA_MODEL.md` §6, `REQUIREMENTS.md` FR-6, `CLI.md` §6/§7):
+wiring and testing the translation-review gate surfaced a cross-milestone gate bug and several smaller
+decisions. Decisions:
+
+(a) **The translation stage completes with failed units allowed.** `pipeline/translation.rs` previously set
+`Stage::Translation = completed` only when `failed == 0 && incomplete == 0`, so any permanently-failed batch
+left the stage `running` forever and `review …` returned `TranslationNotReady` (exit 3) — contradicting
+ARCHITECTURE §2 ("translation_review may run when translation completed, no pending units; FAILED units are
+allowed and listed"). The stage now completes once there are **no pending/in-flight units** (`incomplete ==
+0`), regardless of the failed count. The run's **exit code** still reflects failures (4 via
+`CompletedWithFailures`); only the **stage** is completed. A later `translate --retry-failed` (or
+`--redo`/`--stale`) that requeues a batch resets the stage back to `running` in the same transaction as the
+requeue, so the stage stays consistent with the pending work.
+
+(b) **The review gate replicates `can_run(TranslationReview)`, it does not import it.** The gate predicate
+is identical to the orchestrator's: *translation stage completed AND no pending translation batches (failed
+allowed)*. The orchestrator's `can_run`/`ProjectState` live in `pipeline::orchestrator`, and ARCHITECTURE
+§3 forbids `review → pipeline` ("Nothing depends on pipeline or review"; `main/cli ─► pipeline, review`).
+Rather than introduce that forbidden edge, `review::translation::require_translation_ready` re-expresses the
+same predicate over `store` directly (`get_stage` + `count_translation_batches_by_status(Pending)`). The two
+checks are kept semantically identical by this ADR; a future refactor that lifts `ProjectState`/`can_run`
+into `domain` (where §3's layout already lists `ProjectState`) could let both share one definition.
+
+(c) **A partial translation review file is valid.** DATA_MODEL §6 says "unknown ids, missing ids, or a parse
+error reject the whole import." "Missing ids" means a cue **entry that lacks its `id` field** (a parse/shape
+error) or an **unknown id**, *not* "a project cue that is absent from the file." A file that lists only some
+cues (the output of `review export --range`/`--suspect`) is a valid partial round-trip: only the listed cues
+are considered; cues absent from the file are left untouched. All-or-nothing still applies to the cues the
+file *does* list.
+
+(d) **FR-6 counts are not a partition.** `suspect` = cues with ≥1 quality flag; `fixed` = cues the reviewer
+locked; `untouched` = cues with no flags and not locked. A locked cue that still carries a residual soft
+flag counts in **both** `suspect` and `fixed` (they overlap); only `untouched` is mutually exclusive with
+the other two. FR-6 does not require a partition, and this overlap is the intended, documented behavior.
+
+(e) **Read-only review commands tolerate a changed source; mutating ones do not.** `review list`/`show`/
+`export` are display/read-only and do **not** hard-fail when the source file changed since init (consistent
+with the M4-C `status` decision and the M5-B analysis review). `review set`/`edit`/`import` read cues to
+validate `⟦n⟧` placeholders and mutate state, so they call `check_source_unchanged` first and fail with
+exit 3 on a changed source (ARCHITECTURE §6 rule 5). This exception is enforced in `main.rs` wiring.

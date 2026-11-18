@@ -10,6 +10,7 @@
 pub mod analysis;
 pub mod editor;
 pub mod error;
+pub mod translation;
 
 pub use editor::{EditorLauncher, EnvEditorLauncher};
 pub use error::{ReviewError, Violation};

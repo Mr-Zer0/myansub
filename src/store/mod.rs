@@ -32,7 +32,8 @@ pub use repo_cues::{insert_cues, insert_cues_in_tx, load_cues};
 pub use repo_llm::{CacheRow, ModelUsage, usage_by_model};
 pub use repo_project::{Project, Stage, StageStatus, clear_all_data};
 pub use repo_translations::{
-    NewTranslation, TranslationHistoryRow, TranslationOrigin, TranslationRow, cue_id_by_idx,
-    get_translation, list_translations, upsert_translation, upsert_translation_in_tx,
+    NewTranslation, TranslationHistoryRow, TranslationOrigin, TranslationRow,
+    apply_user_edit_in_tx, cue_id_by_idx, get_translation, list_translations, set_locked_in_tx,
+    upsert_translation, upsert_translation_in_tx,
 };
 pub use repo_units::{AnalysisChunk, NewTranslationBatch, TranslationBatch, UnitStatus};

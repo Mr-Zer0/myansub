@@ -241,6 +241,77 @@ pub fn set_flags_in_tx(
     Ok(changed == 1)
 }
 
+/// Applies a reviewer's edit to one cue within the caller's transaction (M7,
+/// `docs/DATA_MODEL.md` §6): the row becomes `origin = user, locked = 1` with the
+/// supplied re-run quality `flags`, and when the text actually changes the previous
+/// text is appended to `translation_history`.
+///
+/// Unlike [`upsert_translation_in_tx`], this path **bypasses the locked guard**: a
+/// reviewer edit is authoritative and must win even over a previously locked row
+/// (e.g. a second import that changes an already-locked cue). An existing row's
+/// `analysis_version` and `model` provenance are preserved; a brand-new row (a cue
+/// that had no translation yet, e.g. one from a failed batch) is created with
+/// `fallback_analysis_version` and no model.
+pub fn apply_user_edit_in_tx(
+    tx: &Transaction,
+    cue_id: i64,
+    text: &str,
+    flags: &[QualityFlag],
+    fallback_analysis_version: i64,
+) -> Result<(), StoreError> {
+    // Read the prior row (if any) to preserve provenance and to record history on a
+    // real change.
+    let prior: Option<(String, String, i64, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT text, origin, analysis_version, model FROM translations WHERE cue_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![cue_id])?;
+        match rows.next()? {
+            Some(row) => Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            None => None,
+        }
+    };
+
+    let (analysis_version, model) = match &prior {
+        Some((prior_text, prior_origin, av, model)) => {
+            if prior_text != text {
+                tx.execute(
+                    "INSERT INTO translation_history (cue_id, text, origin) VALUES (?1, ?2, ?3)",
+                    params![cue_id, prior_text, prior_origin],
+                )?;
+            }
+            (*av, model.clone())
+        }
+        None => (fallback_analysis_version, None),
+    };
+
+    let flags_json = flags_to_json(flags)?;
+    // A user edit is never stale and is always locked (`docs/DATA_MODEL.md` §2:
+    // locked cues are never set stale). On conflict, keep the preserved provenance
+    // (analysis_version/model) rather than overwriting it.
+    tx.execute(
+        "INSERT INTO translations \
+         (cue_id, text, origin, locked, stale, flags, analysis_version, model, updated_at) \
+         VALUES (?1, ?2, 'user', 1, 0, ?3, ?4, ?5, datetime('now')) \
+         ON CONFLICT(cue_id) DO UPDATE SET \
+           text = excluded.text, origin = 'user', locked = 1, stale = 0, \
+           flags = excluded.flags, updated_at = excluded.updated_at",
+        params![cue_id, text, flags_json, analysis_version, model],
+    )?;
+    Ok(())
+}
+
+/// Sets the `locked` flag on one translation within the caller's transaction (M7,
+/// `docs/DATA_MODEL.md` §2). Returns `true` if a row changed, `false` when no
+/// translation exists for `cue_id`. Used by `review unlock` (locked = 0).
+pub fn set_locked_in_tx(tx: &Transaction, cue_id: i64, locked: bool) -> Result<bool, StoreError> {
+    let changed = tx.execute(
+        "UPDATE translations SET locked = ?2, updated_at = datetime('now') WHERE cue_id = ?1",
+        params![cue_id, locked as i64],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Deletes the translation for `cue_id` unless it is `locked = 1`, so a
 /// `translate --redo` run can mint fresh translations for unlocked cues while
 /// preserving reviewer-locked ones (`docs/CLI.md` §6, `docs/DATA_MODEL.md` §2).

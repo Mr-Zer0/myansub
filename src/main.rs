@@ -9,8 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::Parser;
 use myansub::cli::{
-    AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, RunArgs, ServiceTier,
-    TranslateArgs,
+    AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, ReviewCommand,
+    ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier, TranslateArgs,
 };
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
@@ -37,6 +37,10 @@ use myansub::pipeline::translation::{
 use myansub::project::{project_db_path, resolve_project};
 use myansub::review::EnvEditorLauncher;
 use myansub::review::analysis as analysis_review;
+use myansub::review::translation as translation_review;
+use myansub::review::translation::{
+    ReviewFilters, ReviewSelection, parse_cue_id, parse_flag, parse_id_range,
+};
 use myansub::store::repo_project::get_project;
 use myansub::store::{StageStatus, Store};
 use tokio_util::sync::CancellationToken;
@@ -91,6 +95,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Analyze(args) => run_analyze_command(cli, args),
         Command::Analysis { command } => run_analysis_review_command(cli, command),
         Command::Translate(args) => run_translate_command(cli, args),
+        Command::Review { command } => run_translation_review_command(cli, command),
         other => not_implemented(command_name(other)),
     }
 }
@@ -577,6 +582,177 @@ fn run_analysis_review_command(cli: &Cli, command: &AnalysisCommand) -> anyhow::
             }
         }
     })
+}
+
+/// Handles `myansub review list|show|set|unlock|edit|export|import|approve`
+/// (docs/CLI.md §6). Resolves the project, opens the store, and dispatches to the
+/// translation-review module. The review gate (translation completed) is enforced
+/// inside the module and maps to exit 3; a bad id/range/flag is a usage error
+/// (exit 2); validation/import rejections and I/O map to exit 1 (see
+/// [`exit_code_for`]).
+fn run_translation_review_command(cli: &Cli, command: &ReviewCommand) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
+    let config = load_config(cli, &location.dir)?;
+    let limits = (&config.quality).into();
+
+    let db = project_db_path(&location.dir);
+    if !db.is_file() {
+        return Err(PipelineError::Uninitialized {
+            dir: location.dir.clone(),
+        }
+        .into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    runtime.block_on(async {
+        let store = Store::open(&db)?;
+        let Some(project) = store.call(|conn| get_project(conn)).await? else {
+            return Err::<i32, anyhow::Error>(
+                PipelineError::Uninitialized {
+                    dir: location.dir.clone(),
+                }
+                .into(),
+            );
+        };
+        let source = Path::new(&project.source_path).to_path_buf();
+
+        match command {
+            ReviewCommand::List(args) => {
+                let filters = review_filters(args)?;
+                let listing = translation_review::list(&store, &filters).await?;
+                print_review_listing(&listing);
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Show { id } => {
+                let id = parse_cue_id(id)?;
+                let rendered = translation_review::show(&store, id).await?;
+                print!("{rendered}");
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Set { id, text } => {
+                let id = parse_cue_id(id)?;
+                // Cues (source placeholders) are read, so the source must be unchanged
+                // (docs/ARCHITECTURE.md §6 rule 5).
+                check_source_unchanged(&store, &source).await?;
+                translation_review::set_target(&store, id, text, &limits).await?;
+                println!("set and locked cue {id}.");
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Unlock { id } => {
+                let id = parse_cue_id(id)?;
+                translation_review::unlock(&store, id).await?;
+                println!("unlocked cue {id}.");
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Edit(args) => {
+                let selection = review_selection(args)?;
+                check_source_unchanged(&store, &source).await?;
+                let summary = translation_review::edit(
+                    &store,
+                    EnvEditorLauncher,
+                    &location.dir,
+                    &selection,
+                    &limits,
+                )
+                .await?;
+                println!(
+                    "imported {} changed and {} unchanged cue(s); \
+                     run `myansub review approve` to approve the review.",
+                    summary.changed, summary.unchanged
+                );
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Export { path, selection } => {
+                let selection = review_selection(selection)?;
+                translation_review::export(&store, path, &selection).await?;
+                println!("exported review file to {}", path.display());
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Import { path } => {
+                // Cues are read during placeholder validation, so the source must be
+                // unchanged (docs/ARCHITECTURE.md §6 rule 5).
+                check_source_unchanged(&store, &source).await?;
+                // The file read is blocking I/O, so it runs on the blocking pool
+                // (docs/ARCHITECTURE.md §7).
+                let read_path = path.clone();
+                let content = tokio::task::spawn_blocking(move || {
+                    myansub::review::editor::read_file(&read_path)
+                })
+                .await
+                .context("read import file")??;
+                let summary = translation_review::import(&store, &content, &limits).await?;
+                println!(
+                    "imported {} changed and {} unchanged cue(s); \
+                     run `myansub review approve` to approve the review.",
+                    summary.changed, summary.unchanged
+                );
+                Ok(exit::SUCCESS)
+            }
+            ReviewCommand::Approve => {
+                translation_review::approve(&store).await?;
+                println!(
+                    "approved the translation review; run `myansub export` to produce output."
+                );
+                Ok(exit::SUCCESS)
+            }
+        }
+    })
+}
+
+/// Builds the [`ReviewFilters`] from `review list` args. A bad `--flag` or `--range`
+/// is a typed [`ReviewError`] that maps to the usage exit code (2) via
+/// [`exit_code_for`] (docs/CLI.md §7).
+fn review_filters(args: &ReviewListArgs) -> Result<ReviewFilters, ReviewError> {
+    let flag = args.flag.as_deref().map(parse_flag).transpose()?;
+    let range = args.range.as_deref().map(parse_id_range).transpose()?;
+    Ok(ReviewFilters {
+        suspect: args.suspect,
+        failed: args.failed,
+        stale: args.stale,
+        flag,
+        range,
+    })
+}
+
+/// Builds the [`ReviewSelection`] from `review edit`/`export` args. A bad `--range`
+/// is a typed [`ReviewError`] that maps to the usage exit code (2). `--suspect` and
+/// `--range` are already mutually exclusive at the clap layer.
+fn review_selection(args: &ReviewSelectionArgs) -> Result<ReviewSelection, ReviewError> {
+    let range = args.range.as_deref().map(parse_id_range).transpose()?;
+    Ok(ReviewSelection {
+        suspect: args.suspect,
+        range,
+    })
+}
+
+/// Prints a `review list` result: the matching cues and the project-wide counts
+/// (docs/CLI.md §6, docs/REQUIREMENTS.md FR-6).
+fn print_review_listing(listing: &myansub::review::translation::ReviewListing) {
+    for cue in &listing.cues {
+        let flags = if cue.flags.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = cue
+                .flags
+                .iter()
+                .map(|f| {
+                    serde_json::to_value(f)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| format!("{f:?}"))
+                })
+                .collect();
+            format!(" [{}]", names.join(","))
+        };
+        let lock = if cue.locked { " (locked)" } else { "" };
+        let target = cue.target.as_deref().unwrap_or("(not translated)");
+        println!("{:>5}  {}  {target}{flags}{lock}", cue.id, cue.time);
+    }
+    println!(
+        "Counts: suspect {} / fixed {} / untouched {}",
+        listing.counts.suspect, listing.counts.fixed, listing.counts.untouched
+    );
 }
 
 /// Builds [`AnalysisParams`] from the resolved config and the project source hash.
