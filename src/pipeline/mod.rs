@@ -8,6 +8,7 @@
 //! `output`) arrive in later M4 slices.
 
 pub mod analysis;
+pub mod confirm;
 pub mod error;
 pub mod input;
 pub mod invalidation;
@@ -19,7 +20,11 @@ pub mod translation;
 pub use analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, AnalysisParams, DryRunReport,
     analysis_exit_code, analysis_output_budget, dry_run_analysis, prepare_analysis, run_analysis,
-    worst_case_doc_tokens,
+    run_analysis_confirmed, worst_case_doc_tokens,
+};
+pub use confirm::{
+    ConfirmAction, ConfirmSettings, ConfirmedRun, CostEstimate, GateDecision, confirm_decision,
+    confirm_or_refuse,
 };
 pub use error::PipelineError;
 pub use invalidation::{
@@ -29,7 +34,7 @@ pub use invalidation::{
 };
 pub use orchestrator::{
     NextStep, ProjectState, RunDryRunEstimate, RunOptions, RunOutcome, RunReport, RunRequest,
-    StatusReport, analysis_params, can_run, next_step, run, run_exit_code, status,
+    StatusReport, analysis_params, can_run, next_step, run, run_confirmed, run_exit_code, status,
     translation_params,
 };
 pub use output::{
@@ -40,5 +45,6 @@ pub use output::{
 pub use scheduler::{SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};
 pub use translation::{
     TranslationFlags, TranslationOutcome, TranslationParams, dry_run_translation,
-    prepare_translation, run_translation, translation_exit_code,
+    dry_run_translation_stale, prepare_translation, run_translation, run_translation_confirmed,
+    stale_unlocked_idxs, translation_exit_code,
 };

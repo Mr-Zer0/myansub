@@ -423,9 +423,14 @@ pub async fn approve_and_invalidate(
 /// marked stale. A no-op (returns 0) when there are no translations, no earlier
 /// version to diff against, the two documents are identical, or nothing is affected.
 ///
-/// This is the stand-alone trigger (one transaction of its own). The atomic approve
-/// path uses [`approve_and_invalidate_in_tx`] instead, which shares the approval's
-/// transaction.
+/// **Test-only; not for production gate approval.** This marks translations stale in a
+/// transaction *separate* from the approval, so driving a gate with
+/// `approve → invalidate_after_approval` could leave an approved-but-not-invalidated
+/// state if a crash lands between the two (the exact footgun ADR-041 closes).
+/// Production code must approve and invalidate atomically via
+/// [`approve_and_invalidate`] / [`approve_and_invalidate_in_tx`]; it has no production
+/// caller. This stand-alone trigger is retained only to exercise each `docs/LLM.md` §7
+/// diff row end to end in the integration tests.
 pub async fn invalidate_after_approval(
     store: &Store,
     approved_version: i64,

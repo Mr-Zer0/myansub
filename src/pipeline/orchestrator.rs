@@ -45,6 +45,7 @@ use super::analysis::{
     AnalysisFlags, AnalysisOutcome, AnalysisParams, parse_thinking, parse_tier as parse_tier_label,
     run_analysis,
 };
+use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
 use super::error::PipelineError;
 use super::input::{check_source_unchanged, run_input};
 use super::output::{ResolvedOutput, resolve_output_target, run_output, stored_output_prefs};
@@ -205,8 +206,9 @@ pub enum AutoApproveGate {
     All,
 }
 
-/// Flags that shape a `run` invocation (`docs/CLI.md` §6).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Flags that shape a `run` invocation (`docs/CLI.md` §6). Not `Eq`: the optional
+/// [`ConfirmSettings`] carries a `f64` threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RunOptions {
     /// Gate(s) to approve automatically when reached (takes effect M5+).
     pub auto_approve: Option<AutoApproveGate>,
@@ -214,6 +216,12 @@ pub struct RunOptions {
     pub allow_incomplete: bool,
     /// Run without spending tokens or writing results (takes effect M5+).
     pub dry_run: bool,
+    /// Cost-confirmation settings for the in-pipeline translation gate (`docs/CLI.md`
+    /// §5). `None` (the default and every pre-M8-C caller) skips the gate; `run_confirmed`
+    /// sets it so the translation stage is confirmed before it spends — the pre-flight
+    /// estimate covers analysis only, since translation is not estimable until the
+    /// analysis sheet exists.
+    pub confirm: Option<ConfirmSettings>,
 }
 
 /// Everything `run` needs to create-or-resume and advance a project
@@ -289,6 +297,9 @@ pub enum RunOutcome {
     /// A `--dry-run` finished: the stages were estimated and nothing was written.
     /// Maps to exit 0.
     DryRun,
+    /// The user declined an in-pipeline cost confirmation (the translation gate) at
+    /// the interactive prompt; nothing further was spent. Maps to exit 0.
+    Aborted,
 }
 
 /// Creates-or-resumes the project and advances it through the whole pipeline,
@@ -384,6 +395,21 @@ where
                 }
             }
             NextStep::Execute(Stage::Translation) => {
+                // Second cost-confirmation gate (`docs/CLI.md` §4/§5): the pre-flight
+                // estimate covered analysis only, so confirm the (dominant) translation
+                // budget here — now that the analysis sheet exists and batches can be
+                // planned — *before* any translation request is sent. `--auto-approve`
+                // does not imply `--yes`, so the gate still applies.
+                if let Some(settings) = req.options.confirm
+                    && !req.options.dry_run
+                {
+                    let estimate = estimate_translation_stage(&store, config).await?;
+                    if confirm::confirm_or_refuse(estimate, settings).await?
+                        == confirm::GateDecision::Declined
+                    {
+                        return Ok(RunOutcome::Aborted);
+                    }
+                }
                 let cues = store.call(|conn| load_cues(conn)).await?;
                 let params = translation_params(config);
                 let outcome = run_translation(
@@ -587,35 +613,132 @@ async fn dry_run_pipeline(
     source_hash: &str,
     report: &mut RunReport,
 ) -> Result<RunOutcome, PipelineError> {
-    let cues = store.call(|conn| load_cues(conn)).await?;
-    let prices = PriceTable::from_config(&config.pricing);
-
-    let analysis_params = analysis_params(config, source_hash);
-    let analysis =
-        super::analysis::dry_run_analysis(store, &cues, &analysis_params, &prices).await?;
-
-    let mut prompt_tokens = analysis.estimated_prompt_tokens;
-    let mut output_tokens = analysis.estimated_output_tokens;
-    let mut cost = analysis.estimated_cost;
-
-    // Translation can only be estimated once an approved analysis exists (it needs
-    // the analysis sheet for the cached prefix); skip it otherwise.
-    if current_analysis_approved_in(store).await? {
-        let translation_params = translation_params(config);
-        let translation =
-            super::translation::dry_run_translation(store, &cues, &translation_params, &prices)
-                .await?;
-        prompt_tokens += translation.estimated_prompt_tokens;
-        output_tokens += translation.estimated_output_tokens;
-        cost = add_cost(cost, translation.estimated_cost);
-    }
-
+    let estimate = estimate_pipeline(store, config, source_hash).await?;
     report.dry_run = Some(RunDryRunEstimate {
-        prompt_tokens,
-        output_tokens,
-        cost,
+        prompt_tokens: estimate.prompt_tokens,
+        output_tokens: estimate.output_tokens,
+        cost: estimate.cost,
     });
     Ok(RunOutcome::DryRun)
+}
+
+/// Estimates the whole pipeline's token/cost without writing anything or making an
+/// LLM call (`docs/LLM.md` §9): the analysis stage, plus the translation stage when
+/// an approved analysis exists (it needs the analysis sheet for the cached prefix).
+/// Used by the `--dry-run` report.
+///
+/// Estimate caveats carried from the dry-run estimator (flagged for M9 tuning, see
+/// ADR-043): thinking tokens are counted as 0 (so an analysis estimate under
+/// `thinking = low` under-counts output that bills as thinking), and the cached prefix
+/// is counted as fresh input with `cached_tokens = 0` (so a cache-warmed run is
+/// over-estimated). The over-estimate is conservative for the gate; the thinking
+/// under-estimate is the one to revisit.
+async fn estimate_pipeline(
+    store: &Store,
+    config: &Config,
+    source_hash: &str,
+) -> Result<CostEstimate, PipelineError> {
+    let analysis = estimate_analysis_stage(store, config, source_hash).await?;
+    if !current_analysis_approved_in(store).await? {
+        return Ok(analysis);
+    }
+    let translation = estimate_translation_stage(store, config).await?;
+    Ok(CostEstimate {
+        prompt_tokens: analysis.prompt_tokens + translation.prompt_tokens,
+        output_tokens: analysis.output_tokens + translation.output_tokens,
+        cost: add_cost(analysis.cost, translation.cost),
+    })
+}
+
+/// Estimates just the analysis stage (`docs/LLM.md` §9). This is the `run` pre-flight
+/// estimate ([`run_confirmed`]): translation is confirmed separately, in-pipeline,
+/// once its sheet exists.
+async fn estimate_analysis_stage(
+    store: &Store,
+    config: &Config,
+    source_hash: &str,
+) -> Result<CostEstimate, PipelineError> {
+    let cues = store.call(|conn| load_cues(conn)).await?;
+    let prices = PriceTable::from_config(&config.pricing);
+    let params = analysis_params(config, source_hash);
+    let report = super::analysis::dry_run_analysis(store, &cues, &params, &prices).await?;
+    Ok(CostEstimate {
+        prompt_tokens: report.estimated_prompt_tokens,
+        output_tokens: report.estimated_output_tokens,
+        cost: report.estimated_cost,
+    })
+}
+
+/// Estimates just the translation stage (`docs/LLM.md` §9) — the planned batches over
+/// the full approved-analysis sheet. This is the `run` translation gate's estimate.
+async fn estimate_translation_stage(
+    store: &Store,
+    config: &Config,
+) -> Result<CostEstimate, PipelineError> {
+    let cues = store.call(|conn| load_cues(conn)).await?;
+    let prices = PriceTable::from_config(&config.pricing);
+    let params = translation_params(config);
+    let report = super::translation::dry_run_translation(store, &cues, &params, &prices).await?;
+    Ok(CostEstimate {
+        prompt_tokens: report.estimated_prompt_tokens,
+        output_tokens: report.estimated_output_tokens,
+        cost: report.estimated_cost,
+    })
+}
+
+/// Advances the whole pipeline behind the cost-confirmation gate (`docs/CLI.md` §5,
+/// `docs/LLM.md` §9). Prepares the project (so the pre-flight estimate has cues),
+/// estimates the pipeline, then [`confirm::gate`]s the real [`run`]: `make_transport`
+/// — and the API key it needs — is only built once the gate is cleared, so a refused
+/// run (non-TTY, no `--yes`) returns [`PipelineError::ConfirmationNeeded`] (exit 3)
+/// without spending or requiring a key. `--dry-run` never prompts (it only estimates,
+/// via `run`). `--auto-approve` does **not** imply `--yes`: the cost gate still
+/// applies to an auto-approving run (`docs/CLI.md` §4).
+pub async fn run_confirmed<T, MK>(
+    make_transport: MK,
+    mut req: RunRequest<'_>,
+    config: &Config,
+    token: &CancellationToken,
+    report: &mut RunReport,
+    settings: ConfirmSettings,
+) -> Result<ConfirmedRun<RunOutcome>, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+    MK: FnOnce() -> Result<T, PipelineError>,
+{
+    // Thread the settings into `run` so the translation stage is gated before it spends
+    // (the pre-flight estimate below covers analysis only — translation is not estimable
+    // until its sheet exists).
+    req.options.confirm = Some(settings);
+
+    // A dry run estimates and writes nothing; it never prompts (`docs/CLI.md` §5). The
+    // in-pipeline translation gate is skipped too, because `run` returns its dry-run
+    // estimate before the advance loop.
+    if req.options.dry_run {
+        let transport = make_transport()?;
+        return Ok(ConfirmedRun::Ran(
+            run(transport, req, config, token, report).await?,
+        ));
+    }
+
+    // Prepare the project (input stage on first use) so the estimate has cues, then
+    // estimate the analysis stage. `run` re-prepares harmlessly (the input stage is a
+    // no-op once the project row exists), so the input is never run twice.
+    let estimate = {
+        let store = prepare_project(&req).await?;
+        store.recover().await?;
+        let project = store.call(|conn| get_project(conn)).await?.ok_or_else(|| {
+            PipelineError::Uninitialized {
+                dir: req.project_dir.to_path_buf(),
+            }
+        })?;
+        estimate_analysis_stage(&store, config, &project.source_hash).await?
+    };
+
+    confirm::gate(estimate, settings, make_transport, |transport| {
+        run(transport, req, config, token, report)
+    })
+    .await
 }
 
 /// Sums two [`Cost`]s; an unknown component makes the total unknown
@@ -761,8 +884,9 @@ pub fn run_exit_code(cancelled: bool, outcome: &RunOutcome) -> i32 {
         RunOutcome::StoppedAtGate { .. } | RunOutcome::StoppedAtStage { .. } => exit::PRECONDITION,
         // A completed run with failed units reports exit 4 (`docs/CLI.md` §7).
         RunOutcome::CompletedWithFailures { .. } => exit::FAILED_UNITS,
-        // A completed run and a dry run are both success.
-        RunOutcome::Completed | RunOutcome::DryRun => exit::SUCCESS,
+        // A completed run, a dry run, and a user-declined cost confirmation are all
+        // success (the decline spent nothing, `docs/CLI.md` §5).
+        RunOutcome::Completed | RunOutcome::DryRun | RunOutcome::Aborted => exit::SUCCESS,
     }
 }
 

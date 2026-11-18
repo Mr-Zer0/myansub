@@ -17,9 +17,10 @@ use myansub::llm::client::{CommitToken, LlmResponse, Usage};
 use myansub::llm::fake::Fake;
 use myansub::llm::pricing::Cost;
 use myansub::pipeline::PipelineError;
+use myansub::pipeline::confirm::{ConfirmSettings, ConfirmedRun};
 use myansub::pipeline::orchestrator::{
     ApprovalOrigin, AutoApproveGate, RunOptions, RunOutcome, RunReport, RunRequest, run,
-    run_exit_code, status,
+    run_confirmed, run_exit_code, status,
 };
 use myansub::project::{PROJECT_DB_FILE, project_dir_for_source};
 use myansub::store::repo_analysis::current_analysis;
@@ -449,6 +450,7 @@ async fn auto_approve_translation_refused_on_failed_batch() {
         auto_approve: Some(AutoApproveGate::All),
         allow_incomplete: true,
         dry_run: false,
+        ..RunOptions::default()
     };
     let done = run(
         failing(),
@@ -584,6 +586,7 @@ async fn dry_run_writes_nothing() {
         auto_approve: Some(AutoApproveGate::All),
         allow_incomplete: false,
         dry_run: true,
+        ..RunOptions::default()
     };
     // The dry-run path builds its own `Cached<DryRun>` and never calls this Fake.
     let outcome = run(
@@ -639,6 +642,7 @@ async fn dry_run_reports_estimate() {
         auto_approve: Some(AutoApproveGate::All),
         allow_incomplete: false,
         dry_run: true,
+        ..RunOptions::default()
     };
     let mut report = RunReport::default();
     let outcome = run(
@@ -729,4 +733,177 @@ async fn precancelled_token_is_interrupted() {
 
     // A fatal guard: the capstone's PipelineError type is in scope (exit mapping).
     let _ = PipelineError::MissingApiKey.exit_code();
+}
+
+// ---------------------------------------------------------------------------
+// M8-C: `run` cost-confirmation gate (docs/CLI.md §4/§5)
+// ---------------------------------------------------------------------------
+
+fn confirm_settings(confirm_above_usd: f64, interactive: bool, yes: bool) -> ConfirmSettings {
+    ConfirmSettings {
+        confirm_above_usd,
+        interactive,
+        yes,
+    }
+}
+
+// AC: CLI.md §5 — `run` with an estimate above the threshold, no TTY, and no `--yes`
+// exits 3 (naming `--yes`) and spends nothing: the transport factory is never invoked.
+#[tokio::test]
+async fn run_refuses_cost_without_tty_or_yes() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("movie.srt");
+    fs::write(&source, SRT3).expect("write source");
+    let project_dir = project_dir_for_source(&source);
+
+    let fake = fake_full(&[1, 2, 3]);
+    let token = CancellationToken::new();
+    let err = run_confirmed(
+        || Ok::<_, PipelineError>(fake.clone()),
+        request(&project_dir, &source, auto_all()),
+        &Config::default(),
+        &token,
+        &mut RunReport::default(),
+        confirm_settings(0.0, false, false),
+    )
+    .await
+    .expect_err("refusal");
+
+    assert!(matches!(err, PipelineError::ConfirmationNeeded { .. }));
+    assert_eq!(err.exit_code(), 3);
+    assert_eq!(fake.call_count(), 0, "a refused run spends nothing");
+    // The pipeline never advanced past input: no analysis was produced.
+    assert_eq!(
+        stage(&project_dir, Stage::Analysis).await,
+        StageStatus::NotStarted
+    );
+}
+
+// AC: CLI.md §4/§5 — `--auto-approve` does not imply `--yes`, but `--yes` clears the
+// cost gate and the whole pipeline runs (the transport is called).
+#[tokio::test]
+async fn run_with_yes_proceeds_through_pipeline() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("movie.srt");
+    fs::write(&source, SRT3).expect("write source");
+    let project_dir = project_dir_for_source(&source);
+
+    let fake = fake_full(&[1, 2, 3]);
+    let token = CancellationToken::new();
+    let confirmed = run_confirmed(
+        || Ok::<_, PipelineError>(fake.clone()),
+        request(&project_dir, &source, auto_all()),
+        &Config::default(),
+        &token,
+        &mut RunReport::default(),
+        confirm_settings(0.0, false, true),
+    )
+    .await
+    .expect("confirmed run");
+
+    assert_eq!(confirmed, ConfirmedRun::Ran(RunOutcome::Completed));
+    assert!(fake.call_count() >= 1, "the pipeline sent LLM calls");
+    assert_eq!(
+        stage(&project_dir, Stage::Output).await,
+        StageStatus::Completed
+    );
+}
+
+// AC: CLI.md §4/§5 — the SECOND (translation) gate: a fresh `run --auto-approve all`
+// whose analysis estimate is UNDER the threshold but whose translation is NOT (the
+// translation model is unpriced → unknown → needs confirmation), non-TTY, no `--yes`,
+// refuses at the translation gate (exit 3) AFTER analysis ran — translation unspent.
+#[tokio::test]
+async fn run_confirms_translation_gate_after_analysis() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("movie.srt");
+    fs::write(&source, SRT3).expect("write source");
+    let project_dir = project_dir_for_source(&source);
+
+    // Distinct models: price ONLY the analysis model, so the analysis pre-flight is a
+    // known, tiny cost (under the high threshold) while the translation estimate is
+    // unknown → the translation gate asks.
+    let mut config = Config::default();
+    config.llm.models.analysis = "model-a".to_string();
+    config.llm.models.translation = "model-b".to_string();
+    config.pricing.insert(
+        "model-a".to_string(),
+        PriceEntry {
+            input: 0.1,
+            cached_input: 0.025,
+            output: 0.4,
+            storage_per_hour: 0.0,
+            flex_multiplier: 0.5,
+            long_prompt_threshold: None,
+            long_input: None,
+            long_output: None,
+        },
+    );
+
+    let fake = fake_full(&[1, 2, 3]);
+    let token = CancellationToken::new();
+    let err = run_confirmed(
+        || Ok::<_, PipelineError>(fake.clone()),
+        request(&project_dir, &source, auto_all()),
+        &config,
+        &token,
+        &mut RunReport::default(),
+        confirm_settings(1000.0, false, false),
+    )
+    .await
+    .expect_err("refused at the translation gate");
+
+    match &err {
+        PipelineError::ConfirmationNeeded { flag } => assert_eq!(flag, "--yes"),
+        other => panic!("expected ConfirmationNeeded, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 3);
+    assert_eq!(
+        fake.call_count(),
+        1,
+        "analysis ran (1 call); translation was never sent"
+    );
+    // Analysis was created and auto-approved, but translation never started.
+    assert_eq!(
+        stage(&project_dir, Stage::AnalysisReview).await,
+        StageStatus::Approved
+    );
+    assert_eq!(
+        stage(&project_dir, Stage::Translation).await,
+        StageStatus::NotStarted
+    );
+}
+
+// AC: CLI.md §5 — a `--dry-run` run bypasses the gate entirely (dry-run never prompts):
+// even with threshold 0, non-TTY, no `--yes`, it returns Ran(DryRun), not a refusal.
+#[tokio::test]
+async fn run_confirmed_dry_run_bypasses_gate() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("movie.srt");
+    fs::write(&source, SRT3).expect("write source");
+    let project_dir = project_dir_for_source(&source);
+
+    let options = RunOptions {
+        auto_approve: Some(AutoApproveGate::All),
+        dry_run: true,
+        ..RunOptions::default()
+    };
+    let fake = fake_full(&[1, 2, 3]);
+    let confirmed = run_confirmed(
+        || Ok::<_, PipelineError>(fake.clone()),
+        request(&project_dir, &source, options),
+        &Config::default(),
+        &CancellationToken::new(),
+        &mut RunReport::default(),
+        confirm_settings(0.0, false, false),
+    )
+    .await
+    .expect("dry run bypasses the gate");
+
+    assert_eq!(confirmed, ConfirmedRun::Ran(RunOutcome::DryRun));
+    assert_eq!(
+        fake.call_count(),
+        0,
+        "dry run builds its own DryRun transport"
+    );
 }

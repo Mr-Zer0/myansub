@@ -9,8 +9,9 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::Parser;
 use myansub::cli::{
-    AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, ExportArgs, InitArgs, OutputFormat,
-    ReviewCommand, ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier, TranslateArgs,
+    AnalysisCommand, AnalyzeArgs, AutoApprove, CacheCommand, Cli, Command, ExportArgs, InitArgs,
+    OutputFormat, ReviewCommand, ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier,
+    TranslateArgs,
 };
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::domain::SubtitleFormat;
@@ -20,13 +21,14 @@ use myansub::llm::pricing::{Cost, PriceTable};
 use myansub::llm::{DryRun, Estimator, Gemini};
 use myansub::pipeline::analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, DryRunReport, analysis_exit_code,
-    dry_run_analysis, prepare_analysis, run_analysis,
+    dry_run_analysis, prepare_analysis, run_analysis_confirmed,
 };
+use myansub::pipeline::confirm::{ConfirmSettings, ConfirmedRun};
 use myansub::pipeline::input::check_source_unchanged;
 use myansub::pipeline::input::{InitOutcome, run_init};
 use myansub::pipeline::orchestrator::{
     AutoApproveGate, RunOptions, RunOutcome, RunReport, RunRequest, StatusReport, analysis_params,
-    run as run_pipeline, run_exit_code, status as gather_status, translation_params,
+    run_confirmed, run_exit_code, status as gather_status, translation_params,
 };
 use myansub::pipeline::output::{
     OutputReport, resolve_output_format_from_flags, resolve_output_target, run_output,
@@ -34,7 +36,7 @@ use myansub::pipeline::output::{
 };
 use myansub::pipeline::translation::{
     DryRunReport as TranslationDryRunReport, TranslationFlags, TranslationOutcome,
-    dry_run_translation, prepare_translation, run_translation, translation_exit_code,
+    dry_run_translation, prepare_translation, run_translation_confirmed, translation_exit_code,
 };
 use myansub::project::{project_db_path, resolve_project};
 use myansub::review::EnvEditorLauncher;
@@ -44,7 +46,7 @@ use myansub::review::translation::{
     ReviewFilters, ReviewSelection, parse_cue_id, parse_flag, parse_id_range,
 };
 use myansub::store::repo_project::get_project;
-use myansub::store::{StageStatus, Store};
+use myansub::store::{StageStatus, Store, repo_llm};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -99,8 +101,25 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Translate(args) => run_translate_command(cli, args),
         Command::Review { command } => run_translation_review_command(cli, command),
         Command::Export(args) => run_export_command(cli, args),
+        Command::Cache { command } => run_cache_command(cli, command),
         other => not_implemented(command_name(other)),
     }
+}
+
+/// The cost-confirmation settings for a token-spending command (`docs/CLI.md` §5):
+/// the configured threshold, whether stdin is a TTY, and the global `--yes` flag.
+fn confirm_settings(cli: &Cli, config: &Config) -> ConfirmSettings {
+    ConfirmSettings {
+        confirm_above_usd: config.llm.confirm_above_usd,
+        interactive: std::io::stdin().is_terminal(),
+        yes: cli.yes,
+    }
+}
+
+/// Prints the clean-abort message when the user declines a cost confirmation at the
+/// interactive prompt; nothing was spent (`docs/CLI.md` §5).
+fn report_declined() {
+    println!("aborted at the cost confirmation; no tokens were spent.");
 }
 
 /// Handles `myansub init <FILE> --from <LANG> …` (docs/CLI.md §6).
@@ -172,6 +191,8 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
         auto_approve: args.auto_approve.map(map_auto_approve),
         allow_incomplete: args.allow_incomplete,
         dry_run: args.dry_run,
+        // `run_confirmed` sets the in-pipeline translation gate settings below.
+        confirm: None,
     };
     let request = RunRequest {
         project_dir: &location.dir,
@@ -183,6 +204,7 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
         options,
     };
 
+    let settings = confirm_settings(cli, &config);
     let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
     let token = CancellationToken::new();
     let mut run_report = RunReport::default();
@@ -198,21 +220,37 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
 
         if args.dry_run {
             // A dry run estimates the stages and writes nothing, so it needs no API
-            // key. The dry-run path inside `run` builds its own `Cached<DryRun>` from
-            // config (ADR-033), so this `DryRun` instance only satisfies the generic
-            // transport bound; it is never used to send a request.
-            let transport = DryRun::new(
-                Estimator {
-                    bytes_per_token_latin: config.estimate.bytes_per_token_latin,
-                    bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
-                    bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
-                },
-                config.translation.output_ratio,
-            );
-            run_pipeline(transport, request, &config, &token, &mut run_report).await
+            // key and never prompts. The dry-run path inside `run` builds its own
+            // `Cached<DryRun>` from config (ADR-033), so this `DryRun` only satisfies
+            // the generic transport bound; it is never used to send a request.
+            let output_ratio = config.translation.output_ratio;
+            let estimator = Estimator {
+                bytes_per_token_latin: config.estimate.bytes_per_token_latin,
+                bytes_per_token_myanmar: config.estimate.bytes_per_token_myanmar,
+                bytes_per_token_cjk: config.estimate.bytes_per_token_cjk,
+            };
+            run_confirmed(
+                move || Ok(DryRun::new(estimator, output_ratio)),
+                request,
+                &config,
+                &token,
+                &mut run_report,
+                settings,
+            )
+            .await
         } else {
-            let transport = build_gemini(&config)?;
-            run_pipeline(transport, request, &config, &token, &mut run_report).await
+            // Cost-confirmation gate (docs/CLI.md §4/§5): `--auto-approve` does not
+            // imply `--yes`, so the gate still applies to an auto-approving run.
+            // `build_gemini` runs only once the gate is cleared.
+            run_confirmed(
+                || build_gemini(&config),
+                request,
+                &config,
+                &token,
+                &mut run_report,
+                settings,
+            )
+            .await
         }
     });
 
@@ -223,10 +261,17 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
         report_run_outcome(&RunOutcome::Interrupted);
         return Ok(exit::INTERRUPTED);
     }
-    let outcome = result?;
-    report_run_outcome(&outcome);
-    report_run_extras(&run_report);
-    Ok(run_exit_code(token.is_cancelled(), &outcome))
+    match result? {
+        ConfirmedRun::Ran(outcome) => {
+            report_run_outcome(&outcome);
+            report_run_extras(&run_report);
+            Ok(run_exit_code(token.is_cancelled(), &outcome))
+        }
+        ConfirmedRun::Declined => {
+            report_declined();
+            Ok(exit::SUCCESS)
+        }
+    }
 }
 
 /// Prints the side-information `run` surfaced: the suspect-cue count when the
@@ -299,6 +344,9 @@ fn report_run_outcome(outcome: &RunOutcome) {
         }
         RunOutcome::DryRun => {
             println!("dry run complete; nothing was written.");
+        }
+        RunOutcome::Aborted => {
+            println!("aborted at the cost confirmation; no further tokens were spent.");
         }
     }
 }
@@ -442,14 +490,36 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
             }
         });
 
-        let transport = build_gemini(&config)?;
         let flags = AnalysisFlags {
             redo: args.redo,
             retry_failed: args.retry_failed,
         };
-        let outcome = run_analysis(transport, &store, &cues, &params, flags, &token).await?;
-        report_analysis_outcome(&outcome);
-        Ok(analysis_exit_code(token.is_cancelled(), &outcome))
+        // Cost-confirmation gate (docs/CLI.md §5, docs/LLM.md §9): estimate first,
+        // then confirm. `build_gemini` (and the API key it needs) is only invoked
+        // once the gate is cleared, so a refusal exits 3 without requiring a key.
+        let prices = PriceTable::from_config(&config.pricing);
+        let settings = confirm_settings(cli, &config);
+        let confirmed = run_analysis_confirmed(
+            || build_gemini(&config),
+            &store,
+            &cues,
+            &params,
+            flags,
+            &token,
+            &prices,
+            settings,
+        )
+        .await?;
+        match confirmed {
+            ConfirmedRun::Ran(outcome) => {
+                report_analysis_outcome(&outcome);
+                Ok(analysis_exit_code(token.is_cancelled(), &outcome))
+            }
+            ConfirmedRun::Declined => {
+                report_declined();
+                Ok(exit::SUCCESS)
+            }
+        }
     });
 
     // A typed PipelineError (gate, source, store, LLM) propagates for exit mapping.
@@ -513,15 +583,37 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
             }
         });
 
-        let transport = build_gemini(&config)?;
         let flags = TranslationFlags {
             redo: args.redo,
             retry_failed: args.retry_failed,
             stale: args.stale,
         };
-        let outcome = run_translation(transport, &store, &cues, &params, flags, &token).await?;
-        report_translation_outcome(&outcome);
-        Ok(translation_exit_code(token.is_cancelled(), &outcome))
+        // Cost-confirmation gate (docs/CLI.md §5, docs/LLM.md §7/§9): for `--stale`
+        // the estimate covers only the stale, unlocked cues. `build_gemini` runs only
+        // once the gate is cleared, so a refusal exits 3 without requiring a key.
+        let prices = PriceTable::from_config(&config.pricing);
+        let settings = confirm_settings(cli, &config);
+        let confirmed = run_translation_confirmed(
+            || build_gemini(&config),
+            &store,
+            &cues,
+            &params,
+            flags,
+            &token,
+            &prices,
+            settings,
+        )
+        .await?;
+        match confirmed {
+            ConfirmedRun::Ran(outcome) => {
+                report_translation_outcome(&outcome);
+                Ok(translation_exit_code(token.is_cancelled(), &outcome))
+            }
+            ConfirmedRun::Declined => {
+                report_declined();
+                Ok(exit::SUCCESS)
+            }
+        }
     });
 
     code.map_err(anyhow::Error::new)
@@ -851,6 +943,43 @@ fn report_export(report: &OutputReport) {
         report.format,
         report.path.display()
     );
+}
+
+/// Handles `myansub cache prune [--older-than DAYS]` (docs/CLI.md §6, docs/LLM.md
+/// §4). Deletes local response-cache entries: `--older-than DAYS` ages them by
+/// first-seen `created_at` (M3-C); without the flag every entry is removed. The cache
+/// is disposable and spends no tokens, so pruning is not gated by `confirm_above_usd`
+/// (docs/CLI.md §5). Prints the number removed.
+fn run_cache_command(cli: &Cli, command: &CacheCommand) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
+    // Validate configuration at startup (docs/CONFIG.md §5).
+    let _config = load_config(cli, &location.dir)?;
+
+    let db = project_db_path(&location.dir);
+    if !db.is_file() {
+        return Err(PipelineError::Uninitialized {
+            dir: location.dir.clone(),
+        }
+        .into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    runtime.block_on(async {
+        let store = Store::open(&db)?;
+        let CacheCommand::Prune { older_than } = command;
+        // The `Some(days)` → prune-by-age / `None` → prune-all routing and the day
+        // clamp live in `repo_llm::prune`, which is unit-tested directly.
+        let older_than = *older_than;
+        let removed = store
+            .call(move |conn| repo_llm::prune(conn, older_than))
+            .await?;
+        println!(
+            "pruned {removed} cache {}.",
+            if removed == 1 { "entry" } else { "entries" }
+        );
+        Ok::<i32, anyhow::Error>(exit::SUCCESS)
+    })
 }
 
 /// Maps the CLI output-format choice onto the domain [`SubtitleFormat`].

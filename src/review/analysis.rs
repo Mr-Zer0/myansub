@@ -267,6 +267,14 @@ pub async fn import_doc(store: &Store, content: &str) -> Result<i64, ReviewError
 /// mark current analysis version approved"). Also moves the analysis-review stage
 /// to `approved`, both in one transaction. Returns the approved version number, or
 /// [`ReviewError::NoCurrentAnalysis`] (exit 3) when there is nothing to approve.
+///
+/// **Not for production gate approval.** This approves WITHOUT running selective
+/// invalidation (`docs/LLM.md` §7), so using it to clear the gate could reintroduce
+/// the approved-but-not-invalidated bug. The `analysis approve` command and `run`'s
+/// auto-approve path both clear the gate via `pipeline::approve_and_invalidate`, which
+/// approves and marks the affected translations stale **atomically** (ADR-041). This
+/// function is retained only to exercise the review-stage approval mechanics
+/// (versioning, gate status, origin) in tests.
 pub async fn approve(store: &Store) -> Result<i64, ReviewError> {
     let version = store
         .call(|conn| {

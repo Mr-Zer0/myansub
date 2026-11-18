@@ -55,6 +55,7 @@ use crate::store::repo_units::{
 };
 use crate::store::{Stage, StageStatus, Store, UnitStatus};
 
+use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
 use super::error::PipelineError;
 use super::input::check_source_unchanged;
 use super::orchestrator::{can_run, load_state};
@@ -288,6 +289,40 @@ where
             run_map_reduce(transport, store, cues, plan.chunks, params, token).await
         }
     }
+}
+
+/// Runs the analysis stage behind the cost-confirmation gate (`docs/CLI.md` §5,
+/// `docs/LLM.md` §9). Computes the pre-flight estimate with the dry-run estimator
+/// (no LLM call), then [`confirm::gate`]s the real run: `make_transport` — and thus
+/// the API key it needs — is only built once the gate is cleared, so a refused run
+/// (non-TTY, no `--yes`) returns [`PipelineError::ConfirmationNeeded`] (exit 3)
+/// without spending or requiring a key. `--yes` or an estimate at/under the
+/// threshold proceeds silently.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_analysis_confirmed<T, MK>(
+    make_transport: MK,
+    store: &Store,
+    cues: &[Cue],
+    params: &AnalysisParams,
+    flags: AnalysisFlags,
+    token: &CancellationToken,
+    prices: &PriceTable,
+    settings: ConfirmSettings,
+) -> Result<ConfirmedRun<AnalysisOutcome>, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+    MK: FnOnce() -> Result<T, PipelineError>,
+{
+    let report = dry_run_analysis(store, cues, params, prices).await?;
+    let estimate = CostEstimate {
+        prompt_tokens: report.estimated_prompt_tokens,
+        output_tokens: report.estimated_output_tokens,
+        cost: report.estimated_cost,
+    };
+    confirm::gate(estimate, settings, make_transport, |transport| {
+        run_analysis(transport, store, cues, params, flags, token)
+    })
+    .await
 }
 
 /// Enforces the analysis stage's preconditions and loads the cues it will analyze

@@ -117,6 +117,28 @@ pub fn prune_cache(conn: &mut Connection, older_than_days: u32) -> Result<usize,
     Ok(removed)
 }
 
+/// Deletes every `llm_cache` entry (`cache prune` with no `--older-than`,
+/// `docs/CLI.md` §6). The local response cache is disposable — a pruned entry is
+/// simply re-fetched on the next identical request — so pruning spends no tokens and
+/// needs no cost confirmation. Returns the number removed.
+pub fn prune_all_cache(conn: &mut Connection) -> Result<usize, StoreError> {
+    let tx = conn.transaction()?;
+    let removed = tx.execute("DELETE FROM llm_cache", [])?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// Routes `cache prune [--older-than DAYS]` (`docs/CLI.md` §6): `Some(days)` ages
+/// entries by first-seen `created_at` (clamped to `u32`), `None` removes every entry.
+/// Returns the number removed. This is the single routing + clamp point the `cache`
+/// command drives, so it is unit-tested directly.
+pub fn prune(conn: &mut Connection, older_than_days: Option<u64>) -> Result<usize, StoreError> {
+    match older_than_days {
+        Some(days) => prune_cache(conn, days.min(u64::from(u32::MAX)) as u32),
+        None => prune_all_cache(conn),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // llm_calls
 // ---------------------------------------------------------------------------

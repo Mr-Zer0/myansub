@@ -523,3 +523,63 @@ any benefit:
 - (vi) route cache create/delete through the `Retrying` policy so 429/503 on cache ops are retried.
 
 The M8-B ACs (break-even unit tests; reuse/recreate wiremock) are met without that wiring.
+
+### ADR-043 Cost-confirmation gate: pure decision + deferred transport; dead-code footguns kept but flagged (M8-C)
+Context (`docs/CLI.md` §5, `docs/LLM.md` §7/§9): token-spending commands (`analyze`, `translate`, `run`) must
+print a pre-flight estimate and confirm when it exceeds `confirm_above_usd`, unless `--yes`; a non-TTY with no
+`--yes` must exit 3 naming the flag and never block on input.
+
+Decision:
+(a) **Pure decision, mirroring `decide_reinit`.** `pipeline::confirm::confirm_decision(cost, threshold, interactive,
+yes) -> ConfirmAction {Proceed|Prompt|RefuseNeedsYes}` is pure and unit-tested. `--yes` → Proceed; an estimate that
+*exceeds* the threshold needs confirmation; `threshold <= 0` always asks (CONFIG "0 = always ask"); an **Unknown**
+(unpriced) estimate is treated as needing confirmation — the safe choice, never spend an unknown amount silently.
+When confirmation is needed, a TTY prompts and a non-TTY refuses with `PipelineError::ConfirmationNeeded` (exit 3);
+the interactive read runs on `spawn_blocking` (ARCHITECTURE §6 rule 6), exactly like the destructive-reinit prompt.
+
+(b) **Estimate reuses the dry-run path; transport built only after the gate clears.** The `*_confirmed` wrappers
+(`run_analysis_confirmed`, `run_translation_confirmed`, `run_confirmed`) compute the estimate via the existing
+`dry_run_*` functions (Cached<DryRun>, no network, no writes) and take a `make_transport: FnOnce() -> Result<T,
+PipelineError>` factory invoked only when the gate is cleared. So a refused/declined run never requires a
+`GEMINI_API_KEY` and a non-TTY refusal maps to exit 3 (not a missing-key error). `--redo`/default estimate the full
+plan (already-done batches are free local-cache hits, so a resume's estimate reflects only remaining work).
+`--dry-run` never prompts; `--auto-approve` does not imply `--yes` (CLI.md §4), so the gate still applies.
+
+(b2) **`run` uses TWO gates, because translation is the dominant, later-estimable cost.** A single pre-flight estimate
+covers ANALYSIS ONLY — translation is not estimable until the analysis sheet exists. So `run_confirmed` pre-flights the
+analysis stage, and `run` itself runs a SECOND gate inside the advance loop, immediately before the translation stage
+(once the sheet exists and batches can be planned), estimating the planned translation and confirming before any
+translation request is sent. Non-TTY + no `--yes` → `ConfirmationNeeded` (exit 3) with analysis already done but
+translation unspent; an interactive decline → `RunOutcome::Aborted` (exit 0). The gate is opt-in via a new
+`RunOptions::confirm: Option<ConfirmSettings>` (`None` for every pre-M8-C caller, so existing `run` behaviour is
+unchanged); `RunOptions` drops `Eq` because `ConfirmSettings` carries an `f64`. A single worst-case pre-estimate would
+be less accurate, so two gates is the right trade-off.
+
+(b3) **`--stale` estimates the REAL affected-batch structure, not a re-chunk.** `dry_run_translation_stale` mirrors
+`apply_run_flags`: assemble every batch from the full cues, keep each batch holding ≥1 stale-unlocked cue, reduce it to
+that subset (via `rebuild_batch_subset`), and estimate those — one prefix-bearing request per ORIGINAL affected batch.
+Filtering the stale cues and re-chunking them into fresh `batch_size` groups (the first cut) collapsed scattered stale
+cues into `ceil(stale/batch_size)` requests and undercounted the (prefix-dominated) prompt tokens ~N×, so the gate
+under-warned. `stale_unlocked_idxs` and `dry_run_translation_stale` are `pub` so the scoping is directly tested
+(scattered stale cues → one request per affected batch; strictly under the full-project estimate).
+
+(c) **`cache prune` is not cost-gated.** `prune_cache(days)` ages by first-seen `created_at` (M3-C); `prune_all_cache`
+(new) removes every entry when `--older-than` is absent. The `Some(days)`→age / `None`→all routing and the `u64→u32`
+day clamp live in one unit-tested `repo_llm::prune(conn, Option<u64>)` the command drives. The local response cache is
+disposable (a pruned entry is simply re-fetched), so pruning spends no tokens and needs no confirmation; the command
+just prints the count.
+
+(e) **Estimator caveats for M9 tuning (under/over-warn).** The dry-run `Estimator` sets `thinking_tokens = 0`, so an
+analysis estimate (default `thinking = low`, which bills as output) UNDER-counts and the gate under-warns for analysis
+— the term to revisit when M9 tunes estimates (a rough per-stage thinking term could be added). Conversely the estimate
+counts the cached prefix as fresh input (`cached_tokens = 0`), so a cache-warmed run is OVER-estimated — conservative
+for the gate (it errs toward asking). Both are flagged in a code comment on `estimate_pipeline`.
+
+(d) **Two M8-A footguns flagged, not deleted (preserving existing tests).** `review::analysis::approve` (approves
+without invalidation) and `invalidation::invalidate_after_approval` (stale-marking in a transaction separate from the
+approval) have no production caller — production approval goes through the atomic `approve_and_invalidate` (ADR-041).
+The brief offered "delete and migrate the tests" or "mark clearly test-only"; deleting would force rewriting several
+passing M5-B / M8-A integration tests, which the test-first guardrail forbids ("never rewrite an existing test"). Both
+are therefore kept with explicit doc-warnings stating they must not clear a gate in production and exist only to
+exercise the review-stage / §7-diff mechanics in tests. They are `pub` + test-exercised, so clippy raises no
+dead-code warning.

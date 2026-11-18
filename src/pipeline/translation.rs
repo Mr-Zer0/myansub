@@ -79,6 +79,7 @@ use crate::store::repo_units::{
 };
 use crate::store::{Stage, StageStatus, Store, StoreError, UnitStatus};
 
+use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
 use super::error::PipelineError;
 use super::input::check_source_unchanged;
 use super::orchestrator::{can_run, load_state};
@@ -361,6 +362,75 @@ where
     Ok(TranslationOutcome::Completed { batches: total })
 }
 
+/// Runs the translation stage behind the cost-confirmation gate (`docs/CLI.md` §5,
+/// `docs/LLM.md` §7/§9). Computes the pre-flight estimate with the dry-run estimator
+/// (no LLM call) and [`confirm::gate`]s the real run; `make_transport` is only built
+/// once the gate is cleared, so a refused run (non-TTY, no `--yes`) returns
+/// [`PipelineError::ConfirmationNeeded`] (exit 3) without spending or needing a key.
+///
+/// For `--stale` (`docs/LLM.md` §7) the estimate covers **only** the stale, unlocked
+/// cues that will be re-translated, not the whole project. `--redo` and the default
+/// estimate the full batch plan (already-done batches hit the local cache and are
+/// free, so a resume's estimate reflects only the remaining work).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_translation_confirmed<T, MK>(
+    make_transport: MK,
+    store: &Store,
+    cues: &[Cue],
+    params: &TranslationParams,
+    flags: TranslationFlags,
+    token: &CancellationToken,
+    prices: &PriceTable,
+    settings: ConfirmSettings,
+) -> Result<ConfirmedRun<TranslationOutcome>, PipelineError>
+where
+    T: LlmClient + Clone + Send + Sync + 'static,
+    MK: FnOnce() -> Result<T, PipelineError>,
+{
+    // `--stale` (without the broader `--redo`) re-translates only the stale, unlocked
+    // cues, so estimate over the real affected-batch structure — one prefix-bearing
+    // request per original batch holding a stale cue (`docs/LLM.md` §7), not a re-chunk
+    // of the stale cues (which would collapse scattered batches and under-count).
+    let report = if flags.stale && !flags.redo {
+        dry_run_translation_stale(store, cues, params, prices).await?
+    } else {
+        dry_run_translation(store, cues, params, prices).await?
+    };
+    let estimate = CostEstimate {
+        prompt_tokens: report.estimated_prompt_tokens,
+        output_tokens: report.estimated_output_tokens,
+        cost: report.estimated_cost,
+    };
+    confirm::gate(estimate, settings, make_transport, |transport| {
+        run_translation(transport, store, cues, params, flags, token)
+    })
+    .await
+}
+
+/// The cue `idx` values with a stale, unlocked translation — the exact set
+/// `translate --stale` re-translates (`docs/LLM.md` §7). Used to scope the `--stale`
+/// pre-flight estimate; `pub` so the scoping is directly testable.
+pub async fn stale_unlocked_idxs(store: &Store) -> Result<BTreeSet<u32>, PipelineError> {
+    let (rows, idx_to_id) = store
+        .call(|conn| {
+            let rows = list_translations(conn)?;
+            let idx_to_id = cue_id_by_idx(conn)?;
+            Ok((rows, idx_to_id))
+        })
+        .await?;
+    let id_to_idx: BTreeMap<i64, u32> = idx_to_id.iter().map(|(idx, id)| (*id, *idx)).collect();
+    let mut out = BTreeSet::new();
+    for row in rows {
+        if row.stale
+            && !row.locked
+            && let Some(idx) = id_to_idx.get(&row.cue_id)
+        {
+            out.insert(*idx);
+        }
+    }
+    Ok(out)
+}
+
 /// Reads the current (highest-version) analysis status for each batch.
 async fn status_by_batch(store: &Store) -> Result<BTreeMap<i64, UnitStatus>, PipelineError> {
     let map = store
@@ -580,7 +650,55 @@ pub async fn dry_run_translation(
 ) -> Result<DryRunReport, PipelineError> {
     let (analysis_version, sheet) = load_sheet(store).await?;
     let assembled = assemble_all_batches(cues, &sheet, params, analysis_version);
+    estimate_assembled(store, params, prices, &sheet, &assembled).await
+}
 
+/// Estimates the `translate --stale` re-run (`docs/LLM.md` §7), mirroring the real
+/// run's batch structure in [`apply_run_flags`]: one request per **original** batch
+/// that holds at least one stale, unlocked cue, each reduced to that stale subset but
+/// still carrying the full analysis-sheet prefix. This is why it cannot re-chunk the
+/// stale cues into fresh contiguous groups — scattered stale cues keep their separate
+/// prefix-bearing requests, so the estimate counts N prefixes, not `ceil(stale / batch)`.
+pub async fn dry_run_translation_stale(
+    store: &Store,
+    cues: &[Cue],
+    params: &TranslationParams,
+    prices: &PriceTable,
+) -> Result<DryRunReport, PipelineError> {
+    let (analysis_version, sheet) = load_sheet(store).await?;
+    let stale = stale_unlocked_idxs(store).await?;
+
+    // Build every batch, then keep only those holding a stale-unlocked cue, reducing
+    // each to that subset exactly as `apply_run_flags`/`rebuild_batch_subset` do.
+    let mut affected = Vec::new();
+    for mut batch in assemble_all_batches(cues, &sheet, params, analysis_version) {
+        let subset: Vec<Cue> = batch
+            .translate_cues
+            .iter()
+            .filter(|c| stale.contains(&c.idx))
+            .cloned()
+            .collect();
+        if subset.is_empty() {
+            continue;
+        }
+        if subset.len() != batch.translate_cues.len() {
+            rebuild_batch_subset(&mut batch, subset, params, analysis_version);
+        }
+        affected.push(batch);
+    }
+    estimate_assembled(store, params, prices, &sheet, &affected).await
+}
+
+/// Estimates a set of already-assembled batches through the `DryRun` transport behind
+/// the local cache (a hit is free), writing nothing. Shared by [`dry_run_translation`]
+/// and [`dry_run_translation_stale`] so both price the same request shape.
+async fn estimate_assembled(
+    store: &Store,
+    params: &TranslationParams,
+    prices: &PriceTable,
+    sheet: &Sheet,
+    assembled: &[AssembledBatch],
+) -> Result<DryRunReport, PipelineError> {
     let client = Cached::new(
         DryRun::new(params.estimator, params.output_ratio),
         store.clone(),
@@ -590,7 +708,7 @@ pub async fn dry_run_translation(
     let mut output_tokens = 0u64;
     let mut cost = Cost::Known(0.0);
     let mut calls = 0usize;
-    for batch in &assembled {
+    for batch in assembled {
         let req = build_request(
             &params.model,
             params.tier,
