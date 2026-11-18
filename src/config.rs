@@ -27,7 +27,7 @@ pub enum ConfigError {
     Parse {
         path: Option<PathBuf>,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     /// An environment override held a value of the wrong type.
@@ -335,9 +335,13 @@ pub fn load(sources: &ConfigSources) -> Result<Config, ConfigError> {
     apply_env(&mut table, &sources.env)?;
     apply_overrides(&mut table, &sources.overrides);
 
-    let config: Config = toml::Value::Table(table)
-        .try_into()
-        .map_err(|source| ConfigError::Parse { path: None, source })?;
+    let config: Config =
+        toml::Value::Table(table)
+            .try_into()
+            .map_err(|source| ConfigError::Parse {
+                path: None,
+                source: Box::new(source),
+            })?;
 
     config.validate()?;
     for warning in config.price_warnings() {
@@ -393,7 +397,7 @@ fn read_table(path: &Path) -> Result<toml::Table, ConfigError> {
     })?;
     toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: Some(path.to_path_buf()),
-        source,
+        source: Box::new(source),
     })
 }
 
