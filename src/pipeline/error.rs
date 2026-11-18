@@ -56,6 +56,11 @@ pub enum PipelineError {
     #[error("creating a project requires a source language; pass `--from <LANG>`")]
     MissingFromLanguage,
 
+    /// `analysis approve` was run on a project that has no analysis version yet
+    /// (`docs/CLI.md` §6). Maps to exit code 3 (precondition).
+    #[error("there is no analysis to approve; run `myansub analyze` first")]
+    NoAnalysisToApprove,
+
     /// A destructive action needs confirmation, but stdin is not a TTY and the
     /// confirmation flag was not given (`docs/CLI.md` §5). Maps to exit code 3.
     #[error("confirmation required: stdin is not a TTY; pass `{flag}` to proceed")]

@@ -639,8 +639,22 @@ fn run_analysis_review_command(cli: &Cli, command: &AnalysisCommand) -> anyhow::
                 Ok(exit::SUCCESS)
             }
             AnalysisCommand::Approve => {
-                let version = analysis_review::approve(&store).await?;
-                println!("approved analysis version {version}.");
+                // Approval AND stale-marking happen in ONE store transaction
+                // (ADR-041): a crash or error can never leave an
+                // approved-but-not-invalidated state the pipeline would never heal.
+                // Orchestrated here, not inside `review::analysis::approve`, to avoid a
+                // `review → pipeline` dependency edge (`docs/ARCHITECTURE.md` §3).
+                let outcome = myansub::pipeline::approve_and_invalidate(&store, "user").await?;
+                println!("approved analysis version {}.", outcome.approved_version);
+                // Report the currently-stale count (not just the newly marked), so a
+                // recovery re-run still signals pending re-translation (`docs/LLM.md` §7).
+                if outcome.stale_unlocked > 0 {
+                    println!(
+                        "{} translation(s) stale; run `myansub translate --stale` \
+                         to re-translate them.",
+                        outcome.stale_unlocked
+                    );
+                }
                 Ok(exit::SUCCESS)
             }
         }

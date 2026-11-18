@@ -10,6 +10,7 @@
 pub mod analysis;
 pub mod error;
 pub mod input;
+pub mod invalidation;
 pub mod orchestrator;
 pub mod output;
 pub mod scheduler;
@@ -21,6 +22,11 @@ pub use analysis::{
     worst_case_doc_tokens,
 };
 pub use error::PipelineError;
+pub use invalidation::{
+    AddressPair, AnalysisDoc, ApprovalInvalidation, Character, GlossaryEntry, Scene, affected_cues,
+    approve_and_invalidate, approve_and_invalidate_in_tx, invalidate_after_approval,
+    parse_analysis_doc,
+};
 pub use orchestrator::{
     NextStep, ProjectState, RunDryRunEstimate, RunOptions, RunOutcome, RunReport, RunRequest,
     StatusReport, analysis_params, can_run, next_step, run, run_exit_code, status,

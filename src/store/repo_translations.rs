@@ -301,6 +301,38 @@ pub fn apply_user_edit_in_tx(
     Ok(())
 }
 
+/// Marks the unlocked translations for `cue_ids` stale (`stale = 1`) within the
+/// caller's transaction (`docs/LLM.md` §7, `docs/DATA_MODEL.md` §2). A `locked = 1`
+/// row is never set stale (`docs/REQUIREMENTS.md` FR-6), and a `cue_id` with no
+/// translation row is simply skipped. Returns the number of rows actually updated,
+/// so selective invalidation can report how many translations it invalidated.
+///
+/// All updates share the caller's single transaction (`docs/ARCHITECTURE.md` §6).
+pub fn mark_unlocked_stale_in_tx(tx: &Transaction, cue_ids: &[i64]) -> Result<usize, StoreError> {
+    let mut marked = 0;
+    for &cue_id in cue_ids {
+        marked += tx.execute(
+            "UPDATE translations SET stale = 1, updated_at = datetime('now') \
+             WHERE cue_id = ?1 AND locked = 0 AND stale = 0",
+            params![cue_id],
+        )?;
+    }
+    Ok(marked)
+}
+
+/// Counts the currently-stale, unlocked translations (`stale = 1 AND locked = 0`).
+/// The approve path reports this so a recovery re-run still signals how many
+/// translations are pending re-translation — including any left stale by an earlier
+/// interrupted run, not only the ones this run newly marked (`docs/LLM.md` §7).
+pub fn count_stale_unlocked(conn: &Connection) -> Result<usize, StoreError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM translations WHERE stale = 1 AND locked = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as usize)
+}
+
 /// Sets the `locked` flag on one translation within the caller's transaction (M7,
 /// `docs/DATA_MODEL.md` §2). Returns `true` if a row changed, `false` when no
 /// translation exists for `cue_id`. Used by `review unlock` (locked = 0).

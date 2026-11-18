@@ -23,6 +23,7 @@ use myansub::pipeline::orchestrator::{
 };
 use myansub::project::{PROJECT_DB_FILE, project_dir_for_source};
 use myansub::store::repo_analysis::current_analysis;
+use myansub::store::repo_translations::{cue_id_by_idx, get_translation, set_locked_in_tx};
 use myansub::store::{Stage, StageStatus, Store};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
@@ -211,6 +212,93 @@ async fn auto_approve_records_origin_auto() {
     assert_eq!(
         origin_of(&report, Stage::TranslationReview),
         Some(ApprovalOrigin::Auto)
+    );
+}
+
+/// Whether the translation for cue `idx` is stale, read from `project_dir`.
+async fn stale_at(project_dir: &Path, idx: u32) -> bool {
+    let store = open(project_dir).await;
+    let id = store
+        .call(move |c| Ok(cue_id_by_idx(c)?.get(&idx).copied()))
+        .await
+        .expect("idx map")
+        .expect("cue present");
+    store
+        .call(move |c| get_translation(c, id))
+        .await
+        .expect("get translation")
+        .expect("translation row")
+        .stale
+}
+
+// AC: M8-AC3 — the `run --auto-approve` trigger site: approving an edited analysis
+// version atomically marks the affected unlocked translations stale, while the locked
+// cue is never set stale (FR-6). A changed premise affects every translatable cue.
+#[tokio::test]
+async fn run_auto_approve_marks_affected_unlocked_stale() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("movie.srt");
+    fs::write(&source, SRT3).expect("write source");
+    let project_dir = project_dir_for_source(&source);
+    let config = Config::default();
+
+    // Full run 1: analysis v1 approved (auto), three cues translated at v1, output
+    // written.
+    run(
+        fake_full(&[1, 2, 3]),
+        request(&project_dir, &source, auto_all()),
+        &config,
+        &CancellationToken::new(),
+        &mut RunReport::default(),
+    )
+    .await
+    .expect("run 1");
+
+    // Lock cue 2: it must never be set stale.
+    let store = open(&project_dir).await;
+    let locked_id = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&2).copied()))
+        .await
+        .expect("idx map")
+        .expect("cue 2");
+    store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            set_locked_in_tx(&tx, locked_id, true)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .expect("lock cue 2");
+
+    // Edit the analysis: a new unapproved v2 with a changed premise, re-blocking
+    // translation (the scene range is kept within the three cues so import validates).
+    let v2 = r#"{"schema_version":1,"premise":"p2","tone":"t","characters":[],
+    "address_matrix":[],"glossary":[],
+    "scenes":[{"cue_range":[1,3],"summary":"s","speakers":[]}],
+    "style_rules":[],"unresolved_ambiguities":[]}"#;
+    myansub::review::analysis::import_doc(&store, v2)
+        .await
+        .expect("import v2");
+
+    // Run 2 with --auto-approve: the auto-approve path approves v2 and invalidates in
+    // one transaction. Nothing else executes (translation/output already complete), so
+    // the stale flags persist to observe.
+    run(
+        fake_full(&[1, 2, 3]),
+        request(&project_dir, &source, auto_all()),
+        &config,
+        &CancellationToken::new(),
+        &mut RunReport::default(),
+    )
+    .await
+    .expect("run 2");
+
+    assert!(stale_at(&project_dir, 1).await, "cue 1 (unlocked) is stale");
+    assert!(stale_at(&project_dir, 3).await, "cue 3 (unlocked) is stale");
+    assert!(
+        !stale_at(&project_dir, 2).await,
+        "locked cue 2 is never set stale"
     );
 }
 

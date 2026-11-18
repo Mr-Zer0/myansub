@@ -445,3 +445,21 @@ the other two. FR-6 does not require a partition, and this overlap is the intend
 with the M4-C `status` decision and the M5-B analysis review). `review set`/`edit`/`import` read cues to
 validate `⟦n⟧` placeholders and mutate state, so they call `check_source_unchanged` first and fail with
 exit 3 on a changed source (ARCHITECTURE §6 rule 5). This exception is enforced in `main.rs` wiring.
+
+### ADR-041 Selective invalidation lives in `pipeline`, triggered at both approve sites (M8-A)
+
+`docs/LLM.md` §7's diff and the `stale`-marking it drives are implemented in `pipeline/invalidation.rs`.
+ARCHITECTURE §3 both suggests this home ("a new `pipeline/invalidation.rs`") and forbids `review → pipeline`
+("nothing depends on `pipeline` or `review`"), so the trigger cannot be called from inside
+`review::analysis::approve`. Instead the two sites that approve a new analysis version both sit at or above
+`pipeline` and call `pipeline::invalidate_after_approval` themselves: the orchestrator's `auto_approve_analysis`
+(the `run --auto-approve` path) and `main.rs` right after `review::analysis::approve` (the `analysis approve`
+command). This keeps `review` free of a `pipeline` dependency while still invalidating on every approval.
+
+The diff (`affected_cues`) is pure over the two parsed docs and the project cues (each §7 row is unit-tested in
+isolation). `locked` is a property of the stored translation, not of a `Cue`, so the pure diff returns every
+affected cue and the store layer (`mark_unlocked_stale_in_tx`) skips `locked` rows (FR-6). The "old" document to
+diff against is the newest analysis version strictly older than the just-approved one that the existing
+translations were built against (`MAX(analysis_version) < approved` over `translations`); a first approval with
+no translations, a re-approval of the same version, or byte-identical docs are all no-ops. A role-only character
+edit invalidates nothing: `role` is not among §7's five character fields, so it is not even parsed.

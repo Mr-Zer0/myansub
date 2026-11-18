@@ -89,6 +89,7 @@ impl ExitCode for PipelineError {
             | PipelineError::FromDisagreement { .. }
             | PipelineError::Uninitialized { .. }
             | PipelineError::IncompleteTranslation { .. }
+            | PipelineError::NoAnalysisToApprove
             | PipelineError::MissingFromLanguage => exit::PRECONDITION,
             // A format/extension disagreement is a usage error (exit 2).
             PipelineError::OutputFormatExtensionMismatch { .. } => exit::USAGE,

@@ -30,7 +30,6 @@ use crate::llm::dry_run::Estimator;
 use crate::llm::pricing::{self, Cost, PriceTable};
 use crate::llm::retry::RetryConfig;
 use crate::project::project_db_path;
-use crate::store::repo_analysis::approve_current_analysis_in_tx;
 use crate::store::repo_cues::load_cues;
 use crate::store::repo_project::{
     get_project, get_stage, get_stage_origin, set_stage, set_stage_with_origin,
@@ -494,24 +493,14 @@ fn auto_approves(choice: Option<AutoApproveGate>, gate: Stage) -> bool {
     )
 }
 
-/// Auto-approves the current analysis version and the analysis-review gate in one
-/// transaction, recording origin `auto` (`docs/CLI.md` §4, ADR-019). Mirrors
-/// `review::analysis::approve` but stamps `auto` instead of `user`.
+/// Auto-approves the current analysis version and the analysis-review gate, and
+/// invalidates the affected unlocked translations, **all in one transaction**,
+/// recording origin `auto` (`docs/CLI.md` §4, ADR-019/ADR-041). Approval and
+/// stale-marking are atomic so a crash can never leave an approved-but-not-invalidated
+/// state the `run` loop would skip (`docs/LLM.md` §7). A no-op invalidation before any
+/// translation exists.
 async fn auto_approve_analysis(store: &Store) -> Result<(), PipelineError> {
-    store
-        .call(|conn| {
-            let tx = conn.transaction()?;
-            approve_current_analysis_in_tx(&tx)?;
-            set_stage_with_origin(
-                &tx,
-                Stage::AnalysisReview,
-                StageStatus::Approved,
-                Some("auto"),
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
+    crate::pipeline::invalidation::approve_and_invalidate(store, "auto").await?;
     Ok(())
 }
 
