@@ -24,7 +24,7 @@ async fn input_stage_stores_project_row_fields() {
     fs::write(&source, SRT).expect("write source");
     let store = open_store(tmp.path()).await;
 
-    run_input(&store, &source, "en", None, Some("srt"))
+    run_input(&store, &source, "en", None, Some("srt"), None, None)
         .await
         .expect("input stage runs");
 
@@ -56,7 +56,7 @@ async fn input_stage_records_format_meta_for_ass_source() {
     fs::write(&source, include_bytes!("fixtures/formats/sample.ass")).expect("write ass source");
     let store = open_store(tmp.path()).await;
 
-    run_input(&store, &source, "en", None, Some("ass"))
+    run_input(&store, &source, "en", None, Some("ass"), None, None)
         .await
         .expect("input stage runs on ass");
 
@@ -83,7 +83,7 @@ async fn input_stage_round_trips_cues_and_marks_stage_completed() {
     fs::write(&source, SRT).expect("write source");
     let store = open_store(tmp.path()).await;
 
-    run_input(&store, &source, "en", None, Some("srt"))
+    run_input(&store, &source, "en", None, Some("srt"), None, None)
         .await
         .expect("input stage runs");
 
@@ -117,9 +117,17 @@ async fn input_stage_lists_cues_with_replacement_chars_but_succeeds() {
     fs::write(&source, &bytes).expect("write source");
     let store = open_store(tmp.path()).await;
 
-    let outcome = run_input(&store, &source, "en", Some("shift_jis"), Some("srt"))
-        .await
-        .expect("input stage still succeeds on replacement chars");
+    let outcome = run_input(
+        &store,
+        &source,
+        "en",
+        Some("shift_jis"),
+        Some("srt"),
+        None,
+        None,
+    )
+    .await
+    .expect("input stage still succeeds on replacement chars");
 
     assert!(
         !outcome.replacement_cues.is_empty(),
@@ -142,7 +150,7 @@ async fn check_source_unchanged_passes_when_source_is_unchanged() {
     let source = tmp.path().join("movie.srt");
     fs::write(&source, SRT).expect("write source");
     let store = open_store(tmp.path()).await;
-    run_input(&store, &source, "en", None, Some("srt"))
+    run_input(&store, &source, "en", None, Some("srt"), None, None)
         .await
         .expect("input stage runs");
 
@@ -159,7 +167,7 @@ async fn check_source_unchanged_errors_when_source_changed() {
     let source = tmp.path().join("movie.srt");
     fs::write(&source, SRT).expect("write source");
     let store = open_store(tmp.path()).await;
-    run_input(&store, &source, "en", None, Some("srt"))
+    run_input(&store, &source, "en", None, Some("srt"), None, None)
         .await
         .expect("input stage runs");
 
@@ -202,7 +210,7 @@ async fn failed_reinit_rolls_back_and_keeps_original_data() {
     let store = open_store(tmp.path()).await;
 
     // Fresh init: 2 cues stored.
-    run_input(&store, &source, "en", None, Some("srt"))
+    run_input(&store, &source, "en", None, Some("srt"), None, None)
         .await
         .expect("fresh init");
     let original = store
@@ -219,11 +227,20 @@ async fn failed_reinit_rolls_back_and_keeps_original_data() {
     .expect("modify source");
 
     // Attempt a re-init whose transaction fails right after the clear.
-    let err = run_input_with_fault(&store, &source, "en", None, Some("srt"), |_conn| {
-        Err(StoreError::Unexpected(
-            "injected fault after clear".to_string(),
-        ))
-    })
+    let err = run_input_with_fault(
+        &store,
+        &source,
+        "en",
+        None,
+        Some("srt"),
+        None,
+        None,
+        |_conn| {
+            Err(StoreError::Unexpected(
+                "injected fault after clear".to_string(),
+            ))
+        },
+    )
     .await
     .expect_err("fault aborts the re-init");
     assert!(matches!(err, PipelineError::Store(_)));

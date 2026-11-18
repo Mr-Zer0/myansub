@@ -61,7 +61,12 @@ may edit translations using exported review files.
 - Output is UTF-8 (optional BOM). Writes are atomic.
 - Same-format output preserves original styles and headers; cross-format conversion warns
   about lost information.
-- ASS/SSA output applies a configurable Myanmar-capable font to all styles.
+- ASS/SSA output applies a configurable Myanmar-capable font to all styles. In practice the
+  font is applied to every style in the output's style table, which exists only when the
+  output carries stored `FormatMeta` — i.e. a same-format ASS/SSA export (ADR-020). A
+  cross-format export *to* ASS/SSA, or a source that was recovered via the fallback parser,
+  has no style table, so no font is written and a lost-styling warning is emitted instead
+  (consistent with ADR-020/ADR-024).
 - Export refuses if any translatable cue lacks a translation, unless `--allow-incomplete`
   (then source text is used and a warning lists the cues).
 

@@ -737,7 +737,7 @@ const SRT: &str = "1\n00:00:01,000 --> 00:00:03,000\nGood morning.\n\n\
 async fn init_project(db: &std::path::Path, source: &std::path::Path) -> Store {
     std::fs::write(source, SRT).expect("write source");
     let store = Store::open(db).expect("open");
-    run_input(&store, source, "en", None, Some("srt"))
+    run_input(&store, source, "en", None, Some("srt"), None, None)
         .await
         .expect("input stage");
     store

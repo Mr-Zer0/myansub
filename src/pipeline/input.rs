@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::Document;
 use crate::formats::{codec, encoding};
-use crate::store::repo_project::{get_project, insert_project, set_stage};
+use crate::store::repo_project::{get_project, insert_project, set_output_prefs, set_stage};
 use crate::store::{
     Project, Stage, StageStatus, Store, StoreError, clear_all_data, insert_cues_in_tx,
 };
@@ -42,16 +42,21 @@ pub struct InputOutcome {
 /// Runs the input stage: read, hash, decode, detect, parse, mask, and store.
 ///
 /// `ext_hint` is the source file extension (without the dot), used only as a
-/// format tie-breaker (`docs/REQUIREMENTS.md` FR-1). On success the project row,
-/// all cues, and `stage_state(input) = completed` are committed in one
-/// transaction that first clears any prior data, so re-running (a `--force`
-/// re-init) is atomic and idempotent.
+/// format tie-breaker (`docs/REQUIREMENTS.md` FR-1). `output_format`/`output_path`
+/// are the output preferences given at creation (`docs/CLI.md` §3); they are
+/// persisted in the *same* transaction as the project row so a crash never leaves
+/// a project without the user's chosen output defaults. On success the project row,
+/// all cues, the output preferences, and `stage_state(input) = completed` are
+/// committed in one transaction that first clears any prior data, so re-running (a
+/// `--force` re-init) is atomic and idempotent.
 pub async fn run_input(
     store: &Store,
     source_path: &Path,
     from_lang: &str,
     encoding_override: Option<&str>,
     ext_hint: Option<&str>,
+    output_format: Option<&str>,
+    output_path: Option<&str>,
 ) -> Result<InputOutcome, PipelineError> {
     run_input_with_fault(
         store,
@@ -59,6 +64,8 @@ pub async fn run_input(
         from_lang,
         encoding_override,
         ext_hint,
+        output_format,
+        output_path,
         |_| Ok(()),
     )
     .await
@@ -73,12 +80,15 @@ pub async fn run_input(
 /// §6 rule 1 — must roll the clear back and leave the previous project row and
 /// cues fully intact (never empty or partial). Production callers use
 /// [`run_input`], which injects a no-op.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_input_with_fault<H>(
     store: &Store,
     source_path: &Path,
     from_lang: &str,
     encoding_override: Option<&str>,
     ext_hint: Option<&str>,
+    output_format: Option<&str>,
+    output_path: Option<&str>,
     fault: H,
 ) -> Result<InputOutcome, PipelineError>
 where
@@ -116,9 +126,13 @@ where
         format_meta,
     };
     let cues = document.cues;
+    let output_format = output_format.map(str::to_string);
+    let output_path = output_path.map(str::to_string);
 
-    // One transaction: wipe any prior data, then write project + cues + stage so
-    // a crash leaves the database either fully old or fully new (§6 rule 1). The
+    // One transaction: wipe any prior data, then write project + cues + output
+    // preferences + stage so a crash leaves the database either fully old or fully
+    // new (§6 rule 1). The output preferences are stored here, atomically with
+    // creation, so they can never be lost between two writes (`docs/CLI.md` §3). The
     // fault seam fires after the clear and before any insert, so an error there
     // must roll the clear back, proving the destructive re-init is atomic.
     store
@@ -128,6 +142,7 @@ where
             fault(&tx)?;
             insert_project(&tx, &project)?;
             insert_cues_in_tx(&tx, &cues)?;
+            set_output_prefs(&tx, output_format.as_deref(), output_path.as_deref())?;
             set_stage(&tx, Stage::Input, StageStatus::Completed)?;
             tx.commit()?;
             Ok(())
@@ -215,8 +230,11 @@ pub fn decide_reinit(changed: bool, force: bool, interactive: bool, yes: bool) -
 ///
 /// `project_dir` is the resolved project directory; `interactive` is whether
 /// stdin is a TTY (pass `std::io::stdin().is_terminal()`), and `yes` is the
-/// global `--yes` flag. Output-preference flags (`--output-format`, `-o`) are
-/// accepted by the CLI but not persisted yet (deferred to M7).
+/// global `--yes` flag. `output_format`/`output_path` are the output preferences
+/// given at creation (`docs/CLI.md` §3); they are persisted atomically with the
+/// project row (see [`run_input`]). The caller resolves any `--output-format`
+/// vs `--output`-extension disagreement (exit 2) *before* calling this.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_init(
     project_dir: &Path,
     source_path: &Path,
@@ -225,6 +243,8 @@ pub async fn run_init(
     force: bool,
     interactive: bool,
     yes: bool,
+    output_format: Option<&str>,
+    output_path: Option<&str>,
 ) -> Result<InitOutcome, PipelineError> {
     std::fs::create_dir_all(project_dir).map_err(|source| PipelineError::Io {
         path: project_dir.to_path_buf(),
@@ -237,8 +257,16 @@ pub async fn run_init(
     let existing = store.call(|conn| get_project(conn)).await?;
     let Some(existing) = existing else {
         // Fresh init: no project row yet.
-        let outcome =
-            run_input(&store, source_path, from_lang, encoding_override, ext_hint).await?;
+        let outcome = run_input(
+            &store,
+            source_path,
+            from_lang,
+            encoding_override,
+            ext_hint,
+            output_format,
+            output_path,
+        )
+        .await?;
         return Ok(InitOutcome::Initialized(outcome));
     };
 
@@ -263,16 +291,32 @@ pub async fn run_init(
                     .await
                     .unwrap_or(false);
             if confirmed {
-                let outcome =
-                    run_input(&store, source_path, from_lang, encoding_override, ext_hint).await?;
+                let outcome = run_input(
+                    &store,
+                    source_path,
+                    from_lang,
+                    encoding_override,
+                    ext_hint,
+                    output_format,
+                    output_path,
+                )
+                .await?;
                 Ok(InitOutcome::ReInitialized(outcome))
             } else {
                 Ok(InitOutcome::Cancelled)
             }
         }
         ReinitAction::Proceed => {
-            let outcome =
-                run_input(&store, source_path, from_lang, encoding_override, ext_hint).await?;
+            let outcome = run_input(
+                &store,
+                source_path,
+                from_lang,
+                encoding_override,
+                ext_hint,
+                output_format,
+                output_path,
+            )
+            .await?;
             Ok(InitOutcome::ReInitialized(outcome))
         }
     }

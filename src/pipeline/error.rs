@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use crate::domain::SubtitleFormat;
 use crate::formats::codec::FormatError;
 use crate::formats::encoding::EncodingError;
 use crate::llm::client::LlmError;
@@ -59,6 +60,27 @@ pub enum PipelineError {
     /// confirmation flag was not given (`docs/CLI.md` §5). Maps to exit code 3.
     #[error("confirmation required: stdin is not a TTY; pass `{flag}` to proceed")]
     ConfirmationNeeded { flag: String },
+
+    /// The output stage refused because one or more translatable cues have no
+    /// stored translation and `--allow-incomplete` was not given
+    /// (`docs/REQUIREMENTS.md` FR-7). Maps to exit code 3 (precondition).
+    #[error(
+        "{} translatable cue(s) have no translation; run `myansub translate`, \
+         or pass `--allow-incomplete` to export using the source text. Missing cue ids: {cue_ids:?}",
+        cue_ids.len()
+    )]
+    IncompleteTranslation { cue_ids: Vec<u32> },
+
+    /// `--output-format` and the extension of `--output` disagree (`docs/CLI.md`
+    /// §3). Maps to exit code 2 (usage).
+    #[error(
+        "`--output-format {format}` disagrees with the `.{extension}` extension of `--output`; \
+         remove one of them"
+    )]
+    OutputFormatExtensionMismatch {
+        format: SubtitleFormat,
+        extension: SubtitleFormat,
+    },
 
     /// A real (non-dry-run) LLM command was invoked without a Gemini API key
     /// (`docs/LLM.md` §1). A clear, actionable message; maps to exit code 1 (a

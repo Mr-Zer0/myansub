@@ -62,9 +62,19 @@ async fn fresh_init_creates_project_and_stores_cues() {
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
 
-    let outcome = run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect("fresh init");
+    let outcome = run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("fresh init");
 
     assert!(matches!(outcome, InitOutcome::Initialized(_)));
     assert!(project_dir.join("project.db").is_file());
@@ -78,12 +88,32 @@ async fn second_init_on_unchanged_source_is_nothing_to_do() {
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
 
-    run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect("first init");
-    let outcome = run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect("second init");
+    run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("first init");
+    let outcome = run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("second init");
 
     assert_eq!(outcome, InitOutcome::AlreadyInitialized);
 }
@@ -97,18 +127,38 @@ async fn init_on_changed_source_without_force_refuses() {
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
 
-    run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect("first init");
+    run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("first init");
     fs::write(
         &source,
         format!("{SRT}\n2\n00:00:04,000 --> 00:00:05,000\nNew line.\n"),
     )
     .expect("modify source");
 
-    let err = run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect_err("changed source refused without --force");
+    let err = run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect_err("changed source refused without --force");
 
     match err {
         PipelineError::SourceChanged { .. } => {
@@ -131,9 +181,19 @@ async fn init_force_changed_source_non_tty_without_yes_needs_confirmation() {
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
 
-    run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect("first init");
+    run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("first init");
     fs::write(
         &source,
         format!("{SRT}\n2\n00:00:04,000 --> 00:00:05,000\nNew line.\n"),
@@ -141,9 +201,19 @@ async fn init_force_changed_source_non_tty_without_yes_needs_confirmation() {
     .expect("modify source");
 
     // force=true, interactive=false (non-TTY), yes=false.
-    let err = run_init(&project_dir, &source, "en", None, true, false, false)
-        .await
-        .expect_err("confirmation cannot be obtained");
+    let err = run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        true,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect_err("confirmation cannot be obtained");
 
     match err {
         PipelineError::ConfirmationNeeded { flag } => {
@@ -152,10 +222,20 @@ async fn init_force_changed_source_non_tty_without_yes_needs_confirmation() {
         other => panic!("expected ConfirmationNeeded, got {other:?}"),
     }
     // The error message names the flag the user needs (CLI.md §5).
-    let rendered = run_init(&project_dir, &source, "en", None, true, false, false)
-        .await
-        .expect_err("confirmation cannot be obtained")
-        .to_string();
+    let rendered = run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        true,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect_err("confirmation cannot be obtained")
+    .to_string();
     assert!(
         rendered.contains("--yes"),
         "message names --yes, got: {rendered}"
@@ -171,9 +251,19 @@ async fn init_force_yes_reinitializes_with_new_content() {
     fs::write(&source, SRT).expect("write source");
     let project_dir = project_dir_for_source(&source);
 
-    run_init(&project_dir, &source, "en", None, false, false, false)
-        .await
-        .expect("first init");
+    run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("first init");
     assert_eq!(cue_count(&project_dir).await, 1);
 
     fs::write(
@@ -182,9 +272,19 @@ async fn init_force_yes_reinitializes_with_new_content() {
     )
     .expect("modify source");
 
-    let outcome = run_init(&project_dir, &source, "en", None, true, false, true)
-        .await
-        .expect("re-init with --force --yes");
+    let outcome = run_init(
+        &project_dir,
+        &source,
+        "en",
+        None,
+        true,
+        false,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("re-init with --force --yes");
 
     assert!(matches!(outcome, InitOutcome::ReInitialized(_)));
     assert_eq!(cue_count(&project_dir).await, 2, "new content stored");

@@ -104,6 +104,43 @@ pub fn get_project(conn: &Connection) -> Result<Option<Project>, StoreError> {
     Ok(project)
 }
 
+/// Stores the output preferences on the project row (`docs/DATA_MODEL.md` §2,
+/// `docs/CLI.md` §3). `init` (and `run` when it creates the project) persist the
+/// `--output-format` / `--output` values given at creation; a `None` leaves the
+/// column `NULL` so the export stage falls back to its defaults. Later commands
+/// apply their flags per-invocation and do not call this.
+pub fn set_output_prefs(
+    conn: &Connection,
+    output_format: Option<&str>,
+    output_path: Option<&str>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE project SET output_format = ?1, output_path = ?2 WHERE id = 1",
+        params![output_format, output_path],
+    )?;
+    Ok(())
+}
+
+/// Reads the stored output preferences `(output_format, output_path)` from the
+/// project row (`docs/DATA_MODEL.md` §2). Either element is `None` when the column
+/// is `NULL` (no stored preference); the pair is `(None, None)` when no project
+/// row exists.
+pub fn get_output_prefs(conn: &Connection) -> Result<(Option<String>, Option<String>), StoreError> {
+    let prefs = conn
+        .query_row(
+            "SELECT output_format, output_path FROM project WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(prefs.unwrap_or((None, None)))
+}
+
 /// A pipeline stage (`docs/ARCHITECTURE.md` §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {

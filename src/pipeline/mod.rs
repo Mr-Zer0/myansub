@@ -11,6 +11,7 @@ pub mod analysis;
 pub mod error;
 pub mod input;
 pub mod orchestrator;
+pub mod output;
 pub mod scheduler;
 pub mod translation;
 
@@ -23,6 +24,11 @@ pub use error::PipelineError;
 pub use orchestrator::{
     NextStep, ProjectState, RunOptions, RunOutcome, RunRequest, StatusReport, can_run, next_step,
     run, run_exit_code, status,
+};
+pub use output::{
+    BuiltOutput, OutputReport, OutputWarning, ResolvedOutput, build_output_document,
+    default_output_path, resolve_output_format_from_flags, resolve_output_target, run_output,
+    store_creation_prefs, stored_output_prefs,
 };
 pub use scheduler::{SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};
 pub use translation::{

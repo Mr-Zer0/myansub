@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::domain::SubtitleFormat;
 use crate::error::exit;
 use crate::llm::client::ServiceTier;
 use crate::llm::pricing::{self, Cost, PriceTable};
@@ -211,6 +212,13 @@ pub struct RunRequest<'a> {
     pub from_lang: Option<&'a str>,
     /// `--encoding <ENC>`, if given.
     pub encoding: Option<&'a str>,
+    /// `--output-format <FMT>`, if given — stored when this invocation creates the
+    /// project (`docs/CLI.md` §3). The caller has already resolved any
+    /// `--output-format`/`--output`-extension disagreement (exit 2).
+    pub output_format: Option<SubtitleFormat>,
+    /// `--output <PATH>`, if given — stored when this invocation creates the
+    /// project (`docs/CLI.md` §3).
+    pub output_path: Option<&'a Path>,
     /// `run` flags.
     pub options: RunOptions,
 }
@@ -372,7 +380,20 @@ async fn initialize_into(req: &RunRequest<'_>, store: &Store) -> Result<(), Pipe
         })?;
     let from = req.from_lang.ok_or(PipelineError::MissingFromLanguage)?;
     let ext = extension_of(source);
-    run_input(store, source, from, req.encoding, ext).await?;
+    // Output preferences given at creation are stored atomically with the project
+    // (`docs/CLI.md` §3). The format label is persisted; the path is stored as given.
+    let output_format = req.output_format.map(|f| f.label());
+    let output_path = req.output_path.map(|p| p.to_string_lossy());
+    run_input(
+        store,
+        source,
+        from,
+        req.encoding,
+        ext,
+        output_format,
+        output_path.as_deref(),
+    )
+    .await?;
     Ok(())
 }
 

@@ -9,10 +9,11 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::Parser;
 use myansub::cli::{
-    AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, InitArgs, ReviewCommand,
-    ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier, TranslateArgs,
+    AnalysisCommand, AnalyzeArgs, AutoApprove, Cli, Command, ExportArgs, InitArgs, OutputFormat,
+    ReviewCommand, ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier, TranslateArgs,
 };
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
+use myansub::domain::SubtitleFormat;
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
 use myansub::llm::client::Secret;
 use myansub::llm::pricing::{Cost, PriceTable};
@@ -27,6 +28,10 @@ use myansub::pipeline::input::{InitOutcome, run_init};
 use myansub::pipeline::orchestrator::{
     AutoApproveGate, RunOptions, RunOutcome, RunRequest, StatusReport, run as run_pipeline,
     run_exit_code, status as gather_status,
+};
+use myansub::pipeline::output::{
+    OutputReport, resolve_output_format_from_flags, resolve_output_target, run_output,
+    stored_output_prefs,
 };
 use myansub::pipeline::scheduler::SchedulerConfig;
 use myansub::pipeline::translation::{
@@ -96,6 +101,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Analysis { command } => run_analysis_review_command(cli, command),
         Command::Translate(args) => run_translate_command(cli, args),
         Command::Review { command } => run_translation_review_command(cli, command),
+        Command::Export(args) => run_export_command(cli, args),
         other => not_implemented(command_name(other)),
     }
 }
@@ -109,8 +115,22 @@ fn run_init_command(cli: &Cli, args: &InitArgs) -> anyhow::Result<()> {
     // stage but failing here surfaces a bad config before any work is done.
     let _config = load_config(cli, &location.dir)?;
 
+    // Resolve the output-format flags up front so a format/extension disagreement
+    // is a usage error (exit 2) *before* any work is done — never after the project
+    // is created (docs/CLI.md §3). The resolved format (explicit or derived from a
+    // known `--output` extension) is what gets stored.
+    let flag_path = args.output.output.as_deref();
+    let resolved_format = resolve_output_format_from_flags(
+        args.output.output_format.map(map_output_format),
+        flag_path,
+    )?;
+    let output_format = resolved_format.map(|f| f.label().to_string());
+    let output_path = flag_path.map(|p| p.to_string_lossy().into_owned());
+
     let interactive = std::io::stdin().is_terminal();
     let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    // The output preferences are persisted atomically with project creation inside
+    // `run_init` (docs/CLI.md §3), so there is no second write to lose on a crash.
     let outcome = runtime.block_on(run_init(
         &location.dir,
         &args.file,
@@ -119,6 +139,8 @@ fn run_init_command(cli: &Cli, args: &InitArgs) -> anyhow::Result<()> {
         args.force,
         interactive,
         cli.yes,
+        output_format.as_deref(),
+        output_path.as_deref(),
     ))?;
 
     report_init_outcome(&location.dir, &outcome);
@@ -133,6 +155,18 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
     let location = resolve_project(cli.project.as_deref(), args.file.as_deref(), &cwd)?;
     let config = load_config(cli, &location.dir)?;
 
+    // Output-format flags are validated up front so a format/extension disagreement
+    // is a usage error (exit 2) before any work — on an existing project too, where
+    // `run` would otherwise ignore it (docs/CLI.md §3). The resolved preferences are
+    // threaded into the request and stored atomically when this invocation creates
+    // the project; on an existing project they would apply only to an export this
+    // invocation performs, which `run` does not do until M7-C.
+    let flag_path = args.output.output.as_deref();
+    let resolved_format = resolve_output_format_from_flags(
+        args.output.output_format.map(map_output_format),
+        flag_path,
+    )?;
+
     let options = RunOptions {
         auto_approve: args.auto_approve.map(map_auto_approve),
         allow_incomplete: args.allow_incomplete,
@@ -143,6 +177,8 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
         source_path: args.file.as_deref(),
         from_lang: args.from.as_deref(),
         encoding: args.encoding.as_deref(),
+        output_format: resolved_format,
+        output_path: flag_path,
         options,
     };
 
@@ -698,6 +734,93 @@ fn run_translation_review_command(cli: &Cli, command: &ReviewCommand) -> anyhow:
             }
         }
     })
+}
+
+/// Handles `myansub export [--output-format F] [-o PATH] [--allow-incomplete]`
+/// (docs/CLI.md §6, docs/REQUIREMENTS.md FR-7). Resolves the project, resolves the
+/// output format/path by precedence (command flag > stored value > default), and
+/// runs the output stage. A format/extension disagreement is a usage error (exit
+/// 2); the output gate (translation review approved) and an incomplete translation
+/// without `--allow-incomplete` are preconditions (exit 3).
+fn run_export_command(cli: &Cli, args: &ExportArgs) -> anyhow::Result<i32> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let location = resolve_project(cli.project.as_deref(), None, &cwd)?;
+    let config = load_config(cli, &location.dir)?;
+
+    let db = project_db_path(&location.dir);
+    if !db.is_file() {
+        return Err(PipelineError::Uninitialized {
+            dir: location.dir.clone(),
+        }
+        .into());
+    }
+
+    let flag_format = args.output.output_format.map(map_output_format);
+    let flag_path = args.output.output.clone();
+
+    let runtime = tokio::runtime::Runtime::new().context("start async runtime")?;
+    runtime.block_on(async {
+        let store = Store::open(&db)?;
+        let Some(project) = store.call(|conn| get_project(conn)).await? else {
+            return Err::<i32, anyhow::Error>(
+                PipelineError::Uninitialized {
+                    dir: location.dir.clone(),
+                }
+                .into(),
+            );
+        };
+        let source_format: SubtitleFormat = project
+            .source_format
+            .parse()
+            .map_err(|e| anyhow::anyhow!("stored source_format is invalid: {e}"))?;
+        let source_path = std::path::PathBuf::from(&project.source_path);
+
+        let (stored_format, stored_path) = stored_output_prefs(&store).await?;
+        let resolved = resolve_output_target(
+            flag_format,
+            flag_path.as_deref(),
+            stored_format,
+            stored_path.as_deref(),
+            &source_path,
+            source_format,
+        )?;
+
+        let report = run_output(
+            &store,
+            &source_path,
+            &resolved,
+            &config.output.ass_font_override,
+            config.output.utf8_bom,
+            args.allow_incomplete,
+        )
+        .await?;
+        report_export(&report);
+        Ok(exit::SUCCESS)
+    })
+}
+
+/// Prints where the export wrote and any warnings it surfaced (docs/CLI.md §6).
+fn report_export(report: &OutputReport) {
+    for warning in &report.warnings {
+        println!("WARNING: {warning}");
+    }
+    println!(
+        "exported {} cue(s) as {} to {}",
+        report.cue_count,
+        report.format,
+        report.path.display()
+    );
+}
+
+/// Maps the CLI output-format choice onto the domain [`SubtitleFormat`].
+fn map_output_format(format: OutputFormat) -> SubtitleFormat {
+    match format {
+        OutputFormat::Srt => SubtitleFormat::Srt,
+        OutputFormat::Vtt => SubtitleFormat::Vtt,
+        OutputFormat::Ass => SubtitleFormat::Ass,
+        OutputFormat::Ssa => SubtitleFormat::Ssa,
+        OutputFormat::Sbv => SubtitleFormat::Sbv,
+    }
 }
 
 /// Builds the [`ReviewFilters`] from `review list` args. A bad `--flag` or `--range`

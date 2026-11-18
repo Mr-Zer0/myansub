@@ -12,7 +12,7 @@ use super::db::StoreError;
 
 /// Migration scripts in order. Index `i` (0-based) upgrades the database to
 /// `user_version = i + 1`. Append new scripts here; never edit a released one.
-const MIGRATIONS: &[&str] = &[MIGRATION_1];
+const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2];
 
 /// The current schema version (highest migration applied by a fresh open).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -185,3 +185,82 @@ CREATE TABLE provider_cache (
   expires_at       TEXT NOT NULL
 );
 "#;
+
+/// Migration 2: output preferences on the `project` row (`docs/DATA_MODEL.md`
+/// §2). Both columns are nullable; a `NULL` means "no stored preference", so the
+/// export stage falls back to the format/path defaults (`docs/CLI.md` §3). These
+/// fill the output-preference gap deferred from M4-B. `ALTER TABLE ADD COLUMN` is
+/// append-only and never rewrites existing rows, so this migrates existing
+/// projects without data loss.
+const MIGRATION_2: &str = r#"
+ALTER TABLE project ADD COLUMN output_format TEXT;
+ALTER TABLE project ADD COLUMN output_path TEXT;
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AC: M7-B — migration 2 (`ALTER TABLE ADD COLUMN`) preserves the data of a
+    // project created under migration 1: existing project and cue rows and their
+    // prior columns survive, the new columns appear as NULL, and user_version → 2.
+    #[test]
+    fn migration_two_preserves_existing_v1_data() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Bring the database up to version 1 only, then populate it.
+        run_migrations_with(&mut conn, &[MIGRATION_1]).expect("apply migration 1");
+        let v1: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(v1, 1);
+
+        conn.execute(
+            "INSERT INTO project \
+             (id, source_path, source_hash, source_format, source_encoding, source_lang) \
+             VALUES (1, 'movie.en.srt', 'sha256:abc', 'srt', 'utf-8', 'en')",
+            [],
+        )
+        .expect("insert project");
+        conn.execute(
+            "INSERT INTO cues (idx, start_ms, end_ms, text_raw, text_masked, translatable) \
+             VALUES (1, 1000, 3000, 'Hello.', 'Hello.', 1)",
+            [],
+        )
+        .expect("insert cue");
+
+        // Apply the full migration set: version 1 is skipped, version 2 is applied.
+        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 2");
+        let v2: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(v2, 2);
+
+        // The pre-existing rows and their prior columns are intact.
+        let (path, hash, fmt): (String, String, String) = conn
+            .query_row(
+                "SELECT source_path, source_hash, source_format FROM project WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read project");
+        assert_eq!(path, "movie.en.srt");
+        assert_eq!(hash, "sha256:abc");
+        assert_eq!(fmt, "srt");
+        let cue_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cues", [], |row| row.get(0))
+            .expect("count cues");
+        assert_eq!(cue_count, 1);
+
+        // The new columns exist and default to NULL for the migrated row.
+        let (out_fmt, out_path): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT output_format, output_path FROM project WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read new columns");
+        assert_eq!(out_fmt, None);
+        assert_eq!(out_path, None);
+    }
+}

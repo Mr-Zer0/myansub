@@ -88,7 +88,10 @@ impl ExitCode for PipelineError {
             | PipelineError::GateViolation { .. }
             | PipelineError::FromDisagreement { .. }
             | PipelineError::Uninitialized { .. }
+            | PipelineError::IncompleteTranslation { .. }
             | PipelineError::MissingFromLanguage => exit::PRECONDITION,
+            // A format/extension disagreement is a usage error (exit 2).
+            PipelineError::OutputFormatExtensionMismatch { .. } => exit::USAGE,
             // A missing API key is a generic error (exit 1), not a precondition.
             PipelineError::MissingApiKey => exit::ERROR,
             PipelineError::ProjectResolution(err) => err.exit_code(),

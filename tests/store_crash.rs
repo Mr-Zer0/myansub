@@ -56,7 +56,7 @@ async fn fresh_open_sets_user_version_and_creates_all_tables() {
     let store = Store::open(&dir.path().join("project.db")).expect("open");
 
     assert_eq!(user_version(&store).await, SCHEMA_VERSION as i64);
-    assert_eq!(SCHEMA_VERSION, 1);
+    assert_eq!(SCHEMA_VERSION, 2);
 
     let tables = table_names(&store).await;
     for expected in EXPECTED_TABLES {
@@ -319,47 +319,97 @@ async fn panic_in_closure_poisons_lock_for_next_call() {
 #[tokio::test]
 async fn failing_migration_rolls_back_and_leaves_schema_consistent() {
     let store = Store::open_in_memory().expect("open in-memory");
-    // Fresh store is at version 1 (the real migration 1).
-    assert_eq!(user_version(&store).await, 1);
+    // Fresh store is at the current version (the real migrations 1 and 2).
+    assert_eq!(user_version(&store).await, 2);
 
-    // A migration set whose version-2 script creates one object then fails.
+    // A migration set whose version-3 script creates one object then fails.
     let err = store
         .call(|conn| {
             run_migrations_with(
                 conn,
                 &[
                     "-- v1 already applied; skipped",
-                    "CREATE TABLE migration_two_partial (x INTEGER); \
+                    "-- v2 already applied; skipped",
+                    "CREATE TABLE migration_three_partial (x INTEGER); \
                      CREATE TABLE this_is_not_valid_sql (;",
                 ],
             )
         })
         .await
         .expect_err("invalid migration script must error");
-    assert!(matches!(err, StoreError::Migration { version: 2, .. }));
+    assert!(matches!(err, StoreError::Migration { version: 3, .. }));
 
     // Rollback: version unchanged, and the partial table does not exist.
-    assert_eq!(user_version(&store).await, 1);
+    assert_eq!(user_version(&store).await, 2);
     assert!(
-        !object_exists(&store, "migration_two_partial").await,
+        !object_exists(&store, "migration_three_partial").await,
         "a rolled-back migration must leave no partial objects"
     );
 
-    // A subsequent valid migration to version 2 succeeds.
+    // A subsequent valid migration to version 3 succeeds.
     store
         .call(|conn| {
             run_migrations_with(
                 conn,
                 &[
                     "-- v1 already applied; skipped",
-                    "CREATE TABLE migration_two (x INTEGER);",
+                    "-- v2 already applied; skipped",
+                    "CREATE TABLE migration_three (x INTEGER);",
                 ],
             )
         })
         .await
         .expect("valid migration applies");
-    assert_eq!(user_version(&store).await, 2);
-    assert!(object_exists(&store, "migration_two").await);
+    assert_eq!(user_version(&store).await, 3);
+    assert!(object_exists(&store, "migration_three").await);
+}
+
+// AC: M7-B / docs/DATA_MODEL.md §2 — migration 2 adds the output-preference
+// columns; they round-trip through the repository and start NULL on a project
+// created before any preference was stored.
+#[tokio::test]
+async fn migration_two_output_prefs_round_trip() {
+    use myansub::store::repo_project::{
+        Project, get_output_prefs, insert_project, set_output_prefs,
+    };
+
+    let store = Store::open_in_memory().expect("open in-memory");
+    assert_eq!(user_version(&store).await, SCHEMA_VERSION as i64);
+
+    let project = Project {
+        source_path: "movie.en.srt".to_string(),
+        source_hash: "sha256:abc".to_string(),
+        source_format: "srt".to_string(),
+        source_encoding: "utf-8".to_string(),
+        encoding_confidence: None,
+        source_lang: "en".to_string(),
+        target_lang: "my".to_string(),
+        format_meta: None,
+    };
+    store
+        .call(move |conn| insert_project(conn, &project))
+        .await
+        .expect("insert project");
+
+    // A pre-existing project has no stored preferences.
+    let before = store
+        .call(|conn| get_output_prefs(conn))
+        .await
+        .expect("get prefs before");
+    assert_eq!(before, (None, None));
+
+    store
+        .call(|conn| set_output_prefs(conn, Some("vtt"), Some("out.vtt")))
+        .await
+        .expect("set prefs");
+    let after = store
+        .call(|conn| get_output_prefs(conn))
+        .await
+        .expect("get prefs after");
+    assert_eq!(
+        after,
+        (Some("vtt".to_string()), Some("out.vtt".to_string()))
+    );
 }
 
 async fn object_exists(store: &Store, name: &str) -> bool {
