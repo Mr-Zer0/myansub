@@ -30,6 +30,15 @@ tests/
 `Fake` holds a script: a queue of `(matcher, response | error)` and a call log.
 Tests assert both outputs and the exact sequence of requests (e.g. "batch 3 sent once").
 
+## 3a. Recording progress sink
+
+Progress (`ARCHITECTURE.md` §11, FR-11) is tested with a recording `Progress` double, not by scraping
+stderr: a `RecordingProgress` behind a `Mutex`/atomics captures the ordered events (`stage_start`,
+`stage_units`, per-unit `unit_finished` outcomes, `stage_finish`). Tests assert the event sequence and
+counts against the scheduler's `Summary` (total = runnable, tick count = total, Done/Failed split, and the
+remaining-only total on a resume). Production code paths pass `&NoopProgress` where a real renderer is not
+under test; `main`'s `StderrProgress` rendering (TTY vs plain, throttling) is not asserted here.
+
 ## 4. Crash and resume tests
 
 Simulate interruption by:

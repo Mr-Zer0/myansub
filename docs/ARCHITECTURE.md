@@ -73,6 +73,7 @@ src/
   pipeline/
     orchestrator.rs     # stage state machine, gates, `run`
     scheduler.rs        # generic bounded WorkUnit runner
+    progress.rs         # `trait Progress` sink + `NoopProgress` (rendered by main, §11)
     input.rs  analysis.rs  translation.rs  output.rs
   review/
     editor.rs           # export → $EDITOR → validate → import
@@ -88,6 +89,9 @@ main/cli ─► pipeline, review ─► llm, quality, store, formats ─► doma
 
 - `domain` depends on nothing in the crate.
 - Nothing depends on `pipeline` or `review`.
+- The `Progress` sink trait (`pipeline/progress.rs`, §11) is defined in `pipeline`; `main` implements it
+  (`StderrProgress`). So progress keeps the `main ─► pipeline` edge and never reverses it: `pipeline` and
+  the scheduler depend only on the trait, not on `main`/`cli`.
 - `quality` must not depend on `llm` or `store` (pure functions over domain types).
 - `llm` must not depend on `pipeline`. It may depend on `store` only inside `cache.rs` and
   `metered.rs`, through a narrow trait (`CacheStore`, `UsageSink`) defined in `llm`.
@@ -100,9 +104,13 @@ main/cli ─► pipeline, review ─► llm, quality, store, formats ─► doma
 - Optionally runs the first unit alone (cache warm-up), then fans out.
 - Honors a `CancellationToken`: stops dispatching, waits `grace_secs`, returns.
 - Reports a summary (done / failed / cancelled).
+- Reports **live progress** to an injected `&dyn Progress` (§11): the runnable `total` once known,
+  then one tick per finished unit. Progress is observe-only and never affects the `Summary` or
+  cancellation (ADR-046).
 
 **orchestrator.rs** — Owns stage transitions and gate checks. Builds the units for a stage
-and hands them to the scheduler. Implements `run`.
+and hands them to the scheduler. Implements `run`. Brackets each executable stage with
+`Progress` stage-start/finish events (§11) so a `run` shows analysis → translation → export distinctly.
 
 **retry.rs** — Transport retries only (see `LLM.md` §6). Content retries (validation
 failures) live in `pipeline/translation.rs` and `pipeline/analysis.rs`. Never share a counter.
@@ -192,3 +200,35 @@ Dev-dependencies (approved): `tempfile`, `wiremock`.
 Note: `subtitler` versions 0.0.x are an unrelated older codebase. Always use 2.x.
 Do not add `native-tls`, `openssl`, `chrono`, `async-trait`, or `rand`. Backoff jitter uses
 a small local xorshift seeded from the system clock.
+
+No progress-bar/spinner crate (`indicatif` et al.) is approved: progress (§11) is hand-rolled on `std`
+(stderr writes, `std::time::Instant`, `std::io::IsTerminal`).
+
+## 11. Progress reporting (ADR-046)
+
+The long-running stages (`analyze`, `translate`, and both inside `run`) report live progress so an
+operator can see work advancing. Logging (§9) stays the structured, `RUST_LOG`-controlled channel;
+progress is a separate, human-facing display.
+
+- **Seam.** `pipeline/progress.rs` defines `trait Progress: Send + Sync` and a zero-cost `NoopProgress`.
+  The trait carries stage lifecycle + per-unit events, e.g.:
+  - `stage_start(stage, planned)` — a stage's unit work is about to run (`planned` = batches/chunks, if known).
+  - `stage_units(total)` — the scheduler's runnable total (after skipping already-`done` units on a resume).
+  - `unit_finished(outcome)` — one unit completed (`Done`/`Failed`), called from the unit's task.
+  - `stage_finish(summary)` — the stage's units finished; carries the `Summary` (done/failed/cancelled).
+  The scheduler takes `progress: &dyn Progress`; `run_analysis`/`run_translation`/`orchestrator::run`
+  thread it down and emit the stage boundaries. Tests pass `&NoopProgress`.
+
+- **Rendering (main only).** `main` owns `StderrProgress`. It keeps counters + a start `Instant` behind a
+  `Mutex`, and writes to **stderr** (never stdout — see the channel split below). It never calls into
+  `store`/`llm`, never holds its lock across an `.await`, and ignores stderr write errors, so it cannot
+  stall or abort a unit.
+
+- **Default + modes (ADR-046(d)).** On by default; the global `--no-progress` flag selects `NoopProgress`.
+  `StderrProgress` renders an in-place carriage-return line (label · `done/total` · percent · elapsed)
+  only when `stderr` is a TTY and verbosity is default; under a pipe/CI or raised logging (`-v`/`RUST_LOG`)
+  it prints throttled plain lines instead. Renders are throttled; stage finish terminates the line with a
+  newline so it never collides with the stdout outcome line. `--dry-run` runs no units, so it is silent.
+
+- **Channel split.** Progress → stderr; the final outcome line, dry-run estimate, and `status` report →
+  stdout. Cancellation is unaffected (observe-only; a post-grace tick is dropped), so Ctrl-C still exits 130.

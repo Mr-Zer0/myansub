@@ -127,6 +127,25 @@ gives a clear error with the key name.
 - Tune `quality` thresholds and `estimate` byte ratios from real usage.
 - Record chosen defaults in `DECISIONS.md`.
 
+## M10 — Live progress reporting
+
+- `pipeline/progress.rs`: `trait Progress` + `NoopProgress` (ADR-046, `ARCHITECTURE.md` §11).
+- `scheduler::run` reports the runnable total and one tick per finished unit through an injected
+  `&dyn Progress`; `run_analysis`/`run_translation`/`orchestrator::run(_confirmed)` thread it down and
+  emit stage-start/finish events. Existing scheduler/pipeline tests pass `&NoopProgress`.
+- `main`: `StderrProgress` renderer (in-place line on a TTY at default verbosity; throttled plain lines
+  otherwise) on stderr; global `--no-progress` flag; `--dry-run` stays silent.
+
+**Accept:**
+- A recording fake `Progress` (test double) observes, for a fake-transport `analyze`/`translate`/`run`:
+  the stage-start, a `stage_units(total)` equal to the runnable count, exactly `total` `unit_finished`
+  ticks with the right `Done`/`Failed` split, and a `stage_finish` whose summary matches the scheduler's.
+- Resume: after some units are already `done`, the reported total equals only the remaining units.
+- `--no-progress` yields zero `Progress` calls (NoopProgress) and unchanged stdout/exit code.
+- Progress goes to stderr only: stdout for a run is byte-identical with and without a TTY (progress never
+  leaks into stdout); the outcome line is unchanged.
+- Cancellation mid-stage still exits 130 and a post-grace tick is dropped (no panic, no double count).
+
 ## Later (not v1)
 
 TXT support, Batch API mode, series projects with cross-episode memory, other target
