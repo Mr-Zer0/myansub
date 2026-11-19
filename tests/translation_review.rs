@@ -423,6 +423,7 @@ async fn set_locks_cue_and_redo_preserves_it() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("redo");
@@ -942,6 +943,7 @@ async fn genuinely_failed_batch_opens_review_and_lists_failed_cue() {
         &params(1),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");

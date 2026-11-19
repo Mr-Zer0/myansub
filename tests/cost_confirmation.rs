@@ -336,6 +336,7 @@ async fn analyze_refuses_without_tty_or_yes() {
         &token,
         &PriceTable::new(),
         settings(0.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("refusal");
@@ -365,6 +366,7 @@ async fn analyze_with_yes_proceeds() {
         &token,
         &PriceTable::new(),
         settings(0.0, false, true),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -393,6 +395,7 @@ async fn analyze_below_threshold_proceeds_silently() {
         &token,
         &priced(),
         settings(1000.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -425,6 +428,7 @@ async fn translate_refuses_without_tty_or_yes() {
         &token,
         &PriceTable::new(),
         settings(0.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("refusal");
@@ -450,6 +454,7 @@ async fn translate_with_yes_proceeds() {
         &token,
         &PriceTable::new(),
         settings(0.0, false, true),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -479,6 +484,7 @@ async fn store_with_stale_cues() -> Store {
         &translation_params(),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("first pass");
@@ -522,6 +528,7 @@ async fn translate_stale_refuses_without_tty_or_yes() {
         &token,
         &PriceTable::new(),
         settings(0.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("refusal");
@@ -553,6 +560,7 @@ async fn translate_stale_with_yes_retranslates_stale_cues() {
         &token,
         &PriceTable::new(),
         settings(0.0, false, true),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("stale run");
@@ -584,6 +592,7 @@ async fn confirmed_run_matches_direct_run() {
         &analysis_params(),
         AnalysisFlags::default(),
         &CancellationToken::new(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("direct");
@@ -598,6 +607,7 @@ async fn confirmed_run_matches_direct_run() {
         &CancellationToken::new(),
         &PriceTable::new(),
         settings(0.0, false, true),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("gated");
@@ -684,6 +694,7 @@ async fn scattered_stale_store() -> Store {
         &batch2_params(),
         TranslationFlags::default(),
         &CancellationToken::new(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("first pass");
@@ -798,6 +809,7 @@ async fn stale_wiring_uses_scoped_estimate_not_full_project() {
         &CancellationToken::new(),
         &priced(),
         settings(threshold, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("scoped estimate under threshold proceeds");

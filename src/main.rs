@@ -47,8 +47,14 @@ use myansub::review::translation::{
 };
 use myansub::store::repo_project::get_project;
 use myansub::store::{StageStatus, Store, repo_llm};
+use std::sync::Arc;
+
+use myansub::pipeline::progress::{NoopProgress, Progress};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+mod progress_render;
+use progress_render::StderrProgress;
 
 fn main() {
     // Missing `.env` is not an error (docs/CONFIG.md §1).
@@ -113,6 +119,27 @@ fn confirm_settings(cli: &Cli, config: &Config) -> ConfirmSettings {
         confirm_above_usd: config.llm.confirm_above_usd,
         interactive: std::io::stdin().is_terminal(),
         yes: cli.yes,
+    }
+}
+
+/// Builds the live-progress sink for a token-spending command (`docs/CLI.md` §8,
+/// ADR-046(d)). `--no-progress` and `--dry-run` select the zero-cost [`NoopProgress`]
+/// (a dry run executes no units, so it is silent). Otherwise the stderr renderer draws
+/// an in-place line only when stderr is a terminal AND verbosity is default (no
+/// `-v`/`-vv` and no `RUST_LOG` override — raised logging would clobber an in-place
+/// line, so it degrades to throttled plain lines).
+fn build_progress(cli: &Cli, dry_run: bool) -> Arc<dyn Progress> {
+    let mode = progress_render::decide_mode(
+        cli.no_progress,
+        dry_run,
+        std::io::stderr().is_terminal(),
+        cli.verbose,
+        std::env::var_os("RUST_LOG").is_some(),
+    );
+    match mode {
+        progress_render::ProgressMode::Off => Arc::new(NoopProgress),
+        progress_render::ProgressMode::Live => Arc::new(StderrProgress::new(true)),
+        progress_render::ProgressMode::Plain => Arc::new(StderrProgress::new(false)),
     }
 }
 
@@ -236,6 +263,7 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
                 &token,
                 &mut run_report,
                 settings,
+                build_progress(cli, true),
             )
             .await
         } else {
@@ -249,6 +277,7 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
                 &token,
                 &mut run_report,
                 settings,
+                build_progress(cli, false),
             )
             .await
         }
@@ -499,6 +528,8 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
         // once the gate is cleared, so a refusal exits 3 without requiring a key.
         let prices = PriceTable::from_config(&config.pricing);
         let settings = confirm_settings(cli, &config);
+        // Live progress on stderr (`docs/CLI.md` §8); the dry-run path returned above.
+        let progress = build_progress(cli, false);
         let confirmed = run_analysis_confirmed(
             || build_gemini(&config),
             &store,
@@ -508,6 +539,7 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
             &token,
             &prices,
             settings,
+            progress,
         )
         .await?;
         match confirmed {
@@ -593,6 +625,8 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
         // once the gate is cleared, so a refusal exits 3 without requiring a key.
         let prices = PriceTable::from_config(&config.pricing);
         let settings = confirm_settings(cli, &config);
+        // Live progress on stderr (`docs/CLI.md` §8); the dry-run path returned above.
+        let progress = build_progress(cli, false);
         let confirmed = run_translation_confirmed(
             || build_gemini(&config),
             &store,
@@ -602,6 +636,7 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
             &token,
             &prices,
             settings,
+            progress,
         )
         .await?;
         match confirmed {

@@ -82,6 +82,7 @@ async fn init_only(project_dir: &std::path::Path, source: &std::path::Path) {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("initialize project");
@@ -300,6 +301,7 @@ async fn run_fresh_file_executes_analysis_and_stops_at_review_gate() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run fresh");
@@ -340,6 +342,7 @@ async fn run_resumes_existing_project_and_stops_at_review_gate() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("initial run");
@@ -367,6 +370,7 @@ async fn run_resumes_existing_project_and_stops_at_review_gate() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("resume run");
@@ -404,6 +408,7 @@ async fn run_from_disagreement_is_exit_3() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("initial run with --from ja");
@@ -422,6 +427,7 @@ async fn run_from_disagreement_is_exit_3() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("disagreeing --from must be refused");
@@ -456,6 +462,7 @@ async fn run_changed_source_is_exit_3_pointing_to_force() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("initial run");
@@ -480,6 +487,7 @@ async fn run_changed_source_is_exit_3_pointing_to_force() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("changed source must be refused");
@@ -519,6 +527,7 @@ async fn run_empty_db_without_from_is_helpful_exit_3() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("uninitialized db without --from must be refused");
@@ -555,6 +564,7 @@ async fn run_with_cancelled_token_is_interrupted() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run with cancelled token");

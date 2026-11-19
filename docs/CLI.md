@@ -10,6 +10,7 @@ Binary name: `myansub`.
 | `-c, --config <FILE>` | Extra config file, highest file precedence |
 | `-v` / `-vv` | Raise log level (overridden by `RUST_LOG`) |
 | `--yes` | Answer yes to cost and destructive-action confirmations |
+| `--no-progress` | Suppress the live progress display (§8) |
 
 ## 2. Project resolution
 
@@ -129,3 +130,20 @@ myansub run movie.ja.srt --from ja --auto-approve all --yes
 | 3 | Precondition not met (gate not approved, source changed, ambiguous project, confirmation needed without TTY) |
 | 4 | Completed with failed units (see `status`) |
 | 130 | Interrupted (Ctrl-C) |
+
+## 8. Progress output
+
+`analyze`, `translate`, and `run` show live progress while the analysis chunks / translation batches run
+(ADR-046, `ARCHITECTURE.md` §11). It answers "is it working, and how far along?" during the minutes a stage
+can take.
+
+- **Where.** Progress is written to **stderr**. The final outcome line, `--dry-run` estimates, and the
+  `status` report stay on **stdout**, so piping stdout to a file or a parser is unaffected by progress.
+- **On by default.** On an interactive terminal a single line updates in place, e.g.
+  `translating  8/12 batches · 67% · 0m42s`. For `run` the stage is named (analysis → translation → export).
+  On a resume, already-done units are not recounted, so the total reflects remaining work.
+- **Non-TTY / raised logging.** When stderr is not a terminal (pipe, CI) or `-v`/`-vv`/`RUST_LOG` raise the
+  log level, progress degrades to throttled plain lines (`translation: 8/12 batches done`) instead of an
+  in-place line.
+- **Off.** `--no-progress` suppresses it entirely. `--dry-run` shows no progress (it runs no units).
+- Progress never changes exit codes, and Ctrl-C still stops promptly and exits 130.

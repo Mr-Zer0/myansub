@@ -83,6 +83,15 @@ may edit translations using exported review files.
 ### FR-10 Status
 - `status` shows stage states, batch progress, failures, flags, and usage.
 
+### FR-11 Live progress
+- `analyze`, `translate`, and `run` show live progress while the analysis chunks / translation batches
+  run, so the operator can see work is advancing and how far along it is (`CLI.md` §8, `ARCHITECTURE.md`
+  §11).
+- Progress is written to stderr; the final outcome line, dry-run estimates, and `status` stay on stdout.
+- On by default; an interactive terminal updates a single line in place, non-TTY/raised-logging prints
+  periodic plain lines, and `--no-progress` (or `--dry-run`) suppresses it. Progress never changes exit
+  codes or crash-safety.
+
 ## 5. Non-functional requirements
 
 | ID | Requirement |
@@ -91,7 +100,7 @@ may edit translations using exported review files.
 | NFR-2 Resumability | Re-running any command continues from where it stopped. Completed work is never redone. |
 | NFR-3 Graceful stop | Ctrl-C stops dispatching new work, waits a short grace period, and exits with code 130. |
 | NFR-4 Cost | Defaults minimize LLM spend (see `LLM.md` §5). |
-| NFR-5 Observability | Structured `tracing` logs, controllable via `RUST_LOG`. Sensitive text only at `trace`. |
+| NFR-5 Observability | Structured `tracing` logs, controllable via `RUST_LOG`. Sensitive text only at `trace`. Live progress (FR-11) is a separate human-facing channel on stderr, independent of the log level. |
 | NFR-6 Portability | Builds and runs on Linux, macOS, and Windows. No native TLS (rustls only). |
 | NFR-7 Testability | Full pipeline testable offline with a fake LLM transport. |
 

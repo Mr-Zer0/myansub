@@ -24,7 +24,9 @@ use myansub::pipeline::analysis::{
     worst_case_doc_tokens,
 };
 use myansub::pipeline::input::run_input;
+use myansub::pipeline::progress::{Progress, ProgressStage};
 use myansub::pipeline::scheduler::SchedulerConfig;
+use myansub::pipeline::scheduler::{Summary, UnitOutcome};
 use myansub::store::repo_analysis::get_analysis_version;
 use myansub::store::repo_project::set_stage;
 use myansub::store::repo_units::{
@@ -32,10 +34,59 @@ use myansub::store::repo_units::{
     create_analysis_chunk,
 };
 use myansub::store::{Stage, StageStatus, Store, UnitStatus};
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
 const MODEL: &str = "gemini-flash-latest";
+
+/// A recording [`Progress`] double (`docs/TESTING.md` §3a) capturing the ordered
+/// events so an e2e test can assert the stage lifecycle and tick counts.
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<ProgEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgEvent {
+    StageStart(ProgressStage),
+    StageUnits(usize),
+    UnitFinished(UnitOutcome),
+    StageFinish(Summary),
+}
+
+impl RecordingProgress {
+    fn events(&self) -> Vec<ProgEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+}
+
+impl Progress for RecordingProgress {
+    fn stage_start(&self, stage: ProgressStage) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageStart(stage));
+    }
+    fn stage_units(&self, total: usize) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageUnits(total));
+    }
+    fn unit_finished(&self, outcome: UnitOutcome) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::UnitFinished(outcome));
+    }
+    fn stage_finish(&self, summary: Summary) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageFinish(summary));
+    }
+}
 
 /// A full, schema-valid analysis document (passes `validate_full`).
 const VALID: &str = r#"{"schema_version":1,"premise":"A traveller arrives at dawn.","tone":"calm",
@@ -166,6 +217,7 @@ async fn single_pass_stores_version_one_with_provenance() {
         &params(),
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -200,6 +252,7 @@ async fn rerun_is_noop_without_redo_and_redo_mints_a_new_version() {
         &params(),
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("first run");
@@ -213,6 +266,7 @@ async fn rerun_is_noop_without_redo_and_redo_mints_a_new_version() {
         &params(),
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("second run");
@@ -234,6 +288,7 @@ async fn rerun_is_noop_without_redo_and_redo_mints_a_new_version() {
             retry_failed: false,
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("redo run");
@@ -269,6 +324,7 @@ async fn redo_with_different_model_calls_the_transport() {
         &params(),
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("first run");
@@ -286,6 +342,7 @@ async fn redo_with_different_model_calls_the_transport() {
             retry_failed: false,
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("redo run");
@@ -325,6 +382,7 @@ async fn content_retry_succeeds_after_one_invalid_response() {
         &params(),
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -353,6 +411,7 @@ async fn content_retry_exhaustion_fails_the_unit_exit_4() {
         &p,
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -403,6 +462,7 @@ async fn map_reduce_resumes_after_crash_with_no_duplicate_map_calls() {
             &p,
             AnalysisFlags::default(),
             &token1,
+            std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
         )
         .await
         .expect("run 1");
@@ -426,6 +486,7 @@ async fn map_reduce_resumes_after_crash_with_no_duplicate_map_calls() {
             &p,
             AnalysisFlags::default(),
             &token2,
+            std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
         )
         .await
         .expect("run 2");
@@ -594,6 +655,7 @@ async fn single_pass_request_carries_the_generous_output_budget() {
         &params(),
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -634,6 +696,7 @@ async fn retry_failed_reruns_only_the_failed_chunk() {
         &p,
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -654,6 +717,7 @@ async fn retry_failed_reruns_only_the_failed_chunk() {
             retry_failed: true,
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -719,6 +783,7 @@ async fn tier_override_reaches_the_request() {
         &p,
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -884,6 +949,7 @@ async fn interrupted_in_flight_chunk_is_recovered_and_resent() {
         &p,
         AnalysisFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("rerun");
@@ -914,4 +980,147 @@ async fn interrupted_in_flight_chunk_is_recovered_and_resent() {
         .await
         .expect("count");
     assert_eq!(done, 2);
+}
+
+// ---------------------------------------------------------------------------
+// M10: live progress lifecycle for `analyze`
+// ---------------------------------------------------------------------------
+
+// AC: M10 — a single-pass analyze reports the stage lifecycle to the sink: a
+// stage_start, stage_units(1), exactly one Done tick, and a stage_finish whose
+// summary matches the one unit of work.
+#[tokio::test]
+async fn single_pass_analyze_reports_progress_lifecycle() {
+    let store = Store::open_in_memory().expect("open");
+    let fake = Fake::new().push_response(response(VALID));
+    let token = CancellationToken::new();
+    let progress = Arc::new(RecordingProgress::default());
+
+    let outcome = run_analysis(
+        fake.clone(),
+        &store,
+        &cues(),
+        &params(),
+        AnalysisFlags::default(),
+        &token,
+        progress.clone(),
+    )
+    .await
+    .expect("run");
+    assert_eq!(outcome, AnalysisOutcome::Completed { version: 1 });
+
+    let events = progress.events();
+    assert_eq!(
+        events,
+        vec![
+            ProgEvent::StageStart(ProgressStage::Analysis),
+            ProgEvent::StageUnits(1),
+            ProgEvent::UnitFinished(UnitOutcome::Done),
+            ProgEvent::StageFinish(Summary {
+                done: 1,
+                failed: 0,
+                cancelled: 0,
+            }),
+        ],
+    );
+}
+
+// AC: M10 — a map-reduce analyze (three chunks) reports stage_units(3), exactly three
+// Done ticks, and a stage_finish whose summary matches the scheduler's over the map
+// chunks.
+#[tokio::test]
+async fn map_reduce_analyze_reports_progress_lifecycle() {
+    let store = Store::open_in_memory().expect("open");
+    // 3 chunk map calls + 1 reduce call (chunk_cues 2 over 5 cues → 3 chunks).
+    let fake = Fake::new()
+        .push_response(response(PARTIAL))
+        .push_response(response(PARTIAL))
+        .push_response(response(PARTIAL))
+        .push_response(response(VALID));
+    let token = CancellationToken::new();
+    let progress = Arc::new(RecordingProgress::default());
+
+    let outcome = run_analysis(
+        fake.clone(),
+        &store,
+        &cues(),
+        &map_reduce_params(),
+        AnalysisFlags::default(),
+        &token,
+        progress.clone(),
+    )
+    .await
+    .expect("run");
+    assert_eq!(outcome, AnalysisOutcome::Completed { version: 1 });
+
+    let events = progress.events();
+    assert_eq!(
+        events.first(),
+        Some(&ProgEvent::StageStart(ProgressStage::Analysis))
+    );
+    assert!(
+        events.contains(&ProgEvent::StageUnits(3)),
+        "runnable total is the three map chunks: {events:?}"
+    );
+    let ticks = events
+        .iter()
+        .filter(|e| matches!(e, ProgEvent::UnitFinished(UnitOutcome::Done)))
+        .count();
+    assert_eq!(ticks, 3, "one Done tick per map chunk");
+    assert_eq!(
+        events.last(),
+        Some(&ProgEvent::StageFinish(Summary {
+            done: 3,
+            failed: 0,
+            cancelled: 0,
+        })),
+        "stage_finish carries the map scheduler's summary"
+    );
+}
+
+// AC: M10 (reliability #1) — a single-pass analyze that does NOT succeed still emits a
+// terminating stage_finish, so the renderer's in-place line is always closed before
+// any error/outcome text reaches stderr. Here the model keeps returning unparseable
+// text, so content retries exhaust (CompletedWithFailures). This exercises the
+// single-finish-point guarantee on a non-Valid path; the `store_version` DB-error path
+// is the same code path but is not injectable through this fake-transport harness, so
+// it is covered by the function's single-finish-point structure (audited), not a test.
+#[tokio::test]
+async fn single_pass_failure_still_finishes_the_stage() {
+    let store = Store::open_in_memory().expect("open");
+    let fake = Fake::new().always(|| Ok(response(INVALID)));
+    let token = CancellationToken::new();
+    let progress = Arc::new(RecordingProgress::default());
+
+    let outcome = run_analysis(
+        fake,
+        &store,
+        &cues(),
+        &params(), // single-pass (huge single_pass_max_tokens)
+        AnalysisFlags::default(),
+        &token,
+        progress.clone(),
+    )
+    .await
+    .expect("run");
+    assert_eq!(
+        outcome,
+        AnalysisOutcome::CompletedWithFailures { failed: 1 }
+    );
+
+    let events = progress.events();
+    assert_eq!(
+        events,
+        vec![
+            ProgEvent::StageStart(ProgressStage::Analysis),
+            ProgEvent::StageUnits(1),
+            ProgEvent::UnitFinished(UnitOutcome::Failed),
+            ProgEvent::StageFinish(Summary {
+                done: 0,
+                failed: 1,
+                cancelled: 0,
+            }),
+        ],
+        "a failed single-pass still ends with a terminating stage_finish",
+    );
 }

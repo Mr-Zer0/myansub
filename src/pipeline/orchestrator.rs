@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -49,6 +50,7 @@ use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
 use super::error::PipelineError;
 use super::input::{check_source_unchanged, run_input};
 use super::output::{ResolvedOutput, resolve_output_target, run_output, stored_output_prefs};
+use super::progress::Progress;
 use super::scheduler::SchedulerConfig;
 use super::translation::{
     TranslationFlags, TranslationOutcome, TranslationParams, run_translation,
@@ -328,12 +330,14 @@ pub enum RunOutcome {
 /// the suspect-cue count when the translation gate is auto-approved, and the
 /// `--dry-run` token/cost estimate. It is left at [`RunReport::default`] (all `None`)
 /// when neither applies.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<T>(
     transport: T,
     req: RunRequest<'_>,
     config: &Config,
     token: &CancellationToken,
     report: &mut RunReport,
+    progress: Arc<dyn Progress>,
 ) -> Result<RunOutcome, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
@@ -382,6 +386,7 @@ where
                     &params,
                     AnalysisFlags::default(),
                     token,
+                    progress.clone(),
                 )
                 .await?;
                 match outcome {
@@ -419,6 +424,7 @@ where
                     &params,
                     TranslationFlags::default(),
                     token,
+                    progress.clone(),
                 )
                 .await?;
                 match outcome {
@@ -694,6 +700,7 @@ async fn estimate_translation_stage(
 /// without spending or requiring a key. `--dry-run` never prompts (it only estimates,
 /// via `run`). `--auto-approve` does **not** imply `--yes`: the cost gate still
 /// applies to an auto-approving run (`docs/CLI.md` §4).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_confirmed<T, MK>(
     make_transport: MK,
     mut req: RunRequest<'_>,
@@ -701,6 +708,7 @@ pub async fn run_confirmed<T, MK>(
     token: &CancellationToken,
     report: &mut RunReport,
     settings: ConfirmSettings,
+    progress: Arc<dyn Progress>,
 ) -> Result<ConfirmedRun<RunOutcome>, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
@@ -717,7 +725,7 @@ where
     if req.options.dry_run {
         let transport = make_transport()?;
         return Ok(ConfirmedRun::Ran(
-            run(transport, req, config, token, report).await?,
+            run(transport, req, config, token, report, progress).await?,
         ));
     }
 
@@ -736,7 +744,7 @@ where
     };
 
     confirm::gate(estimate, settings, make_transport, |transport| {
-        run(transport, req, config, token, report)
+        run(transport, req, config, token, report, progress)
     })
     .await
 }

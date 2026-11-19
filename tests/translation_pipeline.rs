@@ -16,7 +16,9 @@ use myansub::llm::dry_run::Estimator;
 use myansub::llm::fake::Fake;
 use myansub::llm::pricing::{Cost, ModelPrice, PriceTable};
 use myansub::llm::retry::RetryConfig;
+use myansub::pipeline::progress::{Progress, ProgressStage};
 use myansub::pipeline::scheduler::SchedulerConfig;
+use myansub::pipeline::scheduler::{Summary, UnitOutcome};
 use myansub::pipeline::translation::{
     TranslationFlags, TranslationOutcome, TranslationParams, dry_run_translation, run_translation,
     translation_exit_code,
@@ -35,10 +37,59 @@ use myansub::store::repo_units::{
     count_translation_batches_by_status, create_translation_batch, get_translation_batch,
 };
 use myansub::store::{Stage, StageStatus, Store, UnitStatus};
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
 const MODEL: &str = "gemini-flash-latest";
+
+/// A recording [`Progress`] double (`docs/TESTING.md` §3a) capturing the ordered
+/// events so an e2e test can assert the stage lifecycle and tick counts.
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<ProgEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgEvent {
+    StageStart(ProgressStage),
+    StageUnits(usize),
+    UnitFinished(UnitOutcome),
+    StageFinish(Summary),
+}
+
+impl RecordingProgress {
+    fn events(&self) -> Vec<ProgEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+}
+
+impl Progress for RecordingProgress {
+    fn stage_start(&self, stage: ProgressStage) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageStart(stage));
+    }
+    fn stage_units(&self, total: usize) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageUnits(total));
+    }
+    fn unit_finished(&self, outcome: UnitOutcome) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::UnitFinished(outcome));
+    }
+    fn stage_finish(&self, summary: Summary) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageFinish(summary));
+    }
+}
 const MM: &str = "မင်္ဂလာပါ"; // Burmese, so `untranslated` never fires
 
 /// An approved analysis document whose single scene covers the whole cue range and
@@ -218,6 +269,7 @@ async fn end_to_end_translates_every_batch_once() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -316,6 +368,7 @@ async fn kill_between_batches_sends_no_batch_twice() {
             &params(1),
             TranslationFlags::default(),
             &token1,
+            std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
         )
         .await
         .expect("run 1");
@@ -335,6 +388,7 @@ async fn kill_between_batches_sends_no_batch_twice() {
             &params(1),
             TranslationFlags::default(),
             &token2,
+            std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
         )
         .await
         .expect("run 2");
@@ -383,6 +437,7 @@ async fn done_batches_are_not_resent_on_rerun() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -405,6 +460,7 @@ async fn done_batches_are_not_resent_on_rerun() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -438,6 +494,7 @@ async fn batch_planning_context_and_speaker_prefix() {
         &p,
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -505,6 +562,7 @@ async fn cached_prefix_is_stable_across_batches() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -548,6 +606,7 @@ async fn hard_flag_drives_tier3_retry_then_stored_flagged() {
         &params(80),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -600,6 +659,7 @@ async fn whole_batch_content_retry_then_success() {
         &params(80),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -631,6 +691,7 @@ async fn content_retry_exhaustion_fails_the_batch_exit_4() {
         &params(80),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -681,6 +742,7 @@ async fn omitted_batch_cue_id_fails_the_batch() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -736,6 +798,7 @@ async fn empty_lines_response_fails_the_batch() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -868,6 +931,7 @@ async fn interrupted_in_flight_batch_is_recovered_and_resent() {
         &params(1),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("rerun");
@@ -915,6 +979,7 @@ async fn no_translatable_cues_is_nothing_to_do() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -952,6 +1017,7 @@ async fn redo_retranslates_unlocked_and_preserves_locked() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -997,6 +1063,7 @@ async fn redo_retranslates_unlocked_and_preserves_locked() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("redo rerun");
@@ -1053,6 +1120,7 @@ async fn uneven_final_batch_is_planned() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -1190,6 +1258,7 @@ async fn partial_ids_re_request_only_missing_ids() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -1256,6 +1325,7 @@ async fn one_failed_batch_does_not_block_others_exit_4() {
         &params(1),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -1335,6 +1405,7 @@ async fn tier3_retry_fixes_hard_flag_and_stores_clean() {
         &params(80),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -1386,6 +1457,7 @@ async fn soft_flag_only_cue_is_not_retried() {
         &params(80),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -1442,6 +1514,7 @@ async fn retry_failed_reruns_only_the_failed_batch() {
         &params(1),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -1465,6 +1538,7 @@ async fn retry_failed_reruns_only_the_failed_batch() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -1532,6 +1606,7 @@ async fn stale_reruns_only_stale_unlocked_batch() {
         &params(1),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -1594,6 +1669,7 @@ async fn stale_reruns_only_stale_unlocked_batch() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -1652,6 +1728,7 @@ async fn stale_re_requests_only_stale_cues_in_a_mixed_batch() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -1700,6 +1777,7 @@ async fn stale_re_requests_only_stale_cues_in_a_mixed_batch() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -1757,6 +1835,7 @@ async fn stale_and_retry_failed_rerun_both_batches() {
         &params(1),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -1809,6 +1888,7 @@ async fn stale_and_retry_failed_rerun_both_batches() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -1899,6 +1979,7 @@ async fn interrupt_during_multi_call_batch_commits_nothing_and_recovers() {
         &params(2),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run");
@@ -1935,4 +2016,166 @@ async fn interrupt_during_multi_call_batch_commits_nothing_and_recovers() {
         .await
         .expect("count");
     assert_eq!(in_flight, 0, "no batch left in_flight after recovery");
+}
+
+// ---------------------------------------------------------------------------
+// M10: live progress lifecycle for `translate`
+// ---------------------------------------------------------------------------
+
+// AC: M10 — a two-batch translate reports the full stage lifecycle to the sink: a
+// stage_start, stage_units(2), exactly two Done ticks, and a stage_finish whose
+// summary matches the scheduler's.
+#[tokio::test]
+async fn translate_reports_progress_lifecycle() {
+    let cues = mixed_cues();
+    let store = seed(&cues).await;
+    let fake = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (4, MM), (5, MM)])));
+    let token = CancellationToken::new();
+    let progress = Arc::new(RecordingProgress::default());
+
+    // translatable = [1,2,4,5]; batch_size 2 → 2 batches.
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(2),
+        TranslationFlags::default(),
+        &token,
+        progress.clone(),
+    )
+    .await
+    .expect("run");
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 2 });
+
+    let events = progress.events();
+    assert_eq!(
+        events.first(),
+        Some(&ProgEvent::StageStart(ProgressStage::Translation))
+    );
+    assert!(
+        events.contains(&ProgEvent::StageUnits(2)),
+        "runnable total equals the two batches: {events:?}"
+    );
+    let ticks = events
+        .iter()
+        .filter(|e| matches!(e, ProgEvent::UnitFinished(UnitOutcome::Done)))
+        .count();
+    assert_eq!(ticks, 2, "one Done tick per batch");
+    assert_eq!(
+        events.last(),
+        Some(&ProgEvent::StageFinish(Summary {
+            done: 2,
+            failed: 0,
+            cancelled: 0,
+        })),
+        "stage_finish carries the scheduler's summary"
+    );
+}
+
+// AC: M10 (resume) — after one batch is already `done`, a rerun reports only the
+// remaining batch as the runnable total and ticks exactly once.
+#[tokio::test]
+async fn translate_resume_reports_only_remaining_batch() {
+    let cues = mixed_cues();
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+
+    // First run with batch_size 1 (four batches), cancelled after two complete.
+    let fake1 = Fake::new()
+        .always(|| Ok(lines_response(&[(1, MM), (2, MM), (4, MM), (5, MM)])))
+        .cancel_after(token.clone(), 2);
+    let _ = run_translation(
+        fake1,
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await
+    .expect("run 1");
+
+    // Resume: the two done batches are skipped, so only the two remaining are runnable.
+    let token2 = CancellationToken::new();
+    let fake2 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (4, MM), (5, MM)])));
+    let progress = Arc::new(RecordingProgress::default());
+    let outcome = run_translation(
+        fake2,
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token2,
+        progress.clone(),
+    )
+    .await
+    .expect("run 2");
+    assert_eq!(outcome, TranslationOutcome::Completed { batches: 4 });
+
+    let events = progress.events();
+    let total = events.iter().find_map(|e| match e {
+        ProgEvent::StageUnits(n) => Some(*n),
+        _ => None,
+    });
+    assert_eq!(
+        total,
+        Some(2),
+        "only the two remaining batches are runnable"
+    );
+    let ticks = events
+        .iter()
+        .filter(|e| matches!(e, ProgEvent::UnitFinished(_)))
+        .count();
+    assert_eq!(ticks, 2, "exactly the remaining batches tick");
+}
+
+// AC: M10 (`--no-progress`) — the production no-op sink (`NoopProgress`, what
+// `--no-progress` selects) leaves the outcome and exit code byte-identical to an
+// observed run: progress is purely observational.
+#[tokio::test]
+async fn noop_progress_leaves_outcome_and_exit_code_unchanged() {
+    let cues = mixed_cues();
+
+    // Observed run (RecordingProgress) on its own fresh store.
+    let store_a = seed(&cues).await;
+    let fake_a = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (4, MM), (5, MM)])));
+    let token_a = CancellationToken::new();
+    let observed = run_translation(
+        fake_a,
+        &store_a,
+        &cues,
+        &params(2),
+        TranslationFlags::default(),
+        &token_a,
+        Arc::new(RecordingProgress::default()),
+    )
+    .await
+    .expect("observed run");
+
+    // No-op run on an independent fresh store.
+    let store_b = seed(&cues).await;
+    let fake_b = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (4, MM), (5, MM)])));
+    let token_b = CancellationToken::new();
+    let silent = run_translation(
+        fake_b,
+        &store_b,
+        &cues,
+        &params(2),
+        TranslationFlags::default(),
+        &token_b,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await
+    .expect("noop run");
+
+    assert_eq!(
+        observed, silent,
+        "outcome is identical with and without a sink"
+    );
+    assert_eq!(
+        translation_exit_code(false, &observed),
+        translation_exit_code(false, &silent),
+        "exit code is unchanged by progress",
+    );
 }

@@ -671,3 +671,87 @@ is byte-identical to before except for the version bump, so first-attempt keys c
 `PROMPT_VERSION`. The `tests/llm_support.rs` version assertion was renamed `prompt_version_is_three` and
 asserts 3. Consequence: on a cap failure the model now receives actionable, field-located guidance and can
 recover within budget instead of exhausting it on a misleading "invalid JSON" message.
+
+### ADR-046 Live progress reporting: a `pipeline` sink trait rendered by `main` on stderr (M10)
+Context (`docs/CLI.md` §8, `docs/REQUIREMENTS.md` FR-11, `docs/ARCHITECTURE.md` §4/§11): `run`, `analyze`,
+and `translate` printed only a single outcome line *after* a stage finished. The analysis chunks and
+translation batches run through `pipeline::scheduler` for the whole (often minutes-long) duration with no
+visible feedback unless the operator set `RUST_LOG=…=debug`, so a run looked hung. The ask is live
+"X of N done" feedback. Constraints shaping the design: no new crates (`ARCHITECTURE.md` §10 — so no
+`indicatif`/progress-bar crate; it is hand-rolled on `std`), the dependency direction forbids
+`pipeline → cli/main` (`ARCHITECTURE.md` §3), stdout is reserved for the final/parseable messages, and
+cancellation + non-TTY behaviour must stay correct (NFR-3).
+
+Decisions:
+
+(a) **A `Progress` sink trait defined in `pipeline`, rendered by `main`.** `pipeline/progress.rs` defines
+`trait Progress: Send + Sync` (stage lifecycle + per-unit tick) and a zero-cost `NoopProgress` that
+ignores every call. `pipeline` and the scheduler depend only on the trait; `main` owns the single concrete
+renderer (`StderrProgress`). This mirrors the ADR-030/ADR-042 seam style (a narrow trait defined in the
+lower layer, implemented above) and keeps `main → pipeline` the only edge — the scheduler never learns how
+progress is drawn.
+
+(b) **The scheduler emits per-unit ticks; the orchestrator/stage runners emit stage boundaries.**
+`scheduler::run` gains a `progress: &dyn Progress` parameter: it calls `progress.stage_units(total)` once it
+knows the runnable count, and `progress.unit_finished(outcome)` as each unit completes (from inside the
+spawned task, so ticks are live and in completion order; the counters the renderer keeps are atomic/behind a
+mutex, independent of the returned `Summary`, which is still folded in `drain`/`record` exactly as before).
+The stage runners (`run_analysis`, `run_translation`) and `run` thread the sink down and bracket each stage
+with `progress.stage_start(stage, …)` / `progress.stage_finish(summary)` so the `run` operator sees
+analysis → translation → export labelled distinctly. Threading the sink is an **additive parameter** on
+`scheduler::run`, `run_analysis(_confirmed)`, `run_translation(_confirmed)`, and `orchestrator::run(_confirmed)`;
+existing tests pass `&NoopProgress` (a mechanical call-site edit, no assertion is weakened —
+the test-first guardrail is honoured).
+
+(c) **Progress goes to stderr; stdout stays clean; dry runs are silent.** The live display shares stderr
+with `tracing` (consistent with NFR-5 and `init_tracing`, which already writes to stderr). The final outcome
+lines (`report_*_outcome`, dry-run estimates, `status`) keep going to **stdout**, so piping stdout to a file
+or parser is unaffected by progress. `--dry-run` runs no units and estimates only, so it emits no progress.
+
+(d) **On by default; TTY-gated live line with a plain-line fallback; `--no-progress` opt-out.** A new global
+`--no-progress` flag selects `NoopProgress`. Otherwise `main` builds `StderrProgress`, which renders an
+in-place, carriage-return-updated line (label · `done/total` · percent · elapsed, e.g.
+`translating  8/12 batches · 67% · 0m42s`) **only when `stderr` is a terminal and verbosity is default**
+(no `-v`/`-vv` and no `RUST_LOG` override — raised log levels would clobber an in-place line, so it degrades
+to the plain path). When `stderr` is not a TTY (pipe/CI) or logging is raised, it emits throttled plain
+lines instead (`translation: 8/12 batches done`). Renders are throttled (≤ ~10/s, and the plain path only on
+change) so a fast run does not flood the terminal. On stage finish the live line is cleared/terminated with a
+newline so it never collides with the stdout outcome line. This default matches the request ("I want to see
+progress"); `--no-progress` restores silent behaviour for scripts that prefer it.
+
+(e) **Cancellation is unaffected.** Progress is observe-only: the sink never holds the scheduler's locks
+across an `.await`, never touches the DB, and a tick after the grace deadline is simply dropped, so Ctrl-C
+still stops dispatch and exits 130 (NFR-3). A panicking renderer must not abort a unit — `StderrProgress`
+performs only infallible stderr writes and ignores write errors (a closed stderr is not fatal).
+
+Consequence: `run`/`analyze`/`translate` show live "X of N" progress by default on an interactive terminal,
+fall back to periodic plain lines under a pipe or raised logging, and go fully silent under `--no-progress`
+or `--dry-run` — all without a new dependency, without touching stdout, and without changing crash-safety or
+the exit-code contract.
+
+### ADR-047 Progress wiring specifics: `Arc<dyn Progress>`, runner-owned stage boundaries, renderer submodule (M10)
+Context (M10 implementation of ADR-046): three small shapes were left open by ADR-046/§11 and are pinned here.
+
+(a) **The sink is threaded as `Arc<dyn Progress>`, not `&dyn Progress`.** ADR-046(b)/§11 sketch
+`scheduler::run(progress: &dyn Progress)` and "existing tests pass `&NoopProgress`". But the per-unit tick must
+fire from *inside* the unit's spawned task (so ticks are live and in completion order), and
+`tokio::spawn` requires a `'static` future — a borrowed `&dyn Progress` cannot be captured. The scheduler
+therefore takes `progress: Arc<dyn Progress>` and clones one handle into each spawned task; `run_analysis(_confirmed)`,
+`run_translation(_confirmed)`, and `orchestrator::run(_confirmed)` take `Arc<dyn Progress>` too. Existing call sites pass
+`Arc::new(NoopProgress)` (the same mechanical, assertion-preserving edit ADR-046(b) intends). `NoopProgress` stays
+zero-cost (all `Progress` methods default to empty bodies).
+
+(b) **Stage boundaries are emitted by the stage runners; the scheduler emits only `stage_units` + `unit_finished`.**
+ADR-046(b) allows either the scheduler or the runners to own `stage_finish`; §4 says the orchestrator brackets stages
+while §11 says `run_analysis`/`run_translation` emit the boundaries. Resolution: `run_analysis`/`run_translation` own
+`stage_start` + `stage_finish` (single-pass analysis synthesizes a one-unit lifecycle; map-reduce and translation pass
+the scheduler's real `Summary` to `stage_finish`). The scheduler emits `stage_units(total)` and `unit_finished(outcome)`
+only, and `orchestrator::run` just threads the sink down (the runners' brackets already make a `run` show analysis →
+translation distinctly). This keeps one consistent emitter per event and lets the scheduler-level test assert
+`stage_units`/`unit_finished` while the e2e `analyze`/`translate`/`run` tests assert the full lifecycle including
+`stage_finish` (matching M10's acceptance criterion, which ties the `stage_finish` assertion to the e2e).
+
+(c) **`StderrProgress` lives in a binary submodule (`src/progress_render.rs`), not literally inside `main.rs`.** It is
+still part of the binary crate only (never the library), so the `main ─► pipeline` edge and the "renderer in `main`"
+intent of ADR-046(a) hold; the file split is cosmetic. A post-grace aborted unit's dropped tick is documented on
+`scheduler::run` and covered by a test (no panic, no double count).

@@ -297,6 +297,7 @@ async fn translate_stale_retranslates_exactly_the_stale_cues() {
         &params(10),
         TranslationFlags::default(),
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("first pass");
@@ -332,6 +333,7 @@ async fn translate_stale_retranslates_exactly_the_stale_cues() {
             ..TranslationFlags::default()
         },
         &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("stale pass");
