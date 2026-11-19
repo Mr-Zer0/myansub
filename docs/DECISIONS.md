@@ -150,6 +150,7 @@ model the schemas in `llm/schemas.rs` using only keywords valid in both dialects
 transport (`gemini.rs`, M3-B) send them under `responseJsonSchema`. Consequence: the modeled
 `serde_json::Value` is compatible either way; only the wire field name in `gemini.rs` is affected,
 and it should be `responseJsonSchema`. Bump `PROMPT_VERSION` if the schema shape later changes.
+Superseded in part by ADR-044 (analysis wire schema no longer carries `maxItems`/`maxLength`; caps enforced in code).
 
 ### ADR-026 Retry policy takes the jitter factor as a parameter
 Context: `docs/LLM.md` §6 requires full jitter on backoff but the policy must be a pure function
@@ -583,3 +584,46 @@ passing M5-B / M8-A integration tests, which the test-first guardrail forbids ("
 are therefore kept with explicit doc-warnings stating they must not clear a gate in production and exist only to
 exercise the review-stage / §7-diff mechanics in tests. They are `pub` + test-exercised, so clippy raises no
 dead-code warning.
+
+### ADR-044 Analysis caps moved out of the Gemini wire schema into post-parse validation (amends ADR-025)
+Context: `analyze` failed in production with Gemini HTTP 400 — "The specified schema produces a constraint that has too
+many states for serving. Typical causes … schemas with long array length limits (especially when nested) … strings with
+complex formats." `llm/schemas.rs::analysis_response_schema()` sent a `responseJsonSchema` whose large `maxItems` object arrays
+(`characters` 40, `address_matrix` 80, `glossary` 120, `scenes` 120) were on their own enough to overflow Gemini's
+constrained-decoding serving ceiling: array-length bounds that large — especially when nested — are the documented
+cause. The schema also carried many `maxLength`-capped string fields (name, aliases, role, speech_style, relation,
+term/target/note, summary, mood, premise, tone, style_rules, unresolved_ambiguities), but those contributed **nothing**
+to the state machine. Verified against the live Gemini structured-output docs: `maxLength`/`minLength` are ignored
+during constrained decoding, so they add no character-counting states. The large `maxItems` arrays alone were the
+necessary and sufficient trigger. `translation_response_schema()` has no such bounds and was always fine; only analysis
+failed.
+
+Decision: remove **all** `maxLength` and all large/list `maxItems` (`characters`/`address_matrix`/`glossary`/`scenes`,
+and `aliases`/`style_rules`/`unresolved_ambiguities`) from the analysis wire schema, keeping only the document *shape* —
+`type`, `properties`, `required`, the small `enum`s (gender, age_group, register; cheap and safe), and `cue_range`'s
+fixed `minItems`/`maxItems` of 2. Dropping the large `maxItems` is the actual fix; dropping `maxLength` alongside it is
+harmless cleanup (the server ignored it anyway), **but** it unlocked a genuine improvement: the §3 caps (characters ≤
+40, address_matrix ≤ 80, glossary ≤ 120, scenes ≤ 120, aliases ≤ 8, style_rules ≤ 12, unresolved_ambiguities ≤ 12) and
+every per-field string-length limit are now enforced in Rust **after** parsing, in `pipeline::analysis::validate_full`
+(the LLM-output path). Moving string-length checks into `validate_full` closed a latent gap: because Gemini ignored
+`maxLength` and `validate_full` did not previously check string lengths, over-length strings on the LLM-output path had
+been validated by nothing. The user-import path (`review::analysis`) already enforced the same caps in code
+(ADR-035/036), so both paths now agree and the wire schema is bound-free. This amends ADR-025, which modeled the schema "using `maxItems`, `maxLength`, `minItems`"; those two
+keywords are no longer used by the analysis schema (the translation schema never used them).
+
+**Over-cap behavior: hard validation error (fail loud), not truncation.** An over-cap array or over-length string is a
+`ValidationError` (`CapExceeded` / the new `StringTooLong`), which drives the standard content retry with a strict
+reminder (`docs/LLM.md` §6) and, if never satisfied within `max_content_attempts`, fails the unit — never silently
+truncating the model's content. This matches the pre-existing treatment of the big array caps (`CapExceeded` already
+drove the content retry) and the brief's "prefer a typed validation error over silent truncation". String lengths are
+measured in `chars().count()` (not graphemes), consistent with ADR-036.
+
+**`PROMPT_VERSION` / cache keys: no bump.** The local response-cache key (`docs/LLM.md` §4) hashes `generationConfig`,
+which includes the response schema, so the new schema naturally produces a different analysis cache key. But the broken
+schema returned a fatal HTTP 400 and invalid responses are never cached (§4), so there is **no** stored analysis cache
+entry to invalidate — the new key simply misses nothing. `PROMPT_VERSION` is a single global shared with translation;
+bumping it to "invalidate" a non-existent analysis cache would needlessly change every translation `input_hash` and
+discard real translation work. The analysis version `signature` (`prompt_vN|model`) does not include the schema, so
+stored versions are unaffected. Therefore `PROMPT_VERSION` stays at 2 and no prompt text changed. Consequence: `analyze`
+stops hitting the 400; the exact §3 caps are preserved end-to-end (now in code, with field-located errors); the wire
+schema is smaller and robust to future cap-value tuning (changing a cap no longer risks re-tripping the serving ceiling).

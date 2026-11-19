@@ -845,11 +845,26 @@ enum ValidationError {
     WrongType(&'static str),
     #[error("array `{0}` exceeds its cap")]
     CapExceeded(&'static str),
+    #[error("string `{0}` exceeds its length cap")]
+    StringTooLong(&'static str),
 }
 
 /// Validates a full analysis document leniently (`docs/DATA_MODEL.md` §3): it must
 /// parse, be an object, carry the required fields with the right JSON types, and
-/// respect the array caps. Unknown fields are ignored (lenient on LLM output).
+/// respect both the array caps and the per-field string-length caps. Unknown
+/// fields are ignored (lenient on LLM output).
+///
+/// These caps used to be `maxItems`/`maxLength` in the Gemini wire schema but were
+/// removed from it: the large `maxItems` array bounds overflowed Gemini's
+/// constrained-decoding serving ceiling (HTTP 400 "too many states for serving",
+/// ADR-044). The `maxLength` caps were dropped too, but as cleanup — Gemini ignores
+/// `maxLength` during constrained decoding, so enforcing string lengths here also
+/// closed a latent gap where over-length strings on the LLM output path were
+/// previously validated by nothing. They are enforced here as a hard validation
+/// error — over-cap output drives a content retry (`docs/LLM.md` §6) and, if never
+/// satisfied, fails the unit loudly rather than silently truncating. String lengths
+/// are measured in `chars().count()` (not graphemes), consistent with the
+/// user-import validator (ADR-036).
 fn validate_full(text: &str) -> Result<(), ValidationError> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| ValidationError::Parse(e.to_string()))?;
@@ -869,12 +884,100 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
             ValidationError::Missing("premise")
         });
     }
+    string_cap(obj.get("premise"), "premise", 500)?;
+    string_cap(obj.get("tone"), "tone", 160)?;
+
     require_array_within(obj, "characters", 40)?;
+    for ch in object_items(obj, "characters") {
+        string_cap(ch.get("name"), "characters[].name", 120)?;
+        string_cap(ch.get("role"), "characters[].role", 260)?;
+        string_cap(ch.get("speech_style"), "characters[].speech_style", 180)?;
+        array_cap(ch.get("aliases"), "characters[].aliases", 8)?;
+        for alias in string_items(ch.get("aliases")) {
+            string_cap(Some(alias), "characters[].aliases[]", 80)?;
+        }
+    }
+
     require_array_within(obj, "scenes", 120)?;
-    // These are optional, but when present must respect their caps.
+    for scene in object_items(obj, "scenes") {
+        string_cap(scene.get("summary"), "scenes[].summary", 300)?;
+        string_cap(scene.get("mood"), "scenes[].mood", 80)?;
+    }
+
+    // These top-level arrays are optional, but when present must respect their caps.
     optional_array_within(obj, "address_matrix", 80)?;
+    for am in object_items(obj, "address_matrix") {
+        string_cap(am.get("relation"), "address_matrix[].relation", 160)?;
+    }
+
     optional_array_within(obj, "glossary", 120)?;
+    for g in object_items(obj, "glossary") {
+        string_cap(g.get("term"), "glossary[].term", 120)?;
+        string_cap(g.get("target"), "glossary[].target", 120)?;
+        string_cap(g.get("note"), "glossary[].note", 180)?;
+    }
+
+    array_cap(obj.get("style_rules"), "style_rules", 12)?;
+    for rule in string_items(obj.get("style_rules")) {
+        string_cap(Some(rule), "style_rules[]", 180)?;
+    }
+    array_cap(
+        obj.get("unresolved_ambiguities"),
+        "unresolved_ambiguities",
+        12,
+    )?;
+    for amb in string_items(obj.get("unresolved_ambiguities")) {
+        string_cap(Some(amb), "unresolved_ambiguities[]", 220)?;
+    }
     Ok(())
+}
+
+/// Enforces a string field's length cap in `chars` (`docs/DATA_MODEL.md` §3).
+/// Absent or non-string values are skipped: presence/type of required fields is
+/// checked elsewhere, and the wire schema still constrains field types.
+fn string_cap(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+    cap: usize,
+) -> Result<(), ValidationError> {
+    if let Some(serde_json::Value::String(s)) = value
+        && s.chars().count() > cap
+    {
+        return Err(ValidationError::StringTooLong(field));
+    }
+    Ok(())
+}
+
+/// Enforces an array field's element-count cap. Absent or non-array values are
+/// skipped (the wire schema still constrains the field type).
+fn array_cap(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+    cap: usize,
+) -> Result<(), ValidationError> {
+    if let Some(serde_json::Value::Array(a)) = value
+        && a.len() > cap
+    {
+        return Err(ValidationError::CapExceeded(field));
+    }
+    Ok(())
+}
+
+/// Iterates the object elements of a top-level array field (non-objects skipped).
+fn object_items<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> impl Iterator<Item = &'a serde_json::Map<String, serde_json::Value>> {
+    obj.get(field)
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_object())
+}
+
+/// Iterates the elements of an array value (any element type).
+fn string_items(value: Option<&serde_json::Value>) -> impl Iterator<Item = &serde_json::Value> {
+    value.and_then(|v| v.as_array()).into_iter().flatten()
 }
 
 /// Validates a map-phase partial leniently: it must parse and be a JSON object
@@ -1105,5 +1208,179 @@ impl<T> AnalysisChunkUnit<T> {
             .call(move |conn| fail_analysis_chunk(conn, chunk_no, &message).map(|_| ()))
             .await;
         self.state.store(ST_FAILED, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ValidationError, validate_full};
+    use serde_json::json;
+
+    /// A minimal analysis document that satisfies every §3 cap.
+    fn base_doc() -> serde_json::Value {
+        json!({
+            "schema_version": 1,
+            "premise": "A short premise.",
+            "tone": "wistful",
+            "characters": [
+                {
+                    "id": "c1",
+                    "name": "Aoi",
+                    "aliases": ["A"],
+                    "gender": "f",
+                    "age_group": "young",
+                    "role": "the lead",
+                    "speech_style": "clipped"
+                }
+            ],
+            "address_matrix": [
+                { "from": "c1", "to": "c1", "relation": "self", "register": "polite" }
+            ],
+            "glossary": [
+                { "term": "Tokyo", "target": "တိုကျို", "keep": false, "note": "city" }
+            ],
+            "scenes": [
+                { "cue_range": [1, 5], "summary": "opening", "speakers": ["c1"], "mood": "calm" }
+            ],
+            "style_rules": ["keep it short"],
+            "unresolved_ambiguities": ["who is narrating"]
+        })
+    }
+
+    fn validate_doc(doc: &serde_json::Value) -> Result<(), ValidationError> {
+        validate_full(&doc.to_string())
+    }
+
+    #[test]
+    fn validate_full_accepts_doc_within_caps() {
+        assert!(validate_doc(&base_doc()).is_ok());
+    }
+
+    #[test]
+    fn validate_full_rejects_too_many_characters() {
+        let mut doc = base_doc();
+        let one = doc["characters"][0].clone();
+        doc["characters"] = serde_json::Value::Array(vec![one; 41]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded("characters"))
+        ));
+    }
+
+    #[test]
+    fn validate_full_rejects_over_length_premise() {
+        let mut doc = base_doc();
+        doc["premise"] = json!("x".repeat(501));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong("premise"))
+        ));
+        // Exactly at the cap is fine.
+        doc["premise"] = json!("x".repeat(500));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_full_rejects_over_length_character_name() {
+        let mut doc = base_doc();
+        doc["characters"][0]["name"] = json!("x".repeat(121));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong("characters[].name"))
+        ));
+    }
+
+    #[test]
+    fn validate_full_rejects_over_length_scene_summary() {
+        let mut doc = base_doc();
+        doc["scenes"][0]["summary"] = json!("x".repeat(301));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong("scenes[].summary"))
+        ));
+    }
+
+    #[test]
+    fn validate_full_rejects_too_many_aliases() {
+        let mut doc = base_doc();
+        doc["characters"][0]["aliases"] = serde_json::Value::Array(vec![json!("a"); 9]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded("characters[].aliases"))
+        ));
+    }
+
+    #[test]
+    fn validate_full_rejects_too_many_style_rules() {
+        let mut doc = base_doc();
+        doc["style_rules"] = serde_json::Value::Array(vec![json!("r"); 13]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded("style_rules"))
+        ));
+    }
+
+    #[test]
+    fn validate_full_accepts_array_exactly_at_cap() {
+        // Arrays exactly at their cap pass (guards a `>`→`>=` off-by-one that the
+        // over-limit-only tests cannot catch).
+        let mut doc = base_doc();
+        let one = doc["characters"][0].clone();
+        doc["characters"] = serde_json::Value::Array(vec![one; 40]);
+        doc["characters"][0]["aliases"] = serde_json::Value::Array(vec![json!("a"); 8]);
+        doc["style_rules"] = serde_json::Value::Array(vec![json!("r"); 12]);
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_full_rejects_too_many_unresolved_ambiguities() {
+        let mut doc = base_doc();
+        doc["unresolved_ambiguities"] = serde_json::Value::Array(vec![json!("a"); 13]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded("unresolved_ambiguities"))
+        ));
+        // Exactly at the cap is fine.
+        doc["unresolved_ambiguities"] = serde_json::Value::Array(vec![json!("a"); 12]);
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_full_rejects_over_length_unresolved_ambiguity() {
+        let mut doc = base_doc();
+        doc["unresolved_ambiguities"] = json!(["x".repeat(221)]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong("unresolved_ambiguities[]"))
+        ));
+        // Exactly at the cap is fine.
+        doc["unresolved_ambiguities"] = json!(["x".repeat(220)]);
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_full_rejects_over_length_address_matrix_relation() {
+        let mut doc = base_doc();
+        doc["address_matrix"][0]["relation"] = json!("x".repeat(161));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong("address_matrix[].relation"))
+        ));
+        // Exactly at the cap is fine.
+        doc["address_matrix"][0]["relation"] = json!("x".repeat(160));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_full_rejects_over_length_glossary_note() {
+        let mut doc = base_doc();
+        doc["glossary"][0]["note"] = json!("x".repeat(181));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong("glossary[].note"))
+        ));
+        // Exactly at the cap is fine.
+        doc["glossary"][0]["note"] = json!("x".repeat(180));
+        assert!(validate_doc(&doc).is_ok());
     }
 }

@@ -118,18 +118,84 @@ fn translation_schema_has_lines_with_id_and_t() {
     assert_eq!(schema["required"], serde_json::json!(["lines"]));
 }
 
+/// Recursively collects every object key present anywhere in a JSON value.
+fn collect_keys(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                collect_keys(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_keys(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The largest numeric value held under any `maxItems` key anywhere in the schema.
+fn max_max_items(value: &serde_json::Value) -> u64 {
+    let mut worst = 0u64;
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if k == "maxItems"
+                    && let Some(n) = v.as_u64()
+                {
+                    worst = worst.max(n);
+                }
+                worst = worst.max(max_max_items(v));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                worst = worst.max(max_max_items(v));
+            }
+        }
+        _ => {}
+    }
+    worst
+}
+
+// AC: analysis structured-output regression guard (ADR-044). The analysis wire
+// schema must still describe the document SHAPE, but must carry none of the heavy
+// constrained-decoding bounds that caused Gemini HTTP 400 ("too many states for
+// serving"): no `maxLength` anywhere, and no `maxItems` beyond the tiny fixed
+// `cue_range` bound of 2. The per-field caps now live in post-parse validation.
 #[test]
-fn analysis_schema_has_fields_and_array_caps() {
+fn analysis_schema_describes_shape_without_heavy_bounds() {
     let schema = analysis_response_schema();
     let props = &schema["properties"];
-    assert_eq!(props["characters"]["maxItems"], 40);
-    assert_eq!(props["address_matrix"]["maxItems"], 80);
-    assert_eq!(props["glossary"]["maxItems"], 120);
-    assert_eq!(props["scenes"]["maxItems"], 120);
-    assert_eq!(props["premise"]["maxLength"], 500);
-    // Gender/age enums are modeled.
+
+    // Shape is still fully described.
+    assert_eq!(schema["type"], "object");
+    assert_eq!(props["characters"]["type"], "array");
+    assert_eq!(props["characters"]["items"]["type"], "object");
+    assert_eq!(props["scenes"]["type"], "array");
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["schema_version", "premise", "characters", "scenes"])
+    );
+    // Small, safe enums are kept.
     let gender = &props["characters"]["items"]["properties"]["gender"]["enum"];
     assert_eq!(gender, &serde_json::json!(["m", "f", "unknown"]));
+
+    // Regression guard: no `maxLength` anywhere.
+    let mut keys = Vec::new();
+    collect_keys(&schema, &mut keys);
+    assert!(
+        !keys.iter().any(|k| k == "maxLength"),
+        "analysis schema must contain no maxLength keys (state-explosion guard)"
+    );
+    // Regression guard: no large `maxItems`; only `cue_range`'s fixed bound of 2.
+    let worst = max_max_items(&schema);
+    assert!(
+        worst <= 2,
+        "analysis schema must contain no maxItems > 2 (found {worst})"
+    );
 }
 
 #[test]
