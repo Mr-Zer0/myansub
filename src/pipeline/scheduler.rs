@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::error::exit;
+use crate::pipeline::progress::Progress;
 
 /// The scheduler's view of a unit's persisted status.
 ///
@@ -156,10 +157,22 @@ impl Summary {
 /// Dispatch order follows the order of `units`. Already-`done`/`failed` units are
 /// skipped; `in_flight` units are reset to `pending` and rerun. On cancellation the
 /// scheduler stops dispatching and waits up to `cfg.grace` for in-flight units.
+///
+/// `progress` is an observe-only sink (`docs/ARCHITECTURE.md` §11, ADR-046): the
+/// scheduler reports the runnable `total` through [`Progress::stage_units`] once it is
+/// known (after the in-flight reset and the `Pending` filter), then one
+/// [`Progress::unit_finished`] tick per finished unit, emitted from inside the unit's
+/// spawned task so ticks are live and in completion order. Progress never affects the
+/// returned [`Summary`], cancellation, or the grace/abort logic — a unit aborted after
+/// the grace deadline never ticks, and that dropped tick is harmless (it is simply not
+/// counted by the renderer, and the `Summary` still counts it as cancelled). The stage
+/// boundaries ([`Progress::stage_start`] / [`Progress::stage_finish`]) are emitted by
+/// the stage runners, not here.
 pub async fn run<U: WorkUnit>(
     units: Vec<Arc<U>>,
     cfg: SchedulerConfig,
     token: &CancellationToken,
+    progress: Arc<dyn Progress>,
 ) -> Summary {
     // §4.1 / §6.2: reset units left in_flight by a previous run so they rerun.
     for unit in &units {
@@ -173,6 +186,9 @@ pub async fn run<U: WorkUnit>(
         .filter(|unit| unit.state() == UnitState::Pending)
         .collect();
 
+    // §11: report the runnable total (remaining-only on a resume) once known.
+    progress.stage_units(runnable.len());
+
     let mut summary = Summary::default();
     let mut remaining = runnable.into_iter();
 
@@ -185,6 +201,7 @@ pub async fn run<U: WorkUnit>(
                 warmup_sem,
                 token,
                 cfg.grace,
+                &progress,
                 &mut summary,
             )
             .await;
@@ -198,7 +215,7 @@ pub async fn run<U: WorkUnit>(
     }
 
     let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
-    dispatch(remaining, sem, token, cfg.grace, &mut summary).await;
+    dispatch(remaining, sem, token, cfg.grace, &progress, &mut summary).await;
     summary
 }
 
@@ -214,6 +231,7 @@ async fn dispatch<U, I>(
     sem: Arc<Semaphore>,
     token: &CancellationToken,
     grace: Duration,
+    progress: &Arc<dyn Progress>,
     summary: &mut Summary,
 ) where
     U: WorkUnit,
@@ -253,9 +271,16 @@ async fn dispatch<U, I>(
         // holding an `enter()` guard across the `.await`: an entered guard held over
         // an await corrupts span attribution when units are polled concurrently.
         let span = tracing::debug_span!("unit", kind = unit.kind(), id = unit.id());
+        // Clone the observe-only sink into the task so the tick fires live, from the
+        // unit's completion, in completion order (§11, ADR-046(b)). A unit aborted
+        // after the grace deadline is dropped before this line, so its tick is simply
+        // never emitted — acceptable and never double-counted.
+        let progress = Arc::clone(progress);
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            unit.run().instrument(span).await
+            let outcome = unit.run().instrument(span).await;
+            progress.unit_finished(outcome);
+            outcome
         }));
     }
 

@@ -22,12 +22,74 @@ use myansub::pipeline::orchestrator::{
     ApprovalOrigin, AutoApproveGate, RunOptions, RunOutcome, RunReport, RunRequest, run,
     run_confirmed, run_exit_code, status,
 };
+use myansub::pipeline::progress::{Progress, ProgressStage};
+use myansub::pipeline::scheduler::{Summary, UnitOutcome};
 use myansub::project::{PROJECT_DB_FILE, project_dir_for_source};
 use myansub::store::repo_analysis::current_analysis;
 use myansub::store::repo_translations::{cue_id_by_idx, get_translation, set_locked_in_tx};
 use myansub::store::{Stage, StageStatus, Store};
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
+
+/// A recording [`Progress`] double (`docs/TESTING.md` §3a) capturing the ordered
+/// events so a `run` e2e test can assert that analysis and translation appear as
+/// distinct, bracketed stages.
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<ProgEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgEvent {
+    StageStart(ProgressStage),
+    StageUnits(usize),
+    UnitFinished(UnitOutcome),
+    StageFinish(Summary),
+}
+
+impl RecordingProgress {
+    fn events(&self) -> Vec<ProgEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+
+    fn stage_starts(&self) -> Vec<ProgressStage> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                ProgEvent::StageStart(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Progress for RecordingProgress {
+    fn stage_start(&self, stage: ProgressStage) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageStart(stage));
+    }
+    fn stage_units(&self, total: usize) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageUnits(total));
+    }
+    fn unit_finished(&self, outcome: UnitOutcome) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::UnitFinished(outcome));
+    }
+    fn stage_finish(&self, summary: Summary) {
+        self.events
+            .lock()
+            .expect("lock")
+            .push(ProgEvent::StageFinish(summary));
+    }
+}
 
 /// Three translatable cues with distinct timings, for an end-to-end export check.
 const SRT3: &str = "1\n00:00:01,000 --> 00:00:03,000\nGood morning.\n\n\
@@ -146,6 +208,7 @@ async fn unattended_full_run_writes_output() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("full run");
@@ -199,6 +262,7 @@ async fn auto_approve_records_origin_auto() {
         &Config::default(),
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("full run");
@@ -251,6 +315,7 @@ async fn run_auto_approve_marks_affected_unlocked_stale() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -291,6 +356,7 @@ async fn run_auto_approve_marks_affected_unlocked_stale() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -327,6 +393,7 @@ async fn gated_flow_resumes_and_records_origin_user() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 1");
@@ -354,6 +421,7 @@ async fn gated_flow_resumes_and_records_origin_user() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 2");
@@ -381,6 +449,7 @@ async fn gated_flow_resumes_and_records_origin_user() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run 3");
@@ -429,6 +498,7 @@ async fn auto_approve_translation_refused_on_failed_batch() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run refused");
@@ -458,6 +528,7 @@ async fn auto_approve_translation_refused_on_failed_batch() {
         &config,
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("run allow-incomplete");
@@ -490,6 +561,7 @@ async fn zero_translatable_project_completes() {
         &Config::default(),
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("zero-translatable run");
@@ -537,6 +609,7 @@ async fn resume_after_cancel_sends_no_duplicate_calls() {
         &config,
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("interrupted run");
@@ -554,6 +627,7 @@ async fn resume_after_cancel_sends_no_duplicate_calls() {
         &config,
         &token2,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("resume run");
@@ -595,6 +669,7 @@ async fn dry_run_writes_nothing() {
         &Config::default(),
         &CancellationToken::new(),
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("dry run");
@@ -651,6 +726,7 @@ async fn dry_run_reports_estimate() {
         &config,
         &CancellationToken::new(),
         &mut report,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("dry run");
@@ -690,6 +766,7 @@ async fn auto_approve_reports_suspect_count() {
         &Config::default(),
         &CancellationToken::new(),
         &mut report,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("suspect run");
@@ -725,6 +802,7 @@ async fn precancelled_token_is_interrupted() {
         &Config::default(),
         &token,
         &mut RunReport::default(),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("precancelled run");
@@ -765,6 +843,7 @@ async fn run_refuses_cost_without_tty_or_yes() {
         &token,
         &mut RunReport::default(),
         confirm_settings(0.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("refusal");
@@ -797,6 +876,7 @@ async fn run_with_yes_proceeds_through_pipeline() {
         &token,
         &mut RunReport::default(),
         confirm_settings(0.0, false, true),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("confirmed run");
@@ -849,6 +929,7 @@ async fn run_confirms_translation_gate_after_analysis() {
         &token,
         &mut RunReport::default(),
         confirm_settings(1000.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect_err("refused at the translation gate");
@@ -896,6 +977,7 @@ async fn run_confirmed_dry_run_bypasses_gate() {
         &CancellationToken::new(),
         &mut RunReport::default(),
         confirm_settings(0.0, false, false),
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
     )
     .await
     .expect("dry run bypasses the gate");
@@ -906,4 +988,98 @@ async fn run_confirmed_dry_run_bypasses_gate() {
         0,
         "dry run builds its own DryRun transport"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M10: live progress across a whole `run` (analysis → translation)
+// ---------------------------------------------------------------------------
+
+// AC: M10 — a full `run --auto-approve all` reports progress for analysis and then
+// translation as two distinct, bracketed stages (stage_start → stage_units → ticks →
+// stage_finish each), so the operator sees analysis → translation distinctly.
+#[tokio::test]
+async fn run_reports_analysis_then_translation_stages() {
+    let tmp = tempdir().expect("tempdir");
+    let source = tmp.path().join("movie.srt");
+    fs::write(&source, SRT3).expect("write source");
+    let project_dir = project_dir_for_source(&source);
+
+    let progress = Arc::new(RecordingProgress::default());
+    let outcome = run(
+        fake_full(&[1, 2, 3]),
+        request(&project_dir, &source, auto_all()),
+        &Config::default(),
+        &token_new(),
+        &mut RunReport::default(),
+        progress.clone(),
+    )
+    .await
+    .expect("full run");
+    assert_eq!(outcome, RunOutcome::Completed);
+
+    // The two unit-bearing stages are reported in order and distinctly.
+    assert_eq!(
+        progress.stage_starts(),
+        vec![ProgressStage::Analysis, ProgressStage::Translation],
+        "analysis is reported before translation",
+    );
+
+    // Each stage is fully bracketed with a units total, at least one tick, and finish.
+    let events = progress.events();
+    for stage in [ProgressStage::Analysis, ProgressStage::Translation] {
+        let start = events
+            .iter()
+            .position(|e| *e == ProgEvent::StageStart(stage))
+            .expect("stage_start present");
+        let finish = events[start..]
+            .iter()
+            .position(|e| matches!(e, ProgEvent::StageFinish(_)))
+            .map(|p| start + p)
+            .expect("stage_finish after start");
+        let between = &events[start..=finish];
+        assert!(
+            between
+                .iter()
+                .any(|e| matches!(e, ProgEvent::StageUnits(_))),
+            "{stage:?} reports a units total"
+        );
+        assert!(
+            between
+                .iter()
+                .any(|e| matches!(e, ProgEvent::UnitFinished(_))),
+            "{stage:?} ticks at least one unit"
+        );
+    }
+
+    // The per-stage stage_finish summaries match the work done: single-pass analysis is
+    // one unit; SRT3's three translatable cues fit one batch at the default batch_size
+    // (80), so translation is one unit too. (The ordered StageFinish events are
+    // analysis then translation.)
+    let finishes: Vec<Summary> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProgEvent::StageFinish(s) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finishes,
+        vec![
+            Summary {
+                done: 1,
+                failed: 0,
+                cancelled: 0,
+            },
+            Summary {
+                done: 1,
+                failed: 0,
+                cancelled: 0,
+            },
+        ],
+        "analysis then translation each finish with done:1 (one unit apiece)",
+    );
+}
+
+fn token_new() -> CancellationToken {
+    CancellationToken::new()
 }

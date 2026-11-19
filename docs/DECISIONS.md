@@ -728,3 +728,30 @@ Consequence: `run`/`analyze`/`translate` show live "X of N" progress by default 
 fall back to periodic plain lines under a pipe or raised logging, and go fully silent under `--no-progress`
 or `--dry-run` — all without a new dependency, without touching stdout, and without changing crash-safety or
 the exit-code contract.
+
+### ADR-047 Progress wiring specifics: `Arc<dyn Progress>`, runner-owned stage boundaries, renderer submodule (M10)
+Context (M10 implementation of ADR-046): three small shapes were left open by ADR-046/§11 and are pinned here.
+
+(a) **The sink is threaded as `Arc<dyn Progress>`, not `&dyn Progress`.** ADR-046(b)/§11 sketch
+`scheduler::run(progress: &dyn Progress)` and "existing tests pass `&NoopProgress`". But the per-unit tick must
+fire from *inside* the unit's spawned task (so ticks are live and in completion order), and
+`tokio::spawn` requires a `'static` future — a borrowed `&dyn Progress` cannot be captured. The scheduler
+therefore takes `progress: Arc<dyn Progress>` and clones one handle into each spawned task; `run_analysis(_confirmed)`,
+`run_translation(_confirmed)`, and `orchestrator::run(_confirmed)` take `Arc<dyn Progress>` too. Existing call sites pass
+`Arc::new(NoopProgress)` (the same mechanical, assertion-preserving edit ADR-046(b) intends). `NoopProgress` stays
+zero-cost (all `Progress` methods default to empty bodies).
+
+(b) **Stage boundaries are emitted by the stage runners; the scheduler emits only `stage_units` + `unit_finished`.**
+ADR-046(b) allows either the scheduler or the runners to own `stage_finish`; §4 says the orchestrator brackets stages
+while §11 says `run_analysis`/`run_translation` emit the boundaries. Resolution: `run_analysis`/`run_translation` own
+`stage_start` + `stage_finish` (single-pass analysis synthesizes a one-unit lifecycle; map-reduce and translation pass
+the scheduler's real `Summary` to `stage_finish`). The scheduler emits `stage_units(total)` and `unit_finished(outcome)`
+only, and `orchestrator::run` just threads the sink down (the runners' brackets already make a `run` show analysis →
+translation distinctly). This keeps one consistent emitter per event and lets the scheduler-level test assert
+`stage_units`/`unit_finished` while the e2e `analyze`/`translate`/`run` tests assert the full lifecycle including
+`stage_finish` (matching M10's acceptance criterion, which ties the `stage_finish` assertion to the e2e).
+
+(c) **`StderrProgress` lives in a binary submodule (`src/progress_render.rs`), not literally inside `main.rs`.** It is
+still part of the binary crate only (never the library), so the `main ─► pipeline` edge and the "renderer in `main`"
+intent of ADR-046(a) hold; the file split is cosmetic. A post-grace aborted unit's dropped tick is documented on
+`scheduler::run` and covered by a test (no panic, no double count).

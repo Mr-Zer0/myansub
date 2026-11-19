@@ -11,9 +11,85 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use myansub::pipeline::scheduler::{self, SchedulerConfig, UnitOutcome, UnitState, WorkUnit};
+use myansub::pipeline::progress::{Progress, ProgressStage};
+use myansub::pipeline::scheduler::{
+    self, SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit,
+};
 use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
+
+/// A recording [`Progress`] double (`docs/TESTING.md` §3a): it captures the ordered
+/// progress events behind a `Mutex` so a test can assert the sequence and counts
+/// against the scheduler's [`Summary`] rather than scraping a rendered line.
+#[derive(Default)]
+struct RecordingProgress {
+    events: Mutex<Vec<ProgEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgEvent {
+    StageStart(ProgressStage),
+    StageUnits(usize),
+    UnitFinished(UnitOutcome),
+    StageFinish(Summary),
+}
+
+impl RecordingProgress {
+    fn events(&self) -> Vec<ProgEvent> {
+        self.events.lock().expect("events lock").clone()
+    }
+
+    fn units_total(&self) -> Option<usize> {
+        self.events().into_iter().find_map(|e| match e {
+            ProgEvent::StageUnits(n) => Some(n),
+            _ => None,
+        })
+    }
+
+    fn finished(&self) -> (usize, usize) {
+        let mut done = 0;
+        let mut failed = 0;
+        for e in self.events() {
+            if let ProgEvent::UnitFinished(o) = e {
+                match o {
+                    UnitOutcome::Done => done += 1,
+                    UnitOutcome::Failed => failed += 1,
+                }
+            }
+        }
+        (done, failed)
+    }
+}
+
+impl Progress for RecordingProgress {
+    fn stage_start(&self, stage: ProgressStage) {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(ProgEvent::StageStart(stage));
+    }
+
+    fn stage_units(&self, total: usize) {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(ProgEvent::StageUnits(total));
+    }
+
+    fn unit_finished(&self, outcome: UnitOutcome) {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(ProgEvent::UnitFinished(outcome));
+    }
+
+    fn stage_finish(&self, summary: Summary) {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(ProgEvent::StageFinish(summary));
+    }
+}
 
 /// Tracks the current and peak number of simultaneously running units.
 #[derive(Default)]
@@ -215,7 +291,13 @@ async fn concurrency_is_bounded_and_reaches_the_limit() {
         .collect();
 
     let token = CancellationToken::new();
-    let summary = scheduler::run(units, cfg(concurrency, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(concurrency, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     assert_eq!(summary.done, total as usize);
     assert_eq!(summary.failed, 0);
@@ -247,7 +329,13 @@ async fn warm_cache_first_runs_the_first_unit_alone() {
         .collect();
 
     let token = CancellationToken::new();
-    let summary = scheduler::run(units, cfg(3, true), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(3, true),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
     assert_eq!(summary.done, 4);
 
     let log = events.lock().expect("events lock").clone();
@@ -286,7 +374,13 @@ async fn without_warm_cache_units_fan_out_immediately() {
     let token = CancellationToken::new();
     // The barrier only releases once both units have started; if the scheduler
     // serialized them (as warm-up would) this would never complete.
-    let summary = scheduler::run(units, cfg(2, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(2, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
     assert_eq!(summary.done, 2);
 
     let log = events.lock().expect("events lock").clone();
@@ -321,7 +415,13 @@ async fn in_flight_units_are_reset_and_rerun() {
     ];
 
     let token = CancellationToken::new();
-    let summary = scheduler::run(units, cfg(2, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(2, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     // Both recovered units plus the pending one run; the done one is skipped.
     assert_eq!(summary.done, 3);
@@ -352,7 +452,13 @@ async fn summary_counts_done_and_failed_without_one_blocking_others() {
     ];
 
     let token = CancellationToken::new();
-    let summary = scheduler::run(units, cfg(2, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(2, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     assert_eq!(summary.done, 3);
     assert_eq!(summary.failed, 2);
@@ -381,7 +487,13 @@ async fn cancellation_stops_dispatch_and_honors_grace() {
         never_b.clone(),
     ];
 
-    let summary = scheduler::run(units, cfg(2, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(2, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     // Units 0 and 1 were in flight when cancellation hit and both finished within
     // the 10s grace; units 2 and 3 were never dispatched.
@@ -412,7 +524,13 @@ async fn in_flight_unit_exceeding_grace_is_cancelled() {
     let never = Arc::new(FakeUnit::new(1));
 
     let units: Vec<Arc<FakeUnit>> = vec![slow.clone(), never.clone()];
-    let summary = scheduler::run(units, cfg(1, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(1, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     assert_eq!(summary.done, 0);
     assert_eq!(summary.failed, 0);
@@ -441,7 +559,13 @@ async fn a_panicking_unit_is_counted_failed_and_does_not_block_peers() {
 
     let units: Vec<Arc<FakeUnit>> = vec![peer_a.clone(), boom.clone(), peer_b.clone()];
     let token = CancellationToken::new();
-    let summary = scheduler::run(units, cfg(3, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(3, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     assert_eq!(summary.done, 2, "both peers complete");
     assert_eq!(summary.failed, 1, "the panicking unit is counted failed");
@@ -469,7 +593,13 @@ async fn cancellation_during_drain_after_full_dispatch_is_honored() {
     let peer_b = Arc::new(FakeUnit::new(2).sleep(Duration::from_secs(100)));
 
     let units: Vec<Arc<FakeUnit>> = vec![canceller.clone(), peer_a.clone(), peer_b.clone()];
-    let summary = scheduler::run(units, cfg(3, false), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(3, false),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     // All three were running and all exceed the 10s grace, so none complete.
     assert_eq!(summary.done, 0);
@@ -497,7 +627,13 @@ async fn cancellation_during_warmup_prevents_fanout() {
     let fan_b = Arc::new(FakeUnit::new(2));
 
     let units: Vec<Arc<FakeUnit>> = vec![warmup.clone(), fan_a.clone(), fan_b.clone()];
-    let summary = scheduler::run(units, cfg(2, true), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(2, true),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
 
     // The warm-up unit exceeds grace (aborted, cancelled); the fan-out units never
     // run.
@@ -524,7 +660,102 @@ async fn cancellation_during_warmup_prevents_fanout() {
 async fn empty_run_is_success() {
     let units: Vec<Arc<FakeUnit>> = Vec::new();
     let token = CancellationToken::new();
-    let summary = scheduler::run(units, cfg(4, true), &token).await;
+    let summary = scheduler::run(
+        units,
+        cfg(4, true),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
     assert_eq!(summary, scheduler::Summary::default());
     assert_eq!(summary.exit_code(), 0);
+}
+
+// AC: M10 — the scheduler reports the runnable total once and ticks exactly `total`
+// times, with the Done/Failed split matching the returned summary. Stage boundaries
+// (stage_start/stage_finish) are the stage runners' job, not the scheduler's.
+#[tokio::test]
+async fn scheduler_reports_unit_total_and_per_unit_ticks() {
+    let units: Vec<Arc<FakeUnit>> = vec![
+        Arc::new(FakeUnit::new(0).outcome(UnitOutcome::Done)),
+        Arc::new(FakeUnit::new(1).outcome(UnitOutcome::Failed)),
+        Arc::new(FakeUnit::new(2).outcome(UnitOutcome::Done)),
+        Arc::new(FakeUnit::new(3).outcome(UnitOutcome::Done)),
+        Arc::new(FakeUnit::new(4).outcome(UnitOutcome::Failed)),
+    ];
+    let token = CancellationToken::new();
+    let progress = Arc::new(RecordingProgress::default());
+    let summary = scheduler::run(units, cfg(2, false), &token, progress.clone()).await;
+
+    assert_eq!(summary.done, 3);
+    assert_eq!(summary.failed, 2);
+
+    // The runnable total is reported once and equals the number of units.
+    assert_eq!(progress.units_total(), Some(5));
+    // Exactly `total` unit ticks, split to match the summary.
+    let (done, failed) = progress.finished();
+    assert_eq!(done, summary.done);
+    assert_eq!(failed, summary.failed);
+    assert_eq!(done + failed, 5);
+
+    // The scheduler emits neither stage_start nor stage_finish (runner-owned).
+    let events = progress.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ProgEvent::StageStart(_) | ProgEvent::StageFinish(_))),
+        "scheduler must not emit stage boundaries: {events:?}"
+    );
+    // stage_units is reported before any unit tick.
+    assert_eq!(events.first(), Some(&ProgEvent::StageUnits(5)));
+}
+
+// AC: M10 (resume) — already-`done` units are skipped, so the reported total counts
+// only the remaining runnable units and exactly that many ticks fire.
+#[tokio::test]
+async fn scheduler_reports_only_remaining_units_on_resume() {
+    let units: Vec<Arc<FakeUnit>> = vec![
+        Arc::new(FakeUnit::new(0).state(UnitState::Done)),
+        Arc::new(FakeUnit::new(1).state(UnitState::Done)),
+        Arc::new(FakeUnit::new(2).state(UnitState::Pending)),
+        Arc::new(FakeUnit::new(3).state(UnitState::Pending)),
+        Arc::new(FakeUnit::new(4).state(UnitState::Pending)),
+    ];
+    let token = CancellationToken::new();
+    let progress = Arc::new(RecordingProgress::default());
+    let summary = scheduler::run(units, cfg(2, false), &token, progress.clone()).await;
+
+    assert_eq!(summary.done, 3);
+    // Only the three remaining units are reported and ticked, not all five.
+    assert_eq!(progress.units_total(), Some(3));
+    let (done, failed) = progress.finished();
+    assert_eq!(done, 3);
+    assert_eq!(failed, 0);
+}
+
+// AC: M10 (cancellation) — a unit aborted after the grace deadline never ticks (its
+// task is dropped before the tick), so progress does not double-count and does not
+// panic; the summary still counts it as cancelled.
+#[tokio::test(start_paused = true)]
+async fn post_grace_aborted_unit_drops_its_tick() {
+    let token = CancellationToken::new();
+    let slow = Arc::new(
+        FakeUnit::new(0)
+            .cancel_on_run(token.clone())
+            .sleep(Duration::from_secs(100)),
+    );
+    let never = Arc::new(FakeUnit::new(1));
+
+    let units: Vec<Arc<FakeUnit>> = vec![slow.clone(), never.clone()];
+    let progress = Arc::new(RecordingProgress::default());
+    let summary = scheduler::run(units, cfg(1, false), &token, progress.clone()).await;
+
+    assert_eq!(summary.cancelled, 2);
+    // The grace-exceeded unit was aborted before it could tick; the never-dispatched
+    // unit never ran. So no unit tick was recorded at all.
+    let (done, failed) = progress.finished();
+    assert_eq!(done, 0);
+    assert_eq!(failed, 0);
+    // The runnable total was still reported.
+    assert_eq!(progress.units_total(), Some(2));
 }

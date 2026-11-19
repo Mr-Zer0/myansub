@@ -14,6 +14,7 @@ pub mod input;
 pub mod invalidation;
 pub mod orchestrator;
 pub mod output;
+pub mod progress;
 pub mod scheduler;
 pub mod translation;
 
@@ -42,6 +43,7 @@ pub use output::{
     default_output_path, resolve_output_format_from_flags, resolve_output_target, run_output,
     store_creation_prefs, stored_output_prefs,
 };
+pub use progress::{NoopProgress, Progress, ProgressStage};
 pub use scheduler::{SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};
 pub use translation::{
     TranslationFlags, TranslationOutcome, TranslationParams, dry_run_translation,

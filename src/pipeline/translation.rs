@@ -83,6 +83,7 @@ use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
 use super::error::PipelineError;
 use super::input::check_source_unchanged;
 use super::orchestrator::{can_run, load_state};
+use super::progress::{Progress, ProgressStage};
 use super::scheduler::{self, SchedulerConfig, UnitOutcome, UnitState, WorkUnit};
 
 /// Per-line JSON overhead (ids, keys, quotes, separators) added to the output
@@ -228,6 +229,7 @@ pub async fn prepare_translation(
 /// prefix and scene/speaker context, plans the batches (creating them once),
 /// schedules them, and reports where it stopped. The caller supplies a
 /// [`CancellationToken`] threaded to the scheduler and every LLM call.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_translation<T>(
     transport: T,
     store: &Store,
@@ -235,6 +237,7 @@ pub async fn run_translation<T>(
     params: &TranslationParams,
     flags: TranslationFlags,
     token: &CancellationToken,
+    progress: Arc<dyn Progress>,
 ) -> Result<TranslationOutcome, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
@@ -330,7 +333,9 @@ where
         .collect();
     let total = units.len();
 
-    let _summary = scheduler::run(units, params.scheduler, token).await;
+    progress.stage_start(ProgressStage::Translation);
+    let summary = scheduler::run(units, params.scheduler, token, progress.clone()).await;
+    progress.stage_finish(summary);
 
     if token.is_cancelled() {
         return Ok(TranslationOutcome::Interrupted);
@@ -382,6 +387,7 @@ pub async fn run_translation_confirmed<T, MK>(
     token: &CancellationToken,
     prices: &PriceTable,
     settings: ConfirmSettings,
+    progress: Arc<dyn Progress>,
 ) -> Result<ConfirmedRun<TranslationOutcome>, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
@@ -402,7 +408,7 @@ where
         cost: report.estimated_cost,
     };
     confirm::gate(estimate, settings, make_transport, |transport| {
-        run_translation(transport, store, cues, params, flags, token)
+        run_translation(transport, store, cues, params, flags, token, progress)
     })
     .await
 }

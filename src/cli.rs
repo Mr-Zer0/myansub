@@ -25,6 +25,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub yes: bool,
 
+    /// Suppress the live progress display (docs/CLI.md §8).
+    #[arg(long, global = true)]
+    pub no_progress: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

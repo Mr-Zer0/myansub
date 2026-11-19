@@ -59,7 +59,8 @@ use super::confirm::{self, ConfirmSettings, ConfirmedRun, CostEstimate};
 use super::error::PipelineError;
 use super::input::check_source_unchanged;
 use super::orchestrator::{can_run, load_state};
-use super::scheduler::{self, SchedulerConfig, UnitOutcome, UnitState, WorkUnit};
+use super::progress::{Progress, ProgressStage};
+use super::scheduler::{self, SchedulerConfig, Summary, UnitOutcome, UnitState, WorkUnit};
 
 /// Characters per output token for the analysis-document estimate. The document is
 /// predominantly English JSON, for which ~4 chars/token is standard; the few Burmese
@@ -244,6 +245,7 @@ pub fn analysis_exit_code(cancelled: bool, outcome: &AnalysisOutcome) -> i32 {
 /// estimate, honours `--redo`/`--retry-failed`, and stores a new, unapproved
 /// analysis version on success. The caller supplies a [`CancellationToken`] that is
 /// threaded to the scheduler and every LLM call.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_analysis<T>(
     transport: T,
     store: &Store,
@@ -251,6 +253,7 @@ pub async fn run_analysis<T>(
     params: &AnalysisParams,
     flags: AnalysisFlags,
     token: &CancellationToken,
+    progress: Arc<dyn Progress>,
 ) -> Result<AnalysisOutcome, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
@@ -283,10 +286,10 @@ where
     );
     match plan.kind {
         AnalysisModeKind::SinglePass => {
-            run_single_pass(&transport, store, cues, params, token).await
+            run_single_pass(&transport, store, cues, params, token, progress).await
         }
         AnalysisModeKind::MapReduce => {
-            run_map_reduce(transport, store, cues, plan.chunks, params, token).await
+            run_map_reduce(transport, store, cues, plan.chunks, params, token, progress).await
         }
     }
 }
@@ -308,6 +311,7 @@ pub async fn run_analysis_confirmed<T, MK>(
     token: &CancellationToken,
     prices: &PriceTable,
     settings: ConfirmSettings,
+    progress: Arc<dyn Progress>,
 ) -> Result<ConfirmedRun<AnalysisOutcome>, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
@@ -320,7 +324,7 @@ where
         cost: report.estimated_cost,
     };
     confirm::gate(estimate, settings, make_transport, |transport| {
-        run_analysis(transport, store, cues, params, flags, token)
+        run_analysis(transport, store, cues, params, flags, token, progress)
     })
     .await
 }
@@ -348,23 +352,86 @@ async fn run_single_pass<T>(
     cues: &[Cue],
     params: &AnalysisParams,
     token: &CancellationToken,
+    progress: Arc<dyn Progress>,
 ) -> Result<AnalysisOutcome, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
 {
+    // Single-pass is one logical unit of work; report it as a one-unit stage so the
+    // operator still sees live progress on the common small-input path (§11).
+    progress.stage_start(ProgressStage::Analysis);
+    progress.stage_units(1);
     let req = transcript_request(full_transcript(cues), params);
     let env = CallEnv::new(transport, store, params, token);
-    match call_validated(&env, None, req, validate_full).await {
+    let result = call_validated(&env, None, req, validate_full).await;
+
+    // Resolve the call (including the `store_version` DB write, which can itself fail)
+    // into a single `(optional tick, summary, return value)` triple, then emit the
+    // tick + `stage_finish` exactly once below. This guarantees a terminating
+    // `stage_finish` on EVERY path — including the `store_version` error — so the
+    // renderer's in-place line is always closed with a newline before any error text
+    // reaches stderr and can never collide with it (§11, ADR-046(d)). A ticked unit is
+    // only one that actually finished its work; a cancelled call or an error that
+    // committed nothing finishes the stage without a tick (consistent with a dropped
+    // post-grace tick).
+    let (tick, summary, ret): (
+        Option<UnitOutcome>,
+        Summary,
+        Result<AnalysisOutcome, PipelineError>,
+    ) = match result {
         CallResult::Valid { text, commit } => {
-            let version = store_version(store, text, commit, params).await?;
-            Ok(AnalysisOutcome::Completed { version })
+            match store_version(store, text, commit, params).await {
+                Ok(version) => (
+                    Some(UnitOutcome::Done),
+                    Summary {
+                        done: 1,
+                        ..Summary::default()
+                    },
+                    Ok(AnalysisOutcome::Completed { version }),
+                ),
+                Err(err) => (
+                    None,
+                    Summary {
+                        failed: 1,
+                        ..Summary::default()
+                    },
+                    Err(err),
+                ),
+            }
         }
-        CallResult::Exhausted => Ok(AnalysisOutcome::CompletedWithFailures { failed: 1 }),
-        CallResult::Cancelled => Ok(AnalysisOutcome::Interrupted),
-        CallResult::Transport(err) => Err(PipelineError::Llm(err)),
+        CallResult::Exhausted => (
+            Some(UnitOutcome::Failed),
+            Summary {
+                failed: 1,
+                ..Summary::default()
+            },
+            Ok(AnalysisOutcome::CompletedWithFailures { failed: 1 }),
+        ),
+        CallResult::Cancelled => (
+            None,
+            Summary {
+                cancelled: 1,
+                ..Summary::default()
+            },
+            Ok(AnalysisOutcome::Interrupted),
+        ),
+        CallResult::Transport(err) => (
+            None,
+            Summary {
+                failed: 1,
+                ..Summary::default()
+            },
+            Err(PipelineError::Llm(err)),
+        ),
+    };
+    if let Some(outcome) = tick {
+        progress.unit_finished(outcome);
     }
+    progress.stage_finish(summary);
+    ret
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_map_reduce<T>(
     transport: T,
     store: &Store,
@@ -372,10 +439,12 @@ async fn run_map_reduce<T>(
     chunks: Vec<ChunkBounds>,
     params: &AnalysisParams,
     token: &CancellationToken,
+    progress: Arc<dyn Progress>,
 ) -> Result<AnalysisOutcome, PipelineError>
 where
     T: LlmClient + Clone + Send + Sync + 'static,
 {
+    progress.stage_start(ProgressStage::Analysis);
     // On a fresh run, create the chunk rows and mark the stage running, all in one
     // transaction. On a resume the rows already exist and this is skipped, so a
     // `done` chunk keeps its committed result (`docs/ARCHITECTURE.md` §6).
@@ -421,7 +490,8 @@ where
         })
         .collect();
 
-    let _summary = scheduler::run(units, params.scheduler, token).await;
+    let summary = scheduler::run(units, params.scheduler, token, progress.clone()).await;
+    progress.stage_finish(summary);
 
     if token.is_cancelled() {
         return Ok(AnalysisOutcome::Interrupted);
