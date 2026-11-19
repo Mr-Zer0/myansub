@@ -36,8 +36,8 @@ use crate::llm::dry_run::{DryRun, Estimator};
 use crate::llm::metered::CallContext;
 use crate::llm::pricing::{self, Cost, PriceTable};
 use crate::llm::prompts::{
-    PROMPT_VERSION, analysis_input_line, analysis_reduce_instruction, analysis_system_instruction,
-    strict_retry_reminder,
+    CapKind, PROMPT_VERSION, analysis_cap_retry_reminder, analysis_input_line,
+    analysis_reduce_instruction, analysis_system_instruction, strict_retry_reminder,
 };
 use crate::llm::retry::RetryConfig;
 use crate::llm::schemas::analysis_response_schema;
@@ -710,12 +710,30 @@ fn generation_config(thinking: ThinkingSetting) -> GenerationConfig {
     }
 }
 
-/// Appends the strict reminder as a trailing user block for a content retry
-/// (`docs/LLM.md` §6).
-fn with_reminder(mut req: LlmRequest) -> LlmRequest {
+/// Appends the content-retry reminder as a trailing user block, selecting the
+/// cap-aware reminder when the triggering failure was a cap violation and the
+/// generic JSON-shape reminder otherwise (`docs/LLM.md` §6).
+fn with_reminder(mut req: LlmRequest, last_error: Option<&ValidationError>) -> LlmRequest {
     req.contents
-        .push(ContentBlock::user(strict_retry_reminder()));
+        .push(ContentBlock::user(retry_reminder_for(last_error)));
     req
+}
+
+/// Chooses the content-retry reminder text for the failure that triggered the retry
+/// (`docs/LLM.md` §6). A cap violation — valid JSON over a per-field limit — gets the
+/// corrective, cap-aware reminder naming the field and its limit; every genuine
+/// JSON/shape failure (parse error, missing field, wrong type) keeps the existing
+/// strict reminder. A missing error (defensive) also uses the strict reminder.
+fn retry_reminder_for(last_error: Option<&ValidationError>) -> String {
+    match last_error {
+        Some(ValidationError::CapExceeded { field, cap, actual }) => {
+            analysis_cap_retry_reminder(field, CapKind::Entries, *cap, *actual)
+        }
+        Some(ValidationError::StringTooLong { field, cap, actual }) => {
+            analysis_cap_retry_reminder(field, CapKind::Characters, *cap, *actual)
+        }
+        _ => strict_retry_reminder(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +795,7 @@ where
     V: Fn(&str) -> Result<(), ValidationError>,
 {
     let mut attempt = 0u32;
+    let mut last_error: Option<ValidationError> = None;
     loop {
         if env.token.is_cancelled() {
             return CallResult::Cancelled;
@@ -784,7 +803,7 @@ where
         let req = if attempt == 0 {
             base_req.clone()
         } else {
-            with_reminder(base_req.clone())
+            with_reminder(base_req.clone(), last_error.as_ref())
         };
 
         let ctx = CallContext {
@@ -815,6 +834,7 @@ where
                         attempt,
                         "analysis response failed validation ({err}); content retry"
                     );
+                    last_error = Some(err);
                     attempt += 1;
                     if attempt >= env.max_content_attempts {
                         return CallResult::Exhausted;
@@ -843,10 +863,18 @@ enum ValidationError {
     Missing(&'static str),
     #[error("field `{0}` has the wrong type")]
     WrongType(&'static str),
-    #[error("array `{0}` exceeds its cap")]
-    CapExceeded(&'static str),
-    #[error("string `{0}` exceeds its length cap")]
-    StringTooLong(&'static str),
+    #[error("array `{field}` has {actual} entries, over its cap of {cap}")]
+    CapExceeded {
+        field: &'static str,
+        cap: usize,
+        actual: usize,
+    },
+    #[error("string `{field}` is {actual} chars, over its length cap of {cap}")]
+    StringTooLong {
+        field: &'static str,
+        cap: usize,
+        actual: usize,
+    },
 }
 
 /// Validates a full analysis document leniently (`docs/DATA_MODEL.md` §3): it must
@@ -940,10 +968,11 @@ fn string_cap(
     field: &'static str,
     cap: usize,
 ) -> Result<(), ValidationError> {
-    if let Some(serde_json::Value::String(s)) = value
-        && s.chars().count() > cap
-    {
-        return Err(ValidationError::StringTooLong(field));
+    if let Some(serde_json::Value::String(s)) = value {
+        let actual = s.chars().count();
+        if actual > cap {
+            return Err(ValidationError::StringTooLong { field, cap, actual });
+        }
     }
     Ok(())
 }
@@ -958,7 +987,11 @@ fn array_cap(
     if let Some(serde_json::Value::Array(a)) = value
         && a.len() > cap
     {
-        return Err(ValidationError::CapExceeded(field));
+        return Err(ValidationError::CapExceeded {
+            field,
+            cap,
+            actual: a.len(),
+        });
     }
     Ok(())
 }
@@ -1000,7 +1033,11 @@ fn require_array_within(
 ) -> Result<(), ValidationError> {
     match obj.get(field) {
         Some(serde_json::Value::Array(a)) if a.len() <= cap => Ok(()),
-        Some(serde_json::Value::Array(_)) => Err(ValidationError::CapExceeded(field)),
+        Some(serde_json::Value::Array(a)) => Err(ValidationError::CapExceeded {
+            field,
+            cap,
+            actual: a.len(),
+        }),
         Some(_) => Err(ValidationError::WrongType(field)),
         None => Err(ValidationError::Missing(field)),
     }
@@ -1013,7 +1050,11 @@ fn optional_array_within(
 ) -> Result<(), ValidationError> {
     match obj.get(field) {
         Some(serde_json::Value::Array(a)) if a.len() <= cap => Ok(()),
-        Some(serde_json::Value::Array(_)) => Err(ValidationError::CapExceeded(field)),
+        Some(serde_json::Value::Array(a)) => Err(ValidationError::CapExceeded {
+            field,
+            cap,
+            actual: a.len(),
+        }),
         Some(_) => Err(ValidationError::WrongType(field)),
         None => Ok(()),
     }
@@ -1213,8 +1254,83 @@ impl<T> AnalysisChunkUnit<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ValidationError, validate_full};
+    use super::{ValidationError, retry_reminder_for, validate_full};
     use serde_json::json;
+
+    // QA item D (ADR-045): a retry triggered by an over-length string selects the
+    // corrective, cap-aware reminder — it names the field and its limit and tells the
+    // model to shorten, and does NOT falsely claim the JSON was invalid.
+    #[test]
+    fn retry_reminder_for_string_cap_is_cap_aware() {
+        let err = ValidationError::StringTooLong {
+            field: "premise",
+            cap: 500,
+            actual: 612,
+        };
+        let text = retry_reminder_for(Some(&err));
+        assert!(text.contains("premise"), "names the field: {text}");
+        assert!(text.contains("500"), "states the limit: {text}");
+        assert!(text.contains("612"), "states the offending value: {text}");
+        assert!(
+            text.to_lowercase().contains("shorten"),
+            "tells to shorten: {text}"
+        );
+        assert!(
+            text.contains("ONLY a single JSON object"),
+            "stays parseable: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("not valid json"),
+            "must not claim invalid JSON: {text}"
+        );
+    }
+
+    // QA item D (ADR-045): a retry triggered by an over-cap array selects the cap-aware
+    // reminder naming the entry limit.
+    #[test]
+    fn retry_reminder_for_array_cap_is_cap_aware() {
+        let err = ValidationError::CapExceeded {
+            field: "unresolved_ambiguities",
+            cap: 12,
+            actual: 15,
+        };
+        let text = retry_reminder_for(Some(&err));
+        assert!(
+            text.contains("unresolved_ambiguities"),
+            "names the field: {text}"
+        );
+        assert!(text.contains("12"), "states the limit: {text}");
+        assert!(text.contains("entries"), "describes an entry cap: {text}");
+        assert!(
+            !text.to_lowercase().contains("not valid json"),
+            "must not claim invalid JSON: {text}"
+        );
+    }
+
+    // QA item D (ADR-045): a non-cap validation failure (missing field, parse error,
+    // wrong type) keeps the existing JSON-shape reminder, unchanged.
+    #[test]
+    fn retry_reminder_for_non_cap_failure_uses_strict_reminder() {
+        for err in [
+            ValidationError::Missing("premise"),
+            ValidationError::Parse("expected value".to_string()),
+            ValidationError::NotObject,
+            ValidationError::WrongType("schema_version"),
+        ] {
+            let text = retry_reminder_for(Some(&err));
+            assert_eq!(
+                text,
+                super::strict_retry_reminder(),
+                "non-cap keeps strict text"
+            );
+            assert!(
+                text.contains("not valid JSON"),
+                "strict reminder text: {text}"
+            );
+        }
+        // A missing error (defensive) also falls back to the strict reminder.
+        assert_eq!(retry_reminder_for(None), super::strict_retry_reminder());
+    }
 
     /// A minimal analysis document that satisfies every §3 cap.
     fn base_doc() -> serde_json::Value {
@@ -1263,7 +1379,10 @@ mod tests {
         doc["characters"] = serde_json::Value::Array(vec![one; 41]);
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::CapExceeded("characters"))
+            Err(ValidationError::CapExceeded {
+                field: "characters",
+                ..
+            })
         ));
     }
 
@@ -1273,7 +1392,10 @@ mod tests {
         doc["premise"] = json!("x".repeat(501));
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::StringTooLong("premise"))
+            Err(ValidationError::StringTooLong {
+                field: "premise",
+                ..
+            })
         ));
         // Exactly at the cap is fine.
         doc["premise"] = json!("x".repeat(500));
@@ -1286,7 +1408,10 @@ mod tests {
         doc["characters"][0]["name"] = json!("x".repeat(121));
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::StringTooLong("characters[].name"))
+            Err(ValidationError::StringTooLong {
+                field: "characters[].name",
+                ..
+            })
         ));
     }
 
@@ -1296,7 +1421,10 @@ mod tests {
         doc["scenes"][0]["summary"] = json!("x".repeat(301));
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::StringTooLong("scenes[].summary"))
+            Err(ValidationError::StringTooLong {
+                field: "scenes[].summary",
+                ..
+            })
         ));
     }
 
@@ -1306,7 +1434,10 @@ mod tests {
         doc["characters"][0]["aliases"] = serde_json::Value::Array(vec![json!("a"); 9]);
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::CapExceeded("characters[].aliases"))
+            Err(ValidationError::CapExceeded {
+                field: "characters[].aliases",
+                ..
+            })
         ));
     }
 
@@ -1316,7 +1447,10 @@ mod tests {
         doc["style_rules"] = serde_json::Value::Array(vec![json!("r"); 13]);
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::CapExceeded("style_rules"))
+            Err(ValidationError::CapExceeded {
+                field: "style_rules",
+                ..
+            })
         ));
     }
 
@@ -1338,7 +1472,10 @@ mod tests {
         doc["unresolved_ambiguities"] = serde_json::Value::Array(vec![json!("a"); 13]);
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::CapExceeded("unresolved_ambiguities"))
+            Err(ValidationError::CapExceeded {
+                field: "unresolved_ambiguities",
+                ..
+            })
         ));
         // Exactly at the cap is fine.
         doc["unresolved_ambiguities"] = serde_json::Value::Array(vec![json!("a"); 12]);
@@ -1351,7 +1488,10 @@ mod tests {
         doc["unresolved_ambiguities"] = json!(["x".repeat(221)]);
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::StringTooLong("unresolved_ambiguities[]"))
+            Err(ValidationError::StringTooLong {
+                field: "unresolved_ambiguities[]",
+                ..
+            })
         ));
         // Exactly at the cap is fine.
         doc["unresolved_ambiguities"] = json!(["x".repeat(220)]);
@@ -1364,7 +1504,10 @@ mod tests {
         doc["address_matrix"][0]["relation"] = json!("x".repeat(161));
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::StringTooLong("address_matrix[].relation"))
+            Err(ValidationError::StringTooLong {
+                field: "address_matrix[].relation",
+                ..
+            })
         ));
         // Exactly at the cap is fine.
         doc["address_matrix"][0]["relation"] = json!("x".repeat(160));
@@ -1377,7 +1520,10 @@ mod tests {
         doc["glossary"][0]["note"] = json!("x".repeat(181));
         assert!(matches!(
             validate_doc(&doc),
-            Err(ValidationError::StringTooLong("glossary[].note"))
+            Err(ValidationError::StringTooLong {
+                field: "glossary[].note",
+                ..
+            })
         ));
         // Exactly at the cap is fine.
         doc["glossary"][0]["note"] = json!("x".repeat(180));

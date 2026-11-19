@@ -627,3 +627,47 @@ discard real translation work. The analysis version `signature` (`prompt_vN|mode
 stored versions are unaffected. Therefore `PROMPT_VERSION` stays at 2 and no prompt text changed. Consequence: `analyze`
 stops hitting the 400; the exact §3 caps are preserved end-to-end (now in code, with field-located errors); the wire
 schema is smaller and robust to future cap-value tuning (changing a cap no longer risks re-tripping the serving ceiling).
+
+### ADR-045 Cap-aware analysis content-retry reminder; `ValidationError` payload enriched; PROMPT_VERSION 2 → 3 (QA item D)
+Context (`docs/LLM.md` §6, ADR-044, ADR-032): `pipeline::analysis::validate_full` fails an LLM response
+that is valid JSON but over a §3 cap — `CapExceeded` (array too long) or `StringTooLong` (string over its
+per-field cap). The content-retry path appended the generic `strict_retry_reminder`, which told the model
+its previous response "was not valid JSON matching the required analysis schema … respond with ONLY a
+single JSON object." That is factually wrong for a cap failure (the output *was* valid JSON, just over a
+limit) and gives no corrective guidance, so the model regenerated a near-identical over-cap document and
+burned the whole `max_content_attempts` budget (ADR-032) before failing the unit — wasted tokens, and a
+recoverable situation turned into a hard failure.
+
+Decision:
+(a) **Cap-aware reminder.** A new `prompts::analysis_cap_retry_reminder(field, CapKind, limit, actual)`
+builds a corrective reminder that names the offending field, states the exact limit and the offending
+value ("`premise` must be at most 500 characters (yours was 612)" / "`unresolved_ambiguities` must have at
+most 12 entries (yours had 15)"), and instructs the model to shorten (strings) or reduce (arrays) — while
+still demanding ONLY a single JSON object so the retry stays parseable. It deliberately does **not** claim
+the output was invalid JSON. The generic `strict_retry_reminder` is unchanged and still used for genuine
+JSON/shape failures (parse error, missing required field, wrong type) and defensively when no error is
+carried.
+
+(b) **Error payload enriched (text only, no enforcement change).** `ValidationError::CapExceeded` and
+`StringTooLong` became struct variants carrying `{ field, cap, actual }` so the reminder can name the exact
+limit and offending value. Only the payload grew; **no cap value and no `validate_full` enforcement outcome
+changed** (ADR-044 caps and behavior preserved; string lengths still measured in `chars().count()`,
+ADR-036). All construction sites (`string_cap`, `array_cap`, `require_array_within`,
+`optional_array_within`) and the existing `validate_full` unit tests were updated to the struct shape; they
+assert the same triggering field as before.
+
+(c) **Routing stays cohesive.** `prompts.rs` builds the text; `pipeline::analysis::retry_reminder_for`
+decides which builder to call from the last `ValidationError`, and `call_validated` threads the last error
+into `with_reminder`. This is the analysis path only; the translation tier-specific reminders
+(ADR-037(d)) are untouched.
+
+(d) **`PROMPT_VERSION` 2 → 3 and cache consequence.** Adding reminder prompt text bumps `PROMPT_VERSION`
+per `CLAUDE.md`. `PROMPT_VERSION` is a single global folded into every cache key (`docs/LLM.md` §4) and
+every translation `input_hash` (§3), so the bump re-keys the translation cache too; this is accepted
+because the project's cache is currently cold (no production translations depend on version 2). The
+cap-aware reminder text participates in the local response-cache key only for **retry** requests (the
+reminder is a trailing `contents` block that appears only on attempt > 0); the first-attempt request prompt
+is byte-identical to before except for the version bump, so first-attempt keys change only because of
+`PROMPT_VERSION`. The `tests/llm_support.rs` version assertion was renamed `prompt_version_is_three` and
+asserts 3. Consequence: on a cap failure the model now receives actionable, field-located guidance and can
+recover within budget instead of exhausting it on a misleading "invalid JSON" message.

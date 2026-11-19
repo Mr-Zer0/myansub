@@ -168,6 +168,19 @@ On a transport-successful but invalid response:
 
 Content and transport attempts are counted separately.
 
+**Analysis content retries (cap-aware reminder).** The analysis stage (`pipeline/analysis.rs`)
+shares the same budget (`translation.max_content_attempts`, ADR-032) but distinguishes two failure
+kinds when choosing its reminder (ADR-045). A genuine JSON/shape failure (unparseable, missing
+required field, wrong type) uses the generic `strict_retry_reminder` ("…was not valid JSON matching
+the required analysis schema…"). A **cap violation** — valid JSON whose array exceeds its element cap
+(`CapExceeded`) or whose string exceeds its per-field length cap (`StringTooLong`, §3 caps enforced in
+`validate_full`, ADR-044) — instead uses a corrective `analysis_cap_retry_reminder` that names the
+offending field, states the exact limit and the offending value ("`premise` must be at most 500
+characters (yours was 612)"), and tells the model to shorten/reduce it — while still requiring ONLY a
+single JSON object so the retry stays parseable. Telling the model its cap-over output "was not valid
+JSON" gave no corrective guidance and burned the whole budget regenerating a near-identical over-cap
+document; the cap-aware reminder lets the model fix the field and succeed on retry.
+
 ## 7. Selective invalidation
 
 When a new analysis version is approved after translations exist, diff old vs new:

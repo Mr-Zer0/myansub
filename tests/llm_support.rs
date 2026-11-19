@@ -11,14 +11,68 @@ use myansub::llm::client::{
     LlmResponse, Secret, ServiceTier, ThinkingSetting, Usage,
 };
 use myansub::llm::prompts::{
-    self, PROMPT_VERSION, TranslationBlock, TranslationLine, analysis_input_line,
+    self, CapKind, PROMPT_VERSION, TranslationBlock, TranslationLine, analysis_cap_retry_reminder,
+    analysis_input_line,
 };
 use myansub::llm::retry::Xorshift;
 use myansub::llm::schemas::{analysis_response_schema, translation_response_schema};
 
 #[test]
-fn prompt_version_is_two() {
-    assert_eq!(PROMPT_VERSION, 2);
+fn prompt_version_is_three() {
+    assert_eq!(PROMPT_VERSION, 3);
+}
+
+// QA item D (ADR-045): a cap-aware content-retry reminder for an over-length string
+// names the field and its character limit, tells the model to shorten, still demands
+// a single JSON object, and never claims the output was invalid JSON.
+#[test]
+fn analysis_cap_retry_reminder_for_string_names_limit_and_shortens() {
+    let text = analysis_cap_retry_reminder("premise", CapKind::Characters, 500, 612);
+    assert!(text.contains("premise"), "names the field: {text}");
+    assert!(text.contains("500"), "states the limit: {text}");
+    assert!(text.contains("612"), "states the offending value: {text}");
+    assert!(
+        text.contains("characters"),
+        "describes a character cap: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("shorten"),
+        "tells the model to shorten: {text}"
+    );
+    assert!(
+        text.contains("ONLY a single JSON object"),
+        "still demands a single JSON object: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("not valid json"),
+        "must not claim the output was invalid JSON: {text}"
+    );
+}
+
+// QA item D (ADR-045): the array-cap variant describes entries, states the limit,
+// and tells the model to reduce the field.
+#[test]
+fn analysis_cap_retry_reminder_for_array_names_entries_and_reduces() {
+    let text = analysis_cap_retry_reminder("unresolved_ambiguities", CapKind::Entries, 12, 15);
+    assert!(
+        text.contains("unresolved_ambiguities"),
+        "names the field: {text}"
+    );
+    assert!(text.contains("12"), "states the limit: {text}");
+    assert!(text.contains("15"), "states the offending count: {text}");
+    assert!(text.contains("entries"), "describes an entry cap: {text}");
+    assert!(
+        text.to_lowercase().contains("reduce"),
+        "tells the model to reduce: {text}"
+    );
+    assert!(
+        text.contains("ONLY a single JSON object"),
+        "still demands a single JSON object: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("not valid json"),
+        "must not claim the output was invalid JSON: {text}"
+    );
 }
 
 #[test]
