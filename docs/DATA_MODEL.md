@@ -174,8 +174,13 @@ deferred from M4-B).
 
 ## 3. Analysis document (schema_version 1)
 
-Prose fields are written in English. Limits are enforced both in the Gemini response schema
-and in serde validation on import.
+Prose fields are written in English. The array caps and the per-field string-length limits
+below are enforced **in code** — in `pipeline::analysis::validate_full` on LLM output and in
+`review::analysis` on user import — **not** in the Gemini wire schema. They were removed from
+the `responseJsonSchema` because stacking many `maxLength` character-counting states across the
+large object arrays overflows Gemini's constrained-decoding serving ceiling (HTTP 400 "too many
+states for serving"); see ADR-044. The wire schema still carries the full document *shape*
+(types, `required`, enums, and `cue_range`'s fixed 2-element bound).
 
 ```json
 {
@@ -215,7 +220,8 @@ and in serde validation on import.
 }
 ```
 
-Array caps: characters ≤ 40, address_matrix ≤ 80, glossary ≤ 120, scenes ≤ 120.
+Array caps (enforced in code, ADR-044): characters ≤ 40, address_matrix ≤ 80, glossary ≤ 120,
+scenes ≤ 120, each character's `aliases` ≤ 8, `style_rules` ≤ 12, `unresolved_ambiguities` ≤ 12.
 
 Validation rules on import:
 - `from`, `to`, and `speakers` must reference existing character ids.

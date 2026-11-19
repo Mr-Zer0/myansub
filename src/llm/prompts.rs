@@ -12,7 +12,9 @@
 ///
 /// v2: the translation content-retry reminders became tier-specific
 /// ([`translation_missing_ids_reminder`], [`translation_per_line_reminder`]).
-pub const PROMPT_VERSION: u32 = 2;
+/// v3: the analysis content retry gained a cap-aware reminder
+/// ([`analysis_cap_retry_reminder`]) for cap violations (QA item D, ADR-045).
+pub const PROMPT_VERSION: u32 = 3;
 
 /// The static system instruction for the analysis stage (`docs/LLM.md` §2,
 /// "Analysis prompt"). English prose; the output is the analysis document
@@ -47,10 +49,56 @@ pub fn translation_system_instruction() -> String {
 
 /// The strict reminder appended to a unit's request on a content retry
 /// (`docs/LLM.md` §6). This is prompt text: any edit must bump [`PROMPT_VERSION`].
+///
+/// Used for genuine JSON/shape failures (unparseable, missing field, wrong type).
+/// A cap violation — valid JSON over a per-field limit — uses the corrective
+/// [`analysis_cap_retry_reminder`] instead, so the model is not falsely told its
+/// output was invalid JSON (QA item D, ADR-045).
 pub fn strict_retry_reminder() -> String {
     "Your previous response was not valid JSON matching the required analysis schema. Respond with \
      ONLY a single JSON object matching the analysis document schema — no prose, no code fences."
         .to_string()
+}
+
+/// Which kind of cap an [`analysis_cap_retry_reminder`] is correcting: an array
+/// field with too many entries, or a string field that is too long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapKind {
+    /// An array field exceeded its element-count cap.
+    Entries,
+    /// A string field exceeded its character-length cap.
+    Characters,
+}
+
+/// The cap-aware reminder appended to an analysis request on a content retry that
+/// was triggered by a cap violation (`docs/LLM.md` §6). Unlike
+/// [`strict_retry_reminder`], it does NOT claim the output was invalid JSON (it was
+/// valid, just over a limit): it names the offending `field`, states the exact
+/// `limit` and the offending `actual` value, and instructs the model to shorten or
+/// reduce it — while still requiring ONLY a single JSON object so the output stays
+/// parseable (QA item D, ADR-045). This is prompt text: any edit must bump
+/// [`PROMPT_VERSION`].
+pub fn analysis_cap_retry_reminder(
+    field: &str,
+    kind: CapKind,
+    limit: usize,
+    actual: usize,
+) -> String {
+    let (limit_clause, verb) = match kind {
+        CapKind::Characters => (
+            format!("must be at most {limit} characters (yours was {actual})"),
+            "Shorten",
+        ),
+        CapKind::Entries => (
+            format!("must have at most {limit} entries (yours had {actual})"),
+            "Reduce",
+        ),
+    };
+    format!(
+        "Your previous response was valid JSON but exceeded a required limit: `{field}` \
+         {limit_clause}. {verb} the over-limit field(s) and respond with ONLY a single JSON object \
+         matching the analysis document schema — no prose, no code fences."
+    )
 }
 
 /// The tier-1 reminder appended to a translation batch's request when the previous

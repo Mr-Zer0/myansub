@@ -150,6 +150,7 @@ model the schemas in `llm/schemas.rs` using only keywords valid in both dialects
 transport (`gemini.rs`, M3-B) send them under `responseJsonSchema`. Consequence: the modeled
 `serde_json::Value` is compatible either way; only the wire field name in `gemini.rs` is affected,
 and it should be `responseJsonSchema`. Bump `PROMPT_VERSION` if the schema shape later changes.
+Superseded in part by ADR-044 (analysis wire schema no longer carries `maxItems`/`maxLength`; caps enforced in code).
 
 ### ADR-026 Retry policy takes the jitter factor as a parameter
 Context: `docs/LLM.md` §6 requires full jitter on backoff but the policy must be a pure function
@@ -583,3 +584,90 @@ passing M5-B / M8-A integration tests, which the test-first guardrail forbids ("
 are therefore kept with explicit doc-warnings stating they must not clear a gate in production and exist only to
 exercise the review-stage / §7-diff mechanics in tests. They are `pub` + test-exercised, so clippy raises no
 dead-code warning.
+
+### ADR-044 Analysis caps moved out of the Gemini wire schema into post-parse validation (amends ADR-025)
+Context: `analyze` failed in production with Gemini HTTP 400 — "The specified schema produces a constraint that has too
+many states for serving. Typical causes … schemas with long array length limits (especially when nested) … strings with
+complex formats." `llm/schemas.rs::analysis_response_schema()` sent a `responseJsonSchema` whose large `maxItems` object arrays
+(`characters` 40, `address_matrix` 80, `glossary` 120, `scenes` 120) were on their own enough to overflow Gemini's
+constrained-decoding serving ceiling: array-length bounds that large — especially when nested — are the documented
+cause. The schema also carried many `maxLength`-capped string fields (name, aliases, role, speech_style, relation,
+term/target/note, summary, mood, premise, tone, style_rules, unresolved_ambiguities), but those contributed **nothing**
+to the state machine. Verified against the live Gemini structured-output docs: `maxLength`/`minLength` are ignored
+during constrained decoding, so they add no character-counting states. The large `maxItems` arrays alone were the
+necessary and sufficient trigger. `translation_response_schema()` has no such bounds and was always fine; only analysis
+failed.
+
+Decision: remove **all** `maxLength` and all large/list `maxItems` (`characters`/`address_matrix`/`glossary`/`scenes`,
+and `aliases`/`style_rules`/`unresolved_ambiguities`) from the analysis wire schema, keeping only the document *shape* —
+`type`, `properties`, `required`, the small `enum`s (gender, age_group, register; cheap and safe), and `cue_range`'s
+fixed `minItems`/`maxItems` of 2. Dropping the large `maxItems` is the actual fix; dropping `maxLength` alongside it is
+harmless cleanup (the server ignored it anyway), **but** it unlocked a genuine improvement: the §3 caps (characters ≤
+40, address_matrix ≤ 80, glossary ≤ 120, scenes ≤ 120, aliases ≤ 8, style_rules ≤ 12, unresolved_ambiguities ≤ 12) and
+every per-field string-length limit are now enforced in Rust **after** parsing, in `pipeline::analysis::validate_full`
+(the LLM-output path). Moving string-length checks into `validate_full` closed a latent gap: because Gemini ignored
+`maxLength` and `validate_full` did not previously check string lengths, over-length strings on the LLM-output path had
+been validated by nothing. The user-import path (`review::analysis`) already enforced the same caps in code
+(ADR-035/036), so both paths now agree and the wire schema is bound-free. This amends ADR-025, which modeled the schema "using `maxItems`, `maxLength`, `minItems`"; those two
+keywords are no longer used by the analysis schema (the translation schema never used them).
+
+**Over-cap behavior: hard validation error (fail loud), not truncation.** An over-cap array or over-length string is a
+`ValidationError` (`CapExceeded` / the new `StringTooLong`), which drives the standard content retry with a strict
+reminder (`docs/LLM.md` §6) and, if never satisfied within `max_content_attempts`, fails the unit — never silently
+truncating the model's content. This matches the pre-existing treatment of the big array caps (`CapExceeded` already
+drove the content retry) and the brief's "prefer a typed validation error over silent truncation". String lengths are
+measured in `chars().count()` (not graphemes), consistent with ADR-036.
+
+**`PROMPT_VERSION` / cache keys: no bump.** The local response-cache key (`docs/LLM.md` §4) hashes `generationConfig`,
+which includes the response schema, so the new schema naturally produces a different analysis cache key. But the broken
+schema returned a fatal HTTP 400 and invalid responses are never cached (§4), so there is **no** stored analysis cache
+entry to invalidate — the new key simply misses nothing. `PROMPT_VERSION` is a single global shared with translation;
+bumping it to "invalidate" a non-existent analysis cache would needlessly change every translation `input_hash` and
+discard real translation work. The analysis version `signature` (`prompt_vN|model`) does not include the schema, so
+stored versions are unaffected. Therefore `PROMPT_VERSION` stays at 2 and no prompt text changed. Consequence: `analyze`
+stops hitting the 400; the exact §3 caps are preserved end-to-end (now in code, with field-located errors); the wire
+schema is smaller and robust to future cap-value tuning (changing a cap no longer risks re-tripping the serving ceiling).
+
+### ADR-045 Cap-aware analysis content-retry reminder; `ValidationError` payload enriched; PROMPT_VERSION 2 → 3 (QA item D)
+Context (`docs/LLM.md` §6, ADR-044, ADR-032): `pipeline::analysis::validate_full` fails an LLM response
+that is valid JSON but over a §3 cap — `CapExceeded` (array too long) or `StringTooLong` (string over its
+per-field cap). The content-retry path appended the generic `strict_retry_reminder`, which told the model
+its previous response "was not valid JSON matching the required analysis schema … respond with ONLY a
+single JSON object." That is factually wrong for a cap failure (the output *was* valid JSON, just over a
+limit) and gives no corrective guidance, so the model regenerated a near-identical over-cap document and
+burned the whole `max_content_attempts` budget (ADR-032) before failing the unit — wasted tokens, and a
+recoverable situation turned into a hard failure.
+
+Decision:
+(a) **Cap-aware reminder.** A new `prompts::analysis_cap_retry_reminder(field, CapKind, limit, actual)`
+builds a corrective reminder that names the offending field, states the exact limit and the offending
+value ("`premise` must be at most 500 characters (yours was 612)" / "`unresolved_ambiguities` must have at
+most 12 entries (yours had 15)"), and instructs the model to shorten (strings) or reduce (arrays) — while
+still demanding ONLY a single JSON object so the retry stays parseable. It deliberately does **not** claim
+the output was invalid JSON. The generic `strict_retry_reminder` is unchanged and still used for genuine
+JSON/shape failures (parse error, missing required field, wrong type) and defensively when no error is
+carried.
+
+(b) **Error payload enriched (text only, no enforcement change).** `ValidationError::CapExceeded` and
+`StringTooLong` became struct variants carrying `{ field, cap, actual }` so the reminder can name the exact
+limit and offending value. Only the payload grew; **no cap value and no `validate_full` enforcement outcome
+changed** (ADR-044 caps and behavior preserved; string lengths still measured in `chars().count()`,
+ADR-036). All construction sites (`string_cap`, `array_cap`, `require_array_within`,
+`optional_array_within`) and the existing `validate_full` unit tests were updated to the struct shape; they
+assert the same triggering field as before.
+
+(c) **Routing stays cohesive.** `prompts.rs` builds the text; `pipeline::analysis::retry_reminder_for`
+decides which builder to call from the last `ValidationError`, and `call_validated` threads the last error
+into `with_reminder`. This is the analysis path only; the translation tier-specific reminders
+(ADR-037(d)) are untouched.
+
+(d) **`PROMPT_VERSION` 2 → 3 and cache consequence.** Adding reminder prompt text bumps `PROMPT_VERSION`
+per `CLAUDE.md`. `PROMPT_VERSION` is a single global folded into every cache key (`docs/LLM.md` §4) and
+every translation `input_hash` (§3), so the bump re-keys the translation cache too; this is accepted
+because the project's cache is currently cold (no production translations depend on version 2). The
+cap-aware reminder text participates in the local response-cache key only for **retry** requests (the
+reminder is a trailing `contents` block that appears only on attempt > 0); the first-attempt request prompt
+is byte-identical to before except for the version bump, so first-attempt keys change only because of
+`PROMPT_VERSION`. The `tests/llm_support.rs` version assertion was renamed `prompt_version_is_three` and
+asserts 3. Consequence: on a cap failure the model now receives actionable, field-located guidance and can
+recover within budget instead of exhausting it on a misleading "invalid JSON" message.

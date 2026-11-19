@@ -11,14 +11,68 @@ use myansub::llm::client::{
     LlmResponse, Secret, ServiceTier, ThinkingSetting, Usage,
 };
 use myansub::llm::prompts::{
-    self, PROMPT_VERSION, TranslationBlock, TranslationLine, analysis_input_line,
+    self, CapKind, PROMPT_VERSION, TranslationBlock, TranslationLine, analysis_cap_retry_reminder,
+    analysis_input_line,
 };
 use myansub::llm::retry::Xorshift;
 use myansub::llm::schemas::{analysis_response_schema, translation_response_schema};
 
 #[test]
-fn prompt_version_is_two() {
-    assert_eq!(PROMPT_VERSION, 2);
+fn prompt_version_is_three() {
+    assert_eq!(PROMPT_VERSION, 3);
+}
+
+// QA item D (ADR-045): a cap-aware content-retry reminder for an over-length string
+// names the field and its character limit, tells the model to shorten, still demands
+// a single JSON object, and never claims the output was invalid JSON.
+#[test]
+fn analysis_cap_retry_reminder_for_string_names_limit_and_shortens() {
+    let text = analysis_cap_retry_reminder("premise", CapKind::Characters, 500, 612);
+    assert!(text.contains("premise"), "names the field: {text}");
+    assert!(text.contains("500"), "states the limit: {text}");
+    assert!(text.contains("612"), "states the offending value: {text}");
+    assert!(
+        text.contains("characters"),
+        "describes a character cap: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("shorten"),
+        "tells the model to shorten: {text}"
+    );
+    assert!(
+        text.contains("ONLY a single JSON object"),
+        "still demands a single JSON object: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("not valid json"),
+        "must not claim the output was invalid JSON: {text}"
+    );
+}
+
+// QA item D (ADR-045): the array-cap variant describes entries, states the limit,
+// and tells the model to reduce the field.
+#[test]
+fn analysis_cap_retry_reminder_for_array_names_entries_and_reduces() {
+    let text = analysis_cap_retry_reminder("unresolved_ambiguities", CapKind::Entries, 12, 15);
+    assert!(
+        text.contains("unresolved_ambiguities"),
+        "names the field: {text}"
+    );
+    assert!(text.contains("12"), "states the limit: {text}");
+    assert!(text.contains("15"), "states the offending count: {text}");
+    assert!(text.contains("entries"), "describes an entry cap: {text}");
+    assert!(
+        text.to_lowercase().contains("reduce"),
+        "tells the model to reduce: {text}"
+    );
+    assert!(
+        text.contains("ONLY a single JSON object"),
+        "still demands a single JSON object: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("not valid json"),
+        "must not claim the output was invalid JSON: {text}"
+    );
 }
 
 #[test]
@@ -118,18 +172,84 @@ fn translation_schema_has_lines_with_id_and_t() {
     assert_eq!(schema["required"], serde_json::json!(["lines"]));
 }
 
+/// Recursively collects every object key present anywhere in a JSON value.
+fn collect_keys(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                collect_keys(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_keys(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The largest numeric value held under any `maxItems` key anywhere in the schema.
+fn max_max_items(value: &serde_json::Value) -> u64 {
+    let mut worst = 0u64;
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if k == "maxItems"
+                    && let Some(n) = v.as_u64()
+                {
+                    worst = worst.max(n);
+                }
+                worst = worst.max(max_max_items(v));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                worst = worst.max(max_max_items(v));
+            }
+        }
+        _ => {}
+    }
+    worst
+}
+
+// AC: analysis structured-output regression guard (ADR-044). The analysis wire
+// schema must still describe the document SHAPE, but must carry none of the heavy
+// constrained-decoding bounds that caused Gemini HTTP 400 ("too many states for
+// serving"): no `maxLength` anywhere, and no `maxItems` beyond the tiny fixed
+// `cue_range` bound of 2. The per-field caps now live in post-parse validation.
 #[test]
-fn analysis_schema_has_fields_and_array_caps() {
+fn analysis_schema_describes_shape_without_heavy_bounds() {
     let schema = analysis_response_schema();
     let props = &schema["properties"];
-    assert_eq!(props["characters"]["maxItems"], 40);
-    assert_eq!(props["address_matrix"]["maxItems"], 80);
-    assert_eq!(props["glossary"]["maxItems"], 120);
-    assert_eq!(props["scenes"]["maxItems"], 120);
-    assert_eq!(props["premise"]["maxLength"], 500);
-    // Gender/age enums are modeled.
+
+    // Shape is still fully described.
+    assert_eq!(schema["type"], "object");
+    assert_eq!(props["characters"]["type"], "array");
+    assert_eq!(props["characters"]["items"]["type"], "object");
+    assert_eq!(props["scenes"]["type"], "array");
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["schema_version", "premise", "characters", "scenes"])
+    );
+    // Small, safe enums are kept.
     let gender = &props["characters"]["items"]["properties"]["gender"]["enum"];
     assert_eq!(gender, &serde_json::json!(["m", "f", "unknown"]));
+
+    // Regression guard: no `maxLength` anywhere.
+    let mut keys = Vec::new();
+    collect_keys(&schema, &mut keys);
+    assert!(
+        !keys.iter().any(|k| k == "maxLength"),
+        "analysis schema must contain no maxLength keys (state-explosion guard)"
+    );
+    // Regression guard: no large `maxItems`; only `cue_range`'s fixed bound of 2.
+    let worst = max_max_items(&schema);
+    assert!(
+        worst <= 2,
+        "analysis schema must contain no maxItems > 2 (found {worst})"
+    );
 }
 
 #[test]
