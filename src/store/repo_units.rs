@@ -515,6 +515,25 @@ pub fn requeue_translation_batch(conn: &Connection, batch_no: i64) -> Result<boo
     Ok(changed == 1)
 }
 
+/// Records a new stored `input_hash` on a translation batch within the caller's
+/// transaction, without touching its status (ADR-050). Used by the done-batch
+/// reconciliation when a config-driven prompt change (`[burmese].digits`) moves a
+/// `done` batch's recomputed hash: the stored hash is rewritten so the drift is
+/// recorded and the next plain run does not re-mark the batch's cues stale. Returns
+/// whether a row changed.
+pub fn set_translation_batch_input_hash_in_tx(
+    tx: &Transaction,
+    batch_no: i64,
+    input_hash: &str,
+) -> Result<bool, StoreError> {
+    let changed = tx.execute(
+        "UPDATE translation_batches SET input_hash = ?2, updated_at = datetime('now') \
+         WHERE batch_no = ?1",
+        params![batch_no, input_hash],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Deletes every analysis chunk row (a fresh `--redo` run starts from a clean map
 /// phase). Returns the number of rows removed.
 pub fn clear_analysis_chunks(conn: &Connection) -> Result<usize, StoreError> {

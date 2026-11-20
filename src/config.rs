@@ -85,6 +85,7 @@ pub struct Config {
     pub quality: Quality,
     pub estimate: Estimate,
     pub output: Output,
+    pub burmese: Burmese,
     /// Prices in USD per 1M tokens, keyed by model name.
     pub pricing: BTreeMap<String, PriceEntry>,
 }
@@ -187,6 +188,28 @@ pub struct Output {
     pub ass_font_override: String,
     pub utf8_bom: bool,
     pub grace_secs: u64,
+}
+
+/// Burmese output policy (`[burmese]`, `docs/CONFIG.md` §6, ADR-049(e)).
+///
+/// `digits` selects the digit style the translation prompt requests (part of the
+/// prompt, so changing it marks unlocked translations stale). `cue_final_stop`
+/// controls how a trailing ။ at the end of a cue is handled at export (applied
+/// deterministically at export, never by the LLM). Both are validated at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Burmese {
+    pub digits: String,
+    pub cue_final_stop: String,
+}
+
+impl Default for Burmese {
+    fn default() -> Self {
+        Self {
+            digits: "myanmar".to_string(),
+            cue_final_stop: "strip".to_string(),
+        }
+    }
 }
 
 /// A pricing entry. Required prices have no default; optional long-prompt
@@ -572,7 +595,51 @@ impl Config {
                 ),
             });
         }
+        if !matches!(self.burmese.digits.as_str(), "myanmar" | "western") {
+            return Err(ConfigError::Invalid {
+                key: "burmese.digits".to_string(),
+                message: format!(
+                    "must be one of myanmar, western; got `{}`",
+                    self.burmese.digits
+                ),
+            });
+        }
+        if !matches!(self.burmese.cue_final_stop.as_str(), "keep" | "strip") {
+            return Err(ConfigError::Invalid {
+                key: "burmese.cue_final_stop".to_string(),
+                message: format!(
+                    "must be one of keep, strip; got `{}`",
+                    self.burmese.cue_final_stop
+                ),
+            });
+        }
         Ok(())
+    }
+
+    /// The validated digit style (`[burmese].digits`, ADR-049(e)). Falls back to
+    /// [`DigitStyle::Myanmar`] for an unrecognized value, which [`validate`] has
+    /// already rejected before any caller reaches this.
+    ///
+    /// [`validate`]: Config::validate
+    pub fn digit_style(&self) -> crate::domain::DigitStyle {
+        match self.burmese.digits.as_str() {
+            "western" => crate::domain::DigitStyle::Western,
+            _ => crate::domain::DigitStyle::Myanmar,
+        }
+    }
+
+    /// The validated cue-final stop policy (`[burmese].cue_final_stop`, ADR-049(e)).
+    /// Falls back to [`CueFinalStop::Strip`] for an unrecognized value, which
+    /// [`validate`] has already rejected.
+    ///
+    /// [`validate`]: Config::validate
+    /// [`CueFinalStop::Strip`]: crate::pipeline::output::CueFinalStop::Strip
+    pub fn cue_final_stop(&self) -> crate::pipeline::output::CueFinalStop {
+        use crate::pipeline::output::CueFinalStop;
+        match self.burmese.cue_final_stop.as_str() {
+            "keep" => CueFinalStop::Keep,
+            _ => CueFinalStop::Strip,
+        }
     }
 
     /// Warnings for configured models that lack a pricing entry. A missing

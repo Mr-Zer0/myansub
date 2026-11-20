@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::domain::{Cue, QualityFlag};
+use crate::domain::{Cue, DigitStyle, QualityFlag};
 use crate::llm::assemble_stack;
 use crate::llm::cache::Cached;
 use crate::llm::canonical::canonical_json;
@@ -69,13 +69,13 @@ use crate::store::repo_llm::put_cache_in_tx;
 use crate::store::repo_project::set_stage;
 use crate::store::repo_translations::{
     NewTranslation, TranslationOrigin, cue_id_by_idx, delete_unlocked_translation,
-    list_translations, upsert_translation_in_tx,
+    list_translations, mark_unlocked_stale_in_tx, upsert_translation_in_tx,
 };
 use crate::store::repo_units::{
     NewTranslationBatch, claim_translation_batch, complete_translation_batch_in_tx,
     count_translation_batches_by_status, create_translation_batch, fail_translation_batch,
     get_translation_batch, list_translation_batches_by_status, requeue_failed_translation_batches,
-    requeue_translation_batch, reset_translation_batch,
+    requeue_translation_batch, reset_translation_batch, set_translation_batch_input_hash_in_tx,
 };
 use crate::store::{Stage, StageStatus, Store, StoreError, UnitStatus};
 
@@ -127,6 +127,10 @@ pub struct TranslationParams {
     /// Output-token ratio for the output budget and dry-run estimate
     /// (`[translation].output_ratio`).
     pub output_ratio: f64,
+    /// The digit style requested in the translation prompt (`[burmese].digits`,
+    /// ADR-049(e)). Part of the prompt and folded into the `input_hash`, so a change
+    /// marks unlocked translations stale (`docs/LLM.md` §7).
+    pub digits: DigitStyle,
     /// Per-script token estimator (`[estimate]`).
     pub estimator: Estimator,
     /// Deterministic quality-check thresholds (`[quality]`).
@@ -283,6 +287,17 @@ where
 
     let idx_to_id = store.call(|conn| cue_id_by_idx(conn)).await?;
 
+    // Done-batch reconciliation for a config-driven prompt change (ADR-050, ADR-049(e)).
+    // A `done` batch is skipped by the scheduler on resume, so a pure `[burmese].digits`
+    // change — which moves each batch's recomputed `input_hash` while the source,
+    // analysis version, model, and PROMPT_VERSION are unchanged — would otherwise be
+    // silently ignored. For each `done` batch whose freshly-assembled hash differs from
+    // its stored one, in ONE transaction mark its UNLOCKED cues stale (locked cues are
+    // never touched, FR-6) and rewrite the stored hash so the drift is recorded and the
+    // next plain run does not re-mark (idempotent). The subsequent `translate --stale`
+    // then re-translates exactly those unlocked cues; this run sends nothing new.
+    reconcile_done_batch_hashes(store, &assembled, &idx_to_id).await?;
+
     // Apply the run-shaping flags (`docs/CLI.md` §6): requeue failed batches
     // (`--retry-failed`) or re-run unlocked / stale-unlocked cues (`--redo`/`--stale`),
     // rebuilding any batch that must drop a locked cue so it is never re-sent. This
@@ -294,6 +309,7 @@ where
         &idx_to_id,
         params,
         analysis_version,
+        &sheet.formal_segments,
     )
     .await?;
 
@@ -310,7 +326,7 @@ where
         tier: params.tier,
         thinking: params.thinking,
         max_content_attempts: params.max_content_attempts.max(1),
-        system_instruction: translation_system_instruction(),
+        system_instruction: translation_system_instruction(params.digits),
         analysis_sheet: sheet.canonical.clone(),
         analysis_version,
         estimator: params.estimator,
@@ -318,6 +334,9 @@ where
         limits: params.limits,
         glossary: sheet.glossary.clone(),
         names: sheet.names.clone(),
+        name_targets: sheet.name_targets.clone(),
+        digits: params.digits,
+        formal_segments: sheet.formal_segments.clone(),
         idx_to_id,
     });
 
@@ -472,6 +491,7 @@ async fn status_by_batch(store: &Store) -> Result<BTreeMap<i64, UnitStatus>, Pip
 /// batch has no translation rows, so it never enters the stale set and must be
 /// requeued on its own regardless of the other flags. `--redo` takes precedence over
 /// `--stale` within the unlocked-cue re-request (the broader selection wins).
+#[allow(clippy::too_many_arguments)]
 async fn apply_run_flags(
     store: &Store,
     assembled: &mut [AssembledBatch],
@@ -479,6 +499,7 @@ async fn apply_run_flags(
     idx_to_id: &BTreeMap<u32, i64>,
     params: &TranslationParams,
     analysis_version: i64,
+    segments: &[FormalRange],
 ) -> Result<(), PipelineError> {
     if flags.redo || flags.stale {
         // Load locked/stale state per cue idx from the stored translations.
@@ -539,7 +560,7 @@ async fn apply_run_flags(
             // Reduce the request to the re-requested subset so locked cues (and, under
             // `--stale`, non-stale cues) are never re-sent.
             if subset.len() != batch.translate_cues.len() {
-                rebuild_batch_subset(batch, subset, params, analysis_version);
+                rebuild_batch_subset(batch, subset, params, analysis_version, segments);
             }
         }
 
@@ -585,6 +606,60 @@ async fn apply_run_flags(
     Ok(())
 }
 
+/// Reconciles `done` batches whose stored `input_hash` no longer matches the
+/// freshly-assembled one (ADR-050). Isolates a pure config-driven prompt change
+/// (`[burmese].digits`): same source, analysis version, model, and PROMPT_VERSION
+/// mean only the digit style can have moved the hash. For each drifted `done` batch,
+/// in one transaction, marks its UNLOCKED cues stale and rewrites the stored hash so
+/// the drift is recorded and re-marking is idempotent. Locked cues are never marked
+/// (FR-6). A plain run does no re-sending here; `translate --stale` does that next.
+async fn reconcile_done_batch_hashes(
+    store: &Store,
+    assembled: &[AssembledBatch],
+    idx_to_id: &BTreeMap<u32, i64>,
+) -> Result<(), PipelineError> {
+    let stored_done: BTreeMap<i64, Option<String>> = store
+        .call(|conn| list_translation_batches_by_status(conn, UnitStatus::Done))
+        .await?
+        .into_iter()
+        .map(|b| (b.batch_no, b.input_hash))
+        .collect();
+
+    // Each drifted done batch: (batch_no, new_hash, cue_ids of its cues).
+    let mut updates: Vec<(i64, String, Vec<i64>)> = Vec::new();
+    for batch in assembled {
+        let Some(stored) = stored_done.get(&batch.batch_no) else {
+            continue; // not a done batch
+        };
+        if stored.as_deref() == Some(batch.input_hash.as_str()) {
+            continue; // unchanged
+        }
+        let cue_ids: Vec<i64> = batch
+            .translate_cues
+            .iter()
+            .filter_map(|c| idx_to_id.get(&c.idx).copied())
+            .collect();
+        updates.push((batch.batch_no, batch.input_hash.clone(), cue_ids));
+    }
+
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    store
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            for (batch_no, new_hash, cue_ids) in &updates {
+                mark_unlocked_stale_in_tx(&tx, cue_ids)?;
+                set_translation_batch_input_hash_in_tx(&tx, *batch_no, new_hash)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
 /// Rebuilds a batch's variable block, `input_hash`, bounds, and cue list from a
 /// subset of its cues (used when a locked cue must be dropped from a `--redo`/`--stale`
 /// re-run so it is never re-sent). The scene header is preserved; context lines are
@@ -594,9 +669,10 @@ fn rebuild_batch_subset(
     cues: Vec<Cue>,
     params: &TranslationParams,
     analysis_version: i64,
+    segments: &[FormalRange],
 ) {
     let refs: Vec<&Cue> = cues.iter().collect();
-    let lines = to_lines(&refs);
+    let lines = to_lines(&refs, segments);
     let block = TranslationBlock {
         scene: &batch.scene,
         speakers: &batch.speakers,
@@ -605,7 +681,12 @@ fn rebuild_batch_subset(
         context_after: &[],
     };
     let variable_block = block.render();
-    batch.input_hash = compute_input_hash(&variable_block, analysis_version, params.model.as_str());
+    batch.input_hash = compute_input_hash(
+        &variable_block,
+        analysis_version,
+        params.model.as_str(),
+        params.digits,
+    );
     if let Some(first) = cues.first() {
         batch.first_cue = i64::from(first.idx);
     }
@@ -688,7 +769,13 @@ pub async fn dry_run_translation_stale(
             continue;
         }
         if subset.len() != batch.translate_cues.len() {
-            rebuild_batch_subset(&mut batch, subset, params, analysis_version);
+            rebuild_batch_subset(
+                &mut batch,
+                subset,
+                params,
+                analysis_version,
+                &sheet.formal_segments,
+            );
         }
         affected.push(batch);
     }
@@ -719,7 +806,7 @@ async fn estimate_assembled(
             &params.model,
             params.tier,
             params.thinking,
-            &translation_system_instruction(),
+            &translation_system_instruction(params.digits),
             &sheet.canonical,
             &batch.variable_block,
             output_budget(
@@ -769,6 +856,26 @@ struct SceneInfo {
     speaker_ids: Vec<String>,
 }
 
+/// One `formal_segments` range (`docs/DATA_MODEL.md` §3, ADR-049(b)): the inclusive
+/// cue-idx bounds and the segment's `kind`. A TRANSLATE line whose cue idx falls in
+/// this range carries the `(literary: <kind>)` marker (`docs/LLM.md` §2).
+#[derive(Debug, Clone)]
+struct FormalRange {
+    first: i64,
+    last: i64,
+    kind: String,
+}
+
+/// The formal-segment `kind` for cue `idx`, when it falls inside a formal segment —
+/// the marker text for its TRANSLATE line (`docs/LLM.md` §2, ADR-049(b)).
+fn marker_for(segments: &[FormalRange], idx: u32) -> Option<String> {
+    let idx = i64::from(idx);
+    segments
+        .iter()
+        .find(|s| s.first <= idx && idx <= s.last)
+        .map(|s| s.kind.clone())
+}
+
 /// The slice of the approved analysis the translation stage consults: the canonical
 /// JSON for the cached prefix (ADR-006), the scenes, the id→name map, and the
 /// glossary/name data the quality checks need (`docs/LLM.md` §8).
@@ -777,11 +884,18 @@ struct Sheet {
     /// Canonical JSON of the whole document — byte-stable across batches.
     canonical: String,
     scenes: Vec<SceneInfo>,
+    /// Formal-segment ranges and kinds, for the TRANSLATE-line `(literary: <kind>)`
+    /// marker (`docs/LLM.md` §2, ADR-049(b)).
+    formal_segments: Vec<FormalRange>,
     char_names: BTreeMap<String, String>,
     /// Glossary entries as `(term, target, keep)`.
     glossary: Vec<(String, String, bool)>,
     /// Character names and aliases, for the `untranslated` check.
     names: Vec<String>,
+    /// Source name/alias → Burmese target-spelling pairs: `(name, name_target)` and,
+    /// positionally, `(aliases[i], aliases_target[i])`, for the name coverage of the
+    /// `glossary_miss` check (`docs/LLM.md` §8, ADR-049(d)).
+    name_targets: Vec<(String, String)>,
 }
 
 impl Sheet {
@@ -793,21 +907,44 @@ impl Sheet {
 
         let mut char_names = BTreeMap::new();
         let mut names = Vec::new();
+        let mut name_targets = Vec::new();
         if let Some(chars) = value.get("characters").and_then(|v| v.as_array()) {
             for ch in chars {
                 let id = ch.get("id").and_then(|v| v.as_str()).unwrap_or_default();
                 let name = ch.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let name_target = ch
+                    .get("name_target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if !id.is_empty() {
                     char_names.insert(id.to_string(), name.to_string());
                 }
                 if !name.is_empty() {
                     names.push(name.to_string());
+                    if !name_target.is_empty() {
+                        name_targets.push((name.to_string(), name_target.to_string()));
+                    }
                 }
-                if let Some(aliases) = ch.get("aliases").and_then(|v| v.as_array()) {
-                    for alias in aliases.iter().filter_map(|a| a.as_str()) {
-                        if !alias.is_empty() {
-                            names.push(alias.to_string());
-                        }
+                let aliases: Vec<&str> = ch
+                    .get("aliases")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                let aliases_target: Vec<&str> = ch
+                    .get("aliases_target")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                for (i, alias) in aliases.iter().enumerate() {
+                    if alias.is_empty() {
+                        continue;
+                    }
+                    names.push((*alias).to_string());
+                    // Pair an alias with its target spelling only when `aliases_target`
+                    // runs parallel (same length): a positional pair is meaningless
+                    // otherwise (`docs/DATA_MODEL.md` §3).
+                    if aliases_target.len() == aliases.len() && !aliases_target[i].is_empty() {
+                        name_targets.push(((*alias).to_string(), aliases_target[i].to_string()));
                     }
                 }
             }
@@ -859,12 +996,40 @@ impl Sheet {
             }
         }
 
+        let mut formal_segments = Vec::new();
+        if let Some(arr) = value.get("formal_segments").and_then(|v| v.as_array()) {
+            for fs in arr {
+                let range = fs.get("cue_range").and_then(|v| v.as_array());
+                let (Some(first), Some(last)) = (
+                    range.and_then(|r| r.first()).and_then(|v| v.as_i64()),
+                    range.and_then(|r| r.get(1)).and_then(|v| v.as_i64()),
+                ) else {
+                    continue;
+                };
+                let kind = fs
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if kind.is_empty() {
+                    continue;
+                }
+                formal_segments.push(FormalRange {
+                    first: first.min(last),
+                    last: first.max(last),
+                    kind,
+                });
+            }
+        }
+
         Sheet {
             canonical,
             scenes,
+            formal_segments,
             char_names,
             glossary,
             names,
+            name_targets,
         }
     }
 
@@ -949,9 +1114,9 @@ fn assemble_all_batches(
         let ctx_after = &translatable[end..(end + after).min(translatable.len())];
 
         let (summary, speakers) = sheet.scene_for(first_idx, last_idx);
-        let before_lines = to_lines(ctx_before);
-        let translate_lines = to_lines(group);
-        let after_lines = to_lines(ctx_after);
+        let before_lines = to_lines(ctx_before, &[]);
+        let translate_lines = to_lines(group, &sheet.formal_segments);
+        let after_lines = to_lines(ctx_after, &[]);
         let block = TranslationBlock {
             scene: &summary,
             speakers: &speakers,
@@ -960,8 +1125,12 @@ fn assemble_all_batches(
             context_after: &after_lines,
         };
         let variable_block = block.render();
-        let input_hash =
-            compute_input_hash(&variable_block, analysis_version, params.model.as_str());
+        let input_hash = compute_input_hash(
+            &variable_block,
+            analysis_version,
+            params.model.as_str(),
+            params.digits,
+        );
 
         out.push(AssembledBatch {
             batch_no: i as i64 + 1,
@@ -979,22 +1148,34 @@ fn assemble_all_batches(
 }
 
 /// Renders a slice of cues as prompt [`TranslationLine`]s; the speaker prefix is
-/// carried only when the cue has a known speaker (`docs/LLM.md` §2).
-fn to_lines(cues: &[&Cue]) -> Vec<TranslationLine> {
+/// carried only when the cue has a known speaker (`docs/LLM.md` §2). Each line is
+/// marked with its formal-segment `kind` when its cue idx falls inside a
+/// `formal_segments` range (`docs/LLM.md` §2, ADR-049(b)); pass `&[]` for context
+/// lines, which are never marked.
+fn to_lines(cues: &[&Cue], segments: &[FormalRange]) -> Vec<TranslationLine> {
     cues.iter()
         .map(|c| TranslationLine {
             idx: c.idx,
             speaker: c.speaker.clone().filter(|s| !s.is_empty()),
             text: c.text_masked.clone(),
+            marker: marker_for(segments, c.idx),
         })
         .collect()
 }
 
 /// The `input_hash` of a batch (`docs/LLM.md` §3): sha256 of the variable block +
-/// the analysis version + the model + [`PROMPT_VERSION`]. A `done` batch whose
-/// `input_hash` is unchanged is never resent, and a re-approved analysis version
-/// changes the hash (the basis for M6-B2 selective invalidation).
-fn compute_input_hash(variable_block: &str, analysis_version: i64, model: &str) -> String {
+/// the analysis version + the model + [`PROMPT_VERSION`] + the digit style. A `done`
+/// batch whose `input_hash` is unchanged is never resent, and a re-approved analysis
+/// version changes the hash (the basis for M6-B2 selective invalidation). The digit
+/// style is folded in so a pure `[burmese].digits` change moves the hash — the basis
+/// for the done-batch reconciliation that marks unlocked cues stale (ADR-049(e),
+/// ADR-050).
+fn compute_input_hash(
+    variable_block: &str,
+    analysis_version: i64,
+    model: &str,
+    digits: DigitStyle,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(variable_block.as_bytes());
     hasher.update([0u8]);
@@ -1003,6 +1184,12 @@ fn compute_input_hash(variable_block: &str, analysis_version: i64, model: &str) 
     hasher.update(model.as_bytes());
     hasher.update([0u8]);
     hasher.update(PROMPT_VERSION.to_le_bytes());
+    hasher.update([0u8]);
+    let digit_tag: u8 = match digits {
+        DigitStyle::Myanmar => 0,
+        DigitStyle::Western => 1,
+    };
+    hasher.update([digit_tag]);
     hex_encode(&hasher.finalize())
 }
 
@@ -1180,6 +1367,12 @@ struct BatchExecCtx<T> {
     limits: Limits,
     glossary: Vec<(String, String, bool)>,
     names: Vec<String>,
+    name_targets: Vec<(String, String)>,
+    /// The digit style for the `digit_style` quality check (ADR-049(e)).
+    digits: DigitStyle,
+    /// Formal-segment ranges, so a tier-2/tier-3 partial re-request keeps the
+    /// `(literary: <kind>)` register markers on its TRANSLATE lines (ADR-049(b)).
+    formal_segments: Vec<FormalRange>,
     idx_to_id: BTreeMap<u32, i64>,
 }
 
@@ -1234,6 +1427,8 @@ impl<T> TranslationBatchUnit<T> {
         let ctx = AnalysisContext {
             glossary: &glossary,
             names: &names,
+            name_targets: &self.ctx.name_targets,
+            digits: self.ctx.digits,
         };
         checks::check_cue(cue, text, &ctx, &self.ctx.limits)
     }
@@ -1255,6 +1450,8 @@ impl<T> TranslationBatchUnit<T> {
         let analysis_ctx = AnalysisContext {
             glossary: &glossary,
             names: &names,
+            name_targets: &self.ctx.name_targets,
+            digits: self.ctx.digits,
         };
 
         // Pair each returned line with its batch cue (ignore ids not in this batch).
@@ -1668,7 +1865,7 @@ where
             .iter()
             .filter(|c| ids.contains(&i64::from(c.idx)))
             .collect();
-        let lines = to_lines(&cues);
+        let lines = to_lines(&cues, &self.ctx.formal_segments);
         let block = TranslationBlock {
             scene: &self.scene,
             speakers: &self.speakers,
@@ -1706,4 +1903,109 @@ fn accepted_ids(accepted: &BTreeMap<i64, String>) -> BTreeSet<i64> {
 fn with_reminder(mut req: LlmRequest, reminder: String) -> LlmRequest {
     req.contents.push(ContentBlock::user(reminder));
     req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::scheduler::SchedulerConfig;
+    use super::*;
+    use crate::llm::retry::RetryConfig;
+    use crate::quality::checks::Limits;
+    use std::time::Duration;
+
+    fn cue(idx: u32) -> Cue {
+        Cue {
+            idx,
+            start_ms: u64::from(idx) * 1000,
+            end_ms: u64::from(idx) * 1000 + 800,
+            text_raw: format!("line {idx}"),
+            text_masked: format!("line {idx}"),
+            lead_tags: None,
+            inline_tags: Vec::new(),
+            style: None,
+            speaker: None,
+            translatable: true,
+        }
+    }
+
+    fn params(batch_size: u32, context: u32) -> TranslationParams {
+        TranslationParams {
+            model: "m".to_string(),
+            tier: ServiceTier::Flex,
+            thinking: ThinkingSetting::Off,
+            batch_size,
+            context_before: context,
+            context_after: context,
+            max_content_attempts: 3,
+            output_ratio: 4.0,
+            digits: DigitStyle::Myanmar,
+            estimator: Estimator {
+                bytes_per_token_latin: 4.0,
+                bytes_per_token_myanmar: 3.0,
+                bytes_per_token_cjk: 3.0,
+            },
+            limits: Limits {
+                max_graphemes_per_line: 42,
+                max_lines: 2,
+                max_gps: 20.0,
+                drift_ratio: 3.0,
+            },
+            scheduler: SchedulerConfig {
+                concurrency: 1,
+                warm_cache_first: false,
+                grace: Duration::from_secs(5),
+            },
+            seed: 42,
+            retry: RetryConfig {
+                max_retries: 2,
+                backoff_base_ms: 1,
+                backoff_max_ms: 2,
+                max_sheds_before_fallback: 1,
+                service_tier_fallback: true,
+            },
+        }
+    }
+
+    // AC: M12-AC5 — a batch whose cue range spans a formal-segment boundary marks
+    // exactly the in-range TRANSLATE lines; out-of-range TRANSLATE lines and ALL
+    // context lines (even in-range ones) carry no marker (ADR-049(b), LLM.md §2).
+    #[test]
+    fn assembled_batch_marks_only_in_range_translate_lines() {
+        // Formal segment covers cues 2..=5. Cues 1..=6 are all translatable.
+        let doc = r#"{
+            "schema_version":1,"premise":"p","characters":[],
+            "scenes":[{"cue_range":[1,6],"summary":"s","speakers":[]}],
+            "formal_segments":[{"cue_range":[2,5],"register":"literary","kind":"reading"}]
+        }"#;
+        let sheet = Sheet::parse(doc);
+        let cues: Vec<Cue> = (1..=6).map(cue).collect();
+
+        // batch_size 2 with 2 context lines each side → the middle batch is cues [3,4]
+        // with context_before [1,2] and context_after [5,6], spanning the segment edges.
+        let batches = assemble_all_batches(&cues, &sheet, &params(2, 2), 1);
+        let middle = &batches[1];
+        let block = &middle.variable_block;
+
+        // In-range TRANSLATE lines are marked.
+        assert!(
+            block.contains("[3] (literary: reading) line 3"),
+            "in-range translate line 3 must be marked: {block}"
+        );
+        assert!(
+            block.contains("[4] (literary: reading) line 4"),
+            "in-range translate line 4 must be marked: {block}"
+        );
+        // In-range CONTEXT lines (2 and 5) are NOT marked.
+        assert!(
+            !block.contains("[2] (literary"),
+            "in-range context line 2 must be unmarked: {block}"
+        );
+        assert!(
+            !block.contains("[5] (literary"),
+            "in-range context line 5 must be unmarked: {block}"
+        );
+        // Out-of-range context lines are plain.
+        assert!(block.contains("[1] line 1"), "{block}");
+        assert!(block.contains("[6] line 6"), "{block}");
+    }
 }

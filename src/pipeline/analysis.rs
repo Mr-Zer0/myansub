@@ -175,13 +175,24 @@ pub fn analysis_signature(model: &str) -> String {
 pub fn worst_case_doc_tokens() -> u64 {
     // maxLength budgets × caps, plus a per-element allowance for ids, enums, keys,
     // quotes, and separators. (`docs/DATA_MODEL.md` §3.)
-    let characters = 40 * (120 + 8 * 80 + 260 + 180 + 120); // name, aliases, role, speech_style, +ids/enums/keys
-    let address_matrix = 80 * (160 + 120 + 120 + 60 + 120); // relation, self_ref, addressee_ref, particle, +from/to/register/keys
+    // name, name_target, aliases, aliases_target, role, speech_style, +ids/enums/keys.
+    // `aliases_target` is budgeted at the parallel `aliases` allowance (80/entry, not its
+    // 120 cap): the two lists run positionally parallel, and this keeps the worst-case
+    // document within the model output ceiling (`ANALYSIS_OUTPUT_CEILING`) so the budget
+    // still covers it (ADR-049(d)).
+    let characters = 40 * (120 + 120 + 8 * 80 + 8 * 80 + 260 + 180 + 120);
+    let address_matrix = 80 * (160 + 120 + 120 + 60 + 20 + 120); // relation, self_ref, addressee_ref, particle, honorific, +from/to/register/keys
     let glossary = 120 * (120 + 120 + 180 + 60); // term, target, note, +keep/keys
     let scenes = 120 * (300 + 80 + 60 + 60); // summary, mood, +cue_range/speakers/keys
     let lists = 12 * 180 + 12 * 220; // style_rules + unresolved_ambiguities
-    let top = 500 + 160 + 256; // premise + tone + schema_version/outer braces
-    let chars: u64 = characters + address_matrix + glossary + scenes + lists + top;
+    // formal_segments ≤ 60 (ADR-049(b)): each entry is tiny — two ints, two short
+    // enums (`register`/`kind`), and a note. The note is budgeted modestly at 60 (of
+    // its 120 cap), mirroring the `aliases_target` precedent above, so the worst-case
+    // document still fits under `ANALYSIS_OUTPUT_CEILING`.
+    let formal_segments = 60 * (60 + 60); // note (budgeted at 60) + cue_range/register/kind/keys
+    let top = 500 + 160 + 40 + 256; // premise + tone + narration_register + schema_version/outer braces
+    let chars: u64 =
+        characters + address_matrix + glossary + scenes + lists + formal_segments + top;
     chars / OUTPUT_CHARS_PER_TOKEN
 }
 
@@ -988,11 +999,16 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
     require_array_within(obj, "characters", 40)?;
     for ch in object_items(obj, "characters") {
         string_cap(ch.get("name"), "characters[].name", 120)?;
+        string_cap(ch.get("name_target"), "characters[].name_target", 120)?;
         string_cap(ch.get("role"), "characters[].role", 260)?;
         string_cap(ch.get("speech_style"), "characters[].speech_style", 180)?;
         array_cap(ch.get("aliases"), "characters[].aliases", 8)?;
         for alias in string_items(ch.get("aliases")) {
             string_cap(Some(alias), "characters[].aliases[]", 80)?;
+        }
+        array_cap(ch.get("aliases_target"), "characters[].aliases_target", 8)?;
+        for alias_target in string_items(ch.get("aliases_target")) {
+            string_cap(Some(alias_target), "characters[].aliases_target[]", 120)?;
         }
     }
 
@@ -1006,6 +1022,7 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
     optional_array_within(obj, "address_matrix", 80)?;
     for am in object_items(obj, "address_matrix") {
         string_cap(am.get("relation"), "address_matrix[].relation", 160)?;
+        string_cap(am.get("honorific"), "address_matrix[].honorific", 20)?;
     }
 
     optional_array_within(obj, "glossary", 120)?;
@@ -1013,6 +1030,14 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
         string_cap(g.get("term"), "glossary[].term", 120)?;
         string_cap(g.get("target"), "glossary[].target", 120)?;
         string_cap(g.get("note"), "glossary[].note", 180)?;
+    }
+
+    // `formal_segments` ≤ 60 (ADR-049(b)); each `note` ≤ 120. The enum/shape of
+    // `kind`/`register` and the `cue_range` bound are enforced by the wire schema and
+    // by strict user import, so the lenient LLM-output path checks only the caps here.
+    optional_array_within(obj, "formal_segments", 60)?;
+    for fs in object_items(obj, "formal_segments") {
+        string_cap(fs.get("note"), "formal_segments[].note", 120)?;
     }
 
     array_cap(obj.get("style_rules"), "style_rules", 12)?;
@@ -1412,7 +1437,9 @@ mod tests {
                 {
                     "id": "c1",
                     "name": "Aoi",
+                    "name_target": "အာအိုအိ",
                     "aliases": ["A"],
+                    "aliases_target": ["အေ"],
                     "gender": "f",
                     "age_group": "young",
                     "role": "the lead",
@@ -1480,6 +1507,52 @@ mod tests {
             validate_doc(&doc),
             Err(ValidationError::StringTooLong {
                 field: "characters[].name",
+                ..
+            })
+        ));
+    }
+
+    // AC: M12-AC20 — an over-120 `name_target` is a located StringTooLong on the
+    // lenient LLM-output path (ADR-049(d), caps enforced in `validate_full`).
+    #[test]
+    fn validate_full_rejects_over_length_name_target() {
+        let mut doc = base_doc();
+        doc["characters"][0]["name_target"] = json!("က".repeat(121));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "characters[].name_target",
+                ..
+            })
+        ));
+        // Exactly at the cap is fine.
+        doc["characters"][0]["name_target"] = json!("က".repeat(120));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    // AC: M12-AC20 — too many `aliases_target` entries is a located CapExceeded.
+    #[test]
+    fn validate_full_rejects_too_many_aliases_target() {
+        let mut doc = base_doc();
+        doc["characters"][0]["aliases_target"] = serde_json::Value::Array(vec![json!("က"); 9]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded {
+                field: "characters[].aliases_target",
+                ..
+            })
+        ));
+    }
+
+    // AC: M12-AC20 — an over-120 `aliases_target` entry is a located StringTooLong.
+    #[test]
+    fn validate_full_rejects_over_length_aliases_target_entry() {
+        let mut doc = base_doc();
+        doc["characters"][0]["aliases_target"] = json!(["က".repeat(121)]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "characters[].aliases_target[]",
                 ..
             })
         ));
@@ -1581,6 +1654,71 @@ mod tests {
         ));
         // Exactly at the cap is fine.
         doc["address_matrix"][0]["relation"] = json!("x".repeat(160));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    // AC: M12-AC15 / M12-AC18 — an over-20 honorific is a located StringTooLong.
+    #[test]
+    fn validate_full_rejects_over_length_honorific() {
+        let mut doc = base_doc();
+        doc["address_matrix"][0]["honorific"] = json!("x".repeat(21));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "address_matrix[].honorific",
+                ..
+            })
+        ));
+        // Exactly at the cap is fine.
+        doc["address_matrix"][0]["honorific"] = json!("x".repeat(20));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    // AC: M12-AC2 — more than 60 formal_segments is a located CapExceeded on the
+    // lenient LLM-output path (ADR-049(b), caps enforced in `validate_full`).
+    #[test]
+    fn validate_full_rejects_too_many_formal_segments() {
+        let mut doc = base_doc();
+        let one = json!({
+            "cue_range": [1, 2],
+            "register": "literary",
+            "kind": "reading",
+            "note": "a note"
+        });
+        doc["formal_segments"] = serde_json::Value::Array(vec![one; 61]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded {
+                field: "formal_segments",
+                ..
+            })
+        ));
+    }
+
+    // AC: M12-AC2 — an over-120 formal_segments note is a located StringTooLong.
+    #[test]
+    fn validate_full_rejects_over_length_formal_segment_note() {
+        let mut doc = base_doc();
+        doc["formal_segments"] = json!([{
+            "cue_range": [1, 2],
+            "register": "literary",
+            "kind": "reading",
+            "note": "x".repeat(121)
+        }]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "formal_segments[].note",
+                ..
+            })
+        ));
+        // Exactly at the cap is fine.
+        doc["formal_segments"] = json!([{
+            "cue_range": [1, 2],
+            "register": "literary",
+            "kind": "reading",
+            "note": "x".repeat(120)
+        }]);
         assert!(validate_doc(&doc).is_ok());
     }
 

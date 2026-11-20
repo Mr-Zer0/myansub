@@ -11,7 +11,7 @@ use myansub::formats::codec::parse_document;
 use myansub::pipeline::PipelineError;
 use myansub::pipeline::input::{InitOutcome, run_init, run_input, run_input_with_fault};
 use myansub::pipeline::output::{
-    OutputWarning, ResolvedOutput, build_output_document, default_output_path,
+    CueFinalStop, OutputWarning, ResolvedOutput, build_output_document, default_output_path,
     resolve_output_format_from_flags, resolve_output_target, run_output, store_creation_prefs,
     stored_output_prefs,
 };
@@ -141,6 +141,7 @@ async fn same_format_export_preserves_timings_for_every_format() {
             "",
             false,
             false,
+            CueFinalStop::Keep,
         )
         .await
         .unwrap_or_else(|e| panic!("export {format} failed: {e}"));
@@ -179,6 +180,7 @@ fn cross_format_export_warns_about_lost_styling() {
         SubtitleFormat::Srt,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build cross-format output");
 
@@ -210,6 +212,7 @@ fn same_format_ass_export_has_no_cross_format_warning() {
         SubtitleFormat::Ass,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build same-format output");
 
@@ -221,6 +224,88 @@ fn same_format_ass_export_has_no_cross_format_warning() {
         "same-format export must not warn about cross-format styling: {:?}",
         built.warnings
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cue-final ။ handling at export (M12-AC13, ADR-049(e))
+// ---------------------------------------------------------------------------
+
+/// A minimal translatable cue carrying `masked` as its text, no tags.
+fn plain_cue(idx: u32, masked: &str) -> Cue {
+    Cue {
+        idx,
+        start_ms: u64::from(idx) * 1000,
+        end_ms: u64::from(idx) * 1000 + 900,
+        text_raw: masked.to_string(),
+        text_masked: masked.to_string(),
+        lead_tags: None,
+        inline_tags: Vec::new(),
+        style: None,
+        speaker: None,
+        translatable: true,
+    }
+}
+
+/// The restored output body of cue `idx` after building with `policy`.
+fn exported_text(cue: &Cue, target: &str, policy: CueFinalStop) -> String {
+    let mut translations = BTreeMap::new();
+    translations.insert(cue.idx, target.to_string());
+    let built = build_output_document(
+        SubtitleFormat::Srt,
+        None,
+        std::slice::from_ref(cue),
+        &translations,
+        SubtitleFormat::Srt,
+        "",
+        false,
+        policy,
+    )
+    .expect("build");
+    built.document.cues[0].text_raw.clone()
+}
+
+// AC: M12-AC13 — `strip` removes one trailing ။ (U+104B) from a single-line cue.
+#[test]
+fn cue_final_stop_strip_removes_trailing_stop_single_line() {
+    let cue = plain_cue(1, "x");
+    assert_eq!(exported_text(&cue, "ကက။", CueFinalStop::Strip), "ကက");
+}
+
+// AC: M12-AC13 — `strip` also removes trailing whitespace around the stop.
+#[test]
+fn cue_final_stop_strip_removes_trailing_whitespace() {
+    let cue = plain_cue(1, "x");
+    assert_eq!(exported_text(&cue, "ကက။  ", CueFinalStop::Strip), "ကက");
+    assert_eq!(exported_text(&cue, "ကက။\n", CueFinalStop::Strip), "ကက");
+}
+
+// AC: M12-AC13 — for a multi-line cue, `strip` touches only the final line's
+// trailing ။; a ။ in the middle of the cue is preserved.
+#[test]
+fn cue_final_stop_strip_multiline_touches_only_final_stop() {
+    let cue = plain_cue(1, "x");
+    assert_eq!(
+        exported_text(&cue, "ကက။\nခခ။", CueFinalStop::Strip),
+        "ကက။\nခခ"
+    );
+}
+
+// AC: M12-AC13 — `keep` leaves the cue text unchanged, including a trailing ။.
+#[test]
+fn cue_final_stop_keep_leaves_text_unchanged() {
+    let cue = plain_cue(1, "x");
+    assert_eq!(exported_text(&cue, "ကက။", CueFinalStop::Keep), "ကက။");
+    assert_eq!(
+        exported_text(&cue, "ကက။\nခခ။", CueFinalStop::Keep),
+        "ကက။\nခခ။"
+    );
+}
+
+// AC: M12-AC13 — a cue with no trailing ။ is unchanged under `strip`.
+#[test]
+fn cue_final_stop_strip_no_trailing_stop_is_unchanged() {
+    let cue = plain_cue(1, "x");
+    assert_eq!(exported_text(&cue, "ကက", CueFinalStop::Strip), "ကက");
 }
 
 // ADR-024 carry-over: a same-format ASS export whose source has no format_meta
@@ -238,6 +323,7 @@ fn same_format_ass_without_format_meta_warns() {
         SubtitleFormat::Ass,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build");
 
@@ -284,6 +370,7 @@ fn export_restores_inline_and_lead_tags() {
         SubtitleFormat::Ass,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build");
 
@@ -317,6 +404,7 @@ fn non_translatable_cue_keeps_source_text() {
         SubtitleFormat::Srt,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build");
 
@@ -339,6 +427,7 @@ fn ass_font_override_applies_to_all_styles() {
         SubtitleFormat::Ass,
         "Noto Sans Myanmar",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build with override");
     let written =
@@ -361,6 +450,7 @@ fn ass_font_override_applies_to_all_styles() {
         SubtitleFormat::Ass,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect("build without override");
     let written_kept = myansub::formats::codec::write_document(&kept.document, SubtitleFormat::Ass)
@@ -396,6 +486,7 @@ fn missing_translation_refuses_without_allow_incomplete() {
         SubtitleFormat::Srt,
         "",
         false,
+        CueFinalStop::Keep,
     )
     .expect_err("must refuse");
 
@@ -431,6 +522,7 @@ fn missing_translation_allowed_uses_source_and_warns() {
         SubtitleFormat::Srt,
         "",
         true,
+        CueFinalStop::Keep,
     )
     .expect("allow incomplete");
 
@@ -462,6 +554,7 @@ async fn export_before_review_approved_fails_with_precondition() {
         "",
         false,
         false,
+        CueFinalStop::Keep,
     )
     .await
     .expect_err("gate must block");
@@ -491,6 +584,7 @@ async fn export_prepends_utf8_bom_when_configured() {
         "",
         true,
         false,
+        CueFinalStop::Keep,
     )
     .await
     .expect("export");
@@ -516,6 +610,7 @@ async fn export_leaves_no_partial_file_on_write_failure() {
         "",
         false,
         false,
+        CueFinalStop::Keep,
     )
     .await
     .expect_err("write into a missing directory must fail");
@@ -859,6 +954,7 @@ async fn export_writes_no_bom_when_disabled() {
         "",
         false,
         false,
+        CueFinalStop::Keep,
     )
     .await
     .expect("export");
@@ -893,6 +989,7 @@ async fn run_output_incomplete_refuses_and_writes_no_file() {
         "",
         false,
         false,
+        CueFinalStop::Keep,
     )
     .await
     .expect_err("must refuse incomplete export");
@@ -900,4 +997,88 @@ async fn run_output_incomplete_refuses_and_writes_no_file() {
     assert!(matches!(err, PipelineError::IncompleteTranslation { .. }));
     assert_eq!(err.exit_code(), 3);
     assert!(!out.exists(), "no file must be written on refusal");
+}
+
+// AC: M12-AC14 — changing `cue_final_stop` needs only a re-export: a second
+// `run_output` with the other policy produces a different file, and the export path
+// makes zero LLM/transport calls (ADR-049(e), ADR-050). `run_output` takes no
+// transport, so an `llm_calls` count of 0 after two exports proves no LLM traffic.
+#[tokio::test]
+async fn changing_cue_final_stop_reexports_differently_with_no_llm_calls() {
+    let dir = tempdir().expect("tempdir");
+    let (store, source) = seed_approved_project(dir.path(), SubtitleFormat::Srt, true).await;
+
+    // Give a translatable cue a Burmese target ending in the sentence stop ။.
+    let ids = store
+        .call(|conn| cue_id_by_idx(conn))
+        .await
+        .expect("cue ids");
+    let cue1 = *ids.get(&1).expect("cue 1");
+    store
+        .call(move |conn| {
+            myansub::store::repo_translations::upsert_translation(
+                conn,
+                &NewTranslation {
+                    cue_id: cue1,
+                    text: "ကက။".to_string(),
+                    origin: TranslationOrigin::Llm,
+                    locked: false,
+                    stale: false,
+                    flags: vec![],
+                    analysis_version: 1,
+                    model: Some("gemini-flash-latest".to_string()),
+                },
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("seed burmese translation");
+
+    let strip_path = dir.path().join("strip.srt");
+    run_output(
+        &store,
+        &source,
+        &ResolvedOutput {
+            format: SubtitleFormat::Srt,
+            path: strip_path.clone(),
+        },
+        "",
+        false,
+        false,
+        CueFinalStop::Strip,
+    )
+    .await
+    .expect("strip export");
+
+    let keep_path = dir.path().join("keep.srt");
+    run_output(
+        &store,
+        &source,
+        &ResolvedOutput {
+            format: SubtitleFormat::Srt,
+            path: keep_path.clone(),
+        },
+        "",
+        false,
+        false,
+        CueFinalStop::Keep,
+    )
+    .await
+    .expect("keep export");
+
+    let stripped = std::fs::read_to_string(&strip_path).expect("read strip");
+    let kept = std::fs::read_to_string(&keep_path).expect("read keep");
+    assert_ne!(
+        stripped, kept,
+        "the two policies must produce different output"
+    );
+    assert!(stripped.contains("ကက") && !stripped.contains("ကက။"));
+    assert!(kept.contains("ကက။"));
+
+    // The export path makes no LLM calls.
+    let calls = store
+        .call(|conn| myansub::store::repo_llm::count_calls(conn))
+        .await
+        .expect("count calls");
+    assert_eq!(calls, 0, "export must make no LLM calls");
 }

@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use myansub::domain::{Cue, QualityFlag};
+use myansub::domain::{Cue, DigitStyle, QualityFlag};
 use myansub::error::ExitCode;
 use myansub::error::exit;
 use myansub::llm::client::{CommitToken, LlmResponse, ServiceTier, ThinkingSetting, Usage};
@@ -308,7 +308,7 @@ async fn import_rejects_placeholder_mismatch_naming_cue_and_applies_nothing() {
     // Cue 2's source is "Hello ⟦0⟧"; dropping the ⟦0⟧ is a placeholder mismatch. Cue 1
     // carries a valid change in the same file to prove all-or-nothing.
     let file = review_file(HASH, &[(1, "နေကောင်းလား"), (2, "no placeholder here")]);
-    let err = translation::import(&store, &file, &limits())
+    let err = translation::import(&store, &file, &limits(), DigitStyle::Myanmar)
         .await
         .expect_err("rejected");
 
@@ -338,9 +338,14 @@ async fn import_rejects_placeholder_mismatch_naming_cue_and_applies_nothing() {
 async fn import_valid_edit_locks_records_history_and_reruns_flags() {
     let store = standard_store().await;
 
-    let summary = translation::import(&store, &review_file(HASH, &[(1, "နေကောင်းလား")]), &limits())
-        .await
-        .expect("accepted");
+    let summary = translation::import(
+        &store,
+        &review_file(HASH, &[(1, "နေကောင်းလား")]),
+        &limits(),
+        DigitStyle::Myanmar,
+    )
+    .await
+    .expect("accepted");
     assert_eq!(summary.changed, 1);
     assert_eq!(summary.unchanged, 0);
 
@@ -399,7 +404,7 @@ async fn set_locks_cue_and_redo_preserves_it() {
 
     // Reviewer sets cue 1.
     let reviewer = "ကိုယ်တိုင်ပြင်ထားသည်";
-    translation::set_target(&store, 1, reviewer, &limits())
+    translation::set_target(&store, 1, reviewer, &limits(), DigitStyle::Myanmar)
         .await
         .expect("set");
     assert!(is_locked(&store, 1).await, "set locks the cue");
@@ -485,6 +490,7 @@ fn params(batch_size: u32) -> TranslationParams {
         context_after: 0,
         max_content_attempts: 3,
         output_ratio: 4.0,
+        digits: DigitStyle::Myanmar,
         estimator: Estimator {
             bytes_per_token_latin: 4.0,
             bytes_per_token_myanmar: 3.0,
@@ -519,6 +525,7 @@ async fn import_rejects_hash_mismatch() {
         &store,
         &review_file("sha256:other", &[(1, "နေကောင်းလား")]),
         &limits(),
+        DigitStyle::Myanmar,
     )
     .await
     .expect_err("rejected");
@@ -535,6 +542,7 @@ async fn import_rejects_unknown_cue_id() {
         &store,
         &review_file(HASH, &[(1, "နေကောင်းလား"), (999, "x")]),
         &limits(),
+        DigitStyle::Myanmar,
     )
     .await
     .expect_err("rejected");
@@ -552,9 +560,14 @@ async fn import_rejects_unknown_cue_id() {
 async fn import_unchanged_cue_is_untouched() {
     let store = standard_store().await;
     // Cue 1's target equals the stored text → unchanged.
-    let summary = translation::import(&store, &review_file(HASH, &[(1, MM)]), &limits())
-        .await
-        .expect("accepted");
+    let summary = translation::import(
+        &store,
+        &review_file(HASH, &[(1, MM)]),
+        &limits(),
+        DigitStyle::Myanmar,
+    )
+    .await
+    .expect("accepted");
     assert_eq!(summary.changed, 0);
     assert_eq!(summary.unchanged, 1);
     assert!(
@@ -572,9 +585,14 @@ async fn import_unchanged_cue_is_untouched() {
 #[tokio::test]
 async fn import_changed_cue_becomes_user_locked_with_history() {
     let store = standard_store().await;
-    let summary = translation::import(&store, &review_file(HASH, &[(1, "နေကောင်းလား")]), &limits())
-        .await
-        .expect("accepted");
+    let summary = translation::import(
+        &store,
+        &review_file(HASH, &[(1, "နေကောင်းလား")]),
+        &limits(),
+        DigitStyle::Myanmar,
+    )
+    .await
+    .expect("accepted");
     assert_eq!((summary.changed, summary.unchanged), (1, 0));
 
     let id1 = cue_id(&store, 1).await;
@@ -694,7 +712,7 @@ async fn list_counts_are_correct() {
 
     // A clean edit of cue 1 re-runs its flags away and locks it: it moves out of
     // suspect and into fixed. Now suspect = {5}, fixed = {1}, untouched = {2,4}.
-    translation::set_target(&store, 1, "နေကောင်းလား", &limits())
+    translation::set_target(&store, 1, "နေကောင်းလား", &limits(), DigitStyle::Myanmar)
         .await
         .expect("set");
     assert_eq!(counts(&store).await, (1, 1, 2));
@@ -702,7 +720,7 @@ async fn list_counts_are_correct() {
     // ADR-038 (d): the counts are NOT a partition. Editing cue 2 with a target that
     // still trips a soft flag (`too_long`, 3 lines) but preserves ⟦0⟧ locks it AND
     // leaves it flagged, so it is counted in BOTH suspect and fixed.
-    translation::set_target(&store, 2, "⟦0⟧\nမ\nမ", &limits())
+    translation::set_target(&store, 2, "⟦0⟧\nမ\nမ", &limits(), DigitStyle::Myanmar)
         .await
         .expect("set cue 2");
     // suspect = {2 (too_long), 5 (failed)} = 2; fixed = {1, 2} = 2; untouched = {4} = 1.
@@ -800,6 +818,7 @@ async fn edit_valid_applies_and_locks() {
         dir.path(),
         &ReviewSelection::default(),
         &limits(),
+        DigitStyle::Myanmar,
     )
     .await
     .expect("edit");
@@ -828,6 +847,7 @@ async fn edit_invalid_placeholder_is_rejected_and_unchanged() {
         dir.path(),
         &ReviewSelection::default(),
         &limits(),
+        DigitStyle::Myanmar,
     )
     .await
     .expect_err("rejected");
@@ -853,7 +873,7 @@ async fn edit_invalid_placeholder_is_rejected_and_unchanged() {
 #[tokio::test]
 async fn set_rejects_placeholder_mismatch() {
     let store = standard_store().await;
-    let err = translation::set_target(&store, 2, "no placeholder", &limits())
+    let err = translation::set_target(&store, 2, "no placeholder", &limits(), DigitStyle::Myanmar)
         .await
         .expect_err("rejected");
     assert!(
@@ -900,7 +920,7 @@ async fn show_renders_cue() {
 #[tokio::test]
 async fn unlock_clears_locked_flag() {
     let store = standard_store().await;
-    translation::set_target(&store, 1, "နေကောင်းလား", &limits())
+    translation::set_target(&store, 1, "နေကောင်းလား", &limits(), DigitStyle::Myanmar)
         .await
         .expect("set");
     assert!(is_locked(&store, 1).await);
@@ -1034,7 +1054,7 @@ async fn pending_batch_keeps_review_closed() {
 #[tokio::test]
 async fn import_rejects_malformed_json() {
     let store = standard_store().await;
-    let err = translation::import(&store, "not json {", &limits())
+    let err = translation::import(&store, "not json {", &limits(), DigitStyle::Myanmar)
         .await
         .expect_err("parse");
     assert!(matches!(err, ReviewError::Parse(_)), "{err:?}");
@@ -1054,7 +1074,7 @@ async fn import_rejects_cue_missing_id_field() {
         "cues": [ { "target": "နေကောင်းလား" } ],
     })
     .to_string();
-    let err = translation::import(&store, &body, &limits())
+    let err = translation::import(&store, &body, &limits(), DigitStyle::Myanmar)
         .await
         .expect_err("missing id");
     assert!(matches!(err, ReviewError::Parse(_)), "{err:?}");
@@ -1067,9 +1087,14 @@ async fn import_rejects_cue_missing_id_field() {
 async fn import_partial_file_is_valid() {
     let store = standard_store().await;
     // Only cue 1 is listed; cues 2 and 4 are absent from the file.
-    let summary = translation::import(&store, &review_file(HASH, &[(1, "နေကောင်းလား")]), &limits())
-        .await
-        .expect("partial file accepted");
+    let summary = translation::import(
+        &store,
+        &review_file(HASH, &[(1, "နေကောင်းလား")]),
+        &limits(),
+        DigitStyle::Myanmar,
+    )
+    .await
+    .expect("partial file accepted");
     assert_eq!((summary.changed, summary.unchanged), (1, 0));
     assert_eq!(
         translation_text(&store, 1).await.as_deref(),

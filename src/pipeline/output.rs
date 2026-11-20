@@ -180,6 +180,7 @@ pub struct BuiltOutput {
 /// `allow_incomplete` is false, this returns [`PipelineError::IncompleteTranslation`];
 /// otherwise the source text is used and an [`OutputWarning::IncompleteCuesUsedSource`]
 /// lists the affected cues.
+#[allow(clippy::too_many_arguments)]
 pub fn build_output_document(
     source_format: SubtitleFormat,
     source_format_meta: Option<&FormatMeta>,
@@ -188,6 +189,7 @@ pub fn build_output_document(
     output_format: SubtitleFormat,
     ass_font_override: &str,
     allow_incomplete: bool,
+    cue_final_stop: CueFinalStop,
 ) -> Result<BuiltOutput, PipelineError> {
     let mut out_cues = Vec::with_capacity(cues.len());
     let mut missing = Vec::new();
@@ -196,7 +198,7 @@ pub fn build_output_document(
     for cue in cues {
         let text = if cue.translatable {
             match translations.get(&cue.idx) {
-                Some(masked) => restore_text(masked, cue),
+                Some(masked) => apply_cue_final_stop(&restore_text(masked, cue), cue_final_stop),
                 None => {
                     if allow_incomplete {
                         used_source.push(cue.idx);
@@ -279,6 +281,44 @@ fn restore_text(masked: &str, cue: &Cue) -> String {
     }
 }
 
+/// The Burmese sentence terminator ။ (U+104B) — the cue-final full stop handled at
+/// export (`[burmese].cue_final_stop`, ADR-049(e)). The clause separator ၊ is
+/// U+104A and is never touched here.
+const BURMESE_SENTENCE_STOP: char = '\u{104B}';
+
+/// How a trailing ။ at the end of a cue is handled at export
+/// (`[burmese].cue_final_stop`, `docs/CONFIG.md` §6, ADR-049(e)). Applied
+/// deterministically here, never by the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CueFinalStop {
+    /// Remove one trailing ။ (and trailing whitespace) at the end of the cue.
+    #[default]
+    Strip,
+    /// Leave the cue text unchanged.
+    Keep,
+}
+
+/// Applies the cue-final ။ policy to one cue's restored body (ADR-049(e)).
+///
+/// `Keep` returns the text unchanged. `Strip` removes exactly one trailing ။
+/// (U+104B) and any whitespace around it at the END of the cue text — for a
+/// multi-line cue that is the final line's trailing stop only; a ။ in the middle
+/// is never touched. A cue with no trailing ။ is returned unchanged (its trailing
+/// whitespace is preserved), so the transform is a no-op when there is no stop to
+/// strip.
+fn apply_cue_final_stop(text: &str, policy: CueFinalStop) -> String {
+    match policy {
+        CueFinalStop::Keep => text.to_string(),
+        CueFinalStop::Strip => {
+            let no_trailing_ws = text.trim_end_matches(char::is_whitespace);
+            match no_trailing_ws.strip_suffix(BURMESE_SENTENCE_STOP) {
+                Some(body) => body.trim_end_matches(char::is_whitespace).to_string(),
+                None => text.to_string(),
+            }
+        }
+    }
+}
+
 /// Whether `format` is an ASS-family format carrying a style table.
 fn is_ass_like(format: SubtitleFormat) -> bool {
     matches!(format, SubtitleFormat::Ass | SubtitleFormat::Ssa)
@@ -332,6 +372,7 @@ pub struct OutputReport {
 /// serialized by the codec and written atomically (rule 4) as UTF-8, with an
 /// optional BOM. Finally the `output` stage is marked completed. Warnings are
 /// returned to the caller and logged at `warn`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_output(
     store: &Store,
     source_path: &Path,
@@ -339,6 +380,7 @@ pub async fn run_output(
     ass_font_override: &str,
     utf8_bom: bool,
     allow_incomplete: bool,
+    cue_final_stop: CueFinalStop,
 ) -> Result<OutputReport, PipelineError> {
     // Gate: output may run only when the translation review is approved.
     let state = load_state(store).await?;
@@ -386,6 +428,7 @@ pub async fn run_output(
         resolved.format,
         ass_font_override,
         allow_incomplete,
+        cue_final_stop,
     )?;
 
     let serialized = codec::write_document(&built.document, resolved.format)?;

@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use myansub::domain::Cue;
+use myansub::domain::{Cue, DigitStyle};
 use myansub::llm::client::{CommitToken, LlmResponse, ServiceTier, ThinkingSetting, Usage};
 use myansub::llm::dry_run::Estimator;
 use myansub::llm::fake::Fake;
@@ -554,6 +554,7 @@ fn params(batch_size: u32) -> TranslationParams {
         context_after: 0,
         max_content_attempts: 3,
         output_ratio: 4.0,
+        digits: DigitStyle::Myanmar,
         estimator: Estimator {
             bytes_per_token_latin: 4.0,
             bytes_per_token_myanmar: 3.0,

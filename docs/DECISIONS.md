@@ -870,3 +870,30 @@ check) and `worst_case_doc_tokens` (budget for the new fields); (3) `review/anal
 `narration_register`, `formal_segments`, name→name_target pairs; mark TRANSLATE lines in formal ranges; pass
 name/target pairs to the quality context). Unknown fields stay lenient on the LLM-output path and strict on
 user import, as before.
+
+### ADR-050 Digit-style change reconciled on done batches: fold digits into `input_hash` + mark unlocked cues stale (M12, PBI-003)
+Context (M12, PBI-003/M12-AC14; ADR-049(e)): `[burmese].digits` is part of the translation prompt, so changing
+it must invalidate translations like any other prompt change (`LLM.md` §7). But a `done` translation batch is
+skipped by the scheduler on resume, so simply re-running `translate` after a digit change would silently ignore
+it — the batch is already done and never re-sent. The existing selective-invalidation path keys off an *analysis*
+diff (`invalidation.rs`), which a config-only change does not touch. Decision:
+
+- **Fold the digit style into both cache keys.** `compute_input_hash` (`pipeline/translation.rs`) now hashes the
+  `DigitStyle` alongside the variable block, analysis version, model, and `PROMPT_VERSION`; the translation
+  system instruction (hence the local response-cache key, `LLM.md` §4) also varies by digit style. A pure digit
+  change therefore moves every batch's recomputed `input_hash` while the source, analysis version, model, and
+  `PROMPT_VERSION` are unchanged — which uniquely isolates "only the digits moved the hash". `PROMPT_VERSION`
+  stays 5: the digit style is a config-driven prompt *variant* captured by the hash + local-cache key, not a
+  version change.
+- **Done-batch reconciliation.** `run_translation` runs a reconciliation step before scheduling: for each existing
+  `done` batch whose freshly-assembled `input_hash` differs from its stored one, in ONE transaction it (a) marks
+  that batch's UNLOCKED cues `stale = 1` (via `mark_unlocked_stale_in_tx`; locked cues are never marked — FR-6)
+  and (b) rewrites the batch row's stored `input_hash` to the new value. Rewriting the stored hash records the
+  drift so the next plain run does not re-mark (idempotent). The reconciling plain run itself re-sends nothing
+  (the scheduler skips `done` batches); the subsequent `translate --stale` re-translates exactly the stale,
+  unlocked cues, preserving locked ones. Auto-resending the whole batch was rejected: it would overwrite locked
+  cues, the very reason the stale path exists.
+- **`cue_final_stop` is export-only.** It is applied deterministically at export (`pipeline/output.rs`,
+  `apply_cue_final_stop` alongside `restore_text`), never sent to the LLM and never part of the prompt or
+  `input_hash`. Changing it therefore triggers no stale-marking and no LLM calls — a re-export with the new value
+  is sufficient. See ADR-049(e).

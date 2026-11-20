@@ -142,7 +142,24 @@ pub enum QualityFlag {
     ZawgyiSuspect,
     BoundaryDrift,
     GlossaryMiss,
+    /// The target uses digits of the system *not* chosen in `[burmese].digits`
+    /// (placeholder contents excluded) (`docs/DATA_MODEL.md` §5, ADR-049(e)).
+    DigitStyle,
     TooLong,
     TooFast,
     Failed,
+}
+
+/// The digit style the Burmese output requests (`[burmese].digits`, ADR-049(e)).
+///
+/// A pure domain type so the config, prompt, quality, and pipeline layers can all
+/// share it without crossing the dependency direction (`docs/ARCHITECTURE.md` §3).
+/// The default is [`DigitStyle::Myanmar`] (`docs/CONFIG.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DigitStyle {
+    /// Myanmar digits ၀–၉ (U+1040–U+1049).
+    #[default]
+    Myanmar,
+    /// Western digits 0–9 (U+0030–U+0039).
+    Western,
 }
