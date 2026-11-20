@@ -348,6 +348,13 @@ where
     C: ContextCacheClient + Sync,
     P: ProviderCacheStore + Sync,
 {
+    // The lookup key is `(analysis_version, model)` and deliberately does NOT include
+    // `PROMPT_VERSION` today because this store is dormant: there is no live caller and
+    // `LlmRequest` has no `cached_content` field, so no request is actually served from
+    // a `provider_cache` row. When the explicit cache is wired to real requests,
+    // `PROMPT_VERSION` MUST be folded into this key (or a version mismatch must force a
+    // recreate); otherwise a resumed stale row built under an older prompt would be
+    // reused and bypass the prompt-injection guard (ADR-048 follow-up, NFR-8).
     if let Some(existing) = store.get(spec.analysis_version, spec.model.clone()).await? {
         if existing.expires_at > now {
             tracing::debug!(cache = %existing.name, "reusing unexpired explicit cache");

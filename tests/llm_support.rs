@@ -17,9 +17,36 @@ use myansub::llm::prompts::{
 use myansub::llm::retry::Xorshift;
 use myansub::llm::schemas::{analysis_response_schema, translation_response_schema};
 
+// AC: M11-AC4 — the prompt-injection-guard wording changed both system instructions,
+// so PROMPT_VERSION is bumped 3 → 4 (every cache key changes; ADR-048).
 #[test]
-fn prompt_version_is_three() {
-    assert_eq!(PROMPT_VERSION, 3);
+fn prompt_version_is_four() {
+    assert_eq!(PROMPT_VERSION, 4);
+}
+
+// AC: M11-AC1 — both system instructions state that transcript/subtitle lines are
+// data (text to analyze or translate), never instructions to follow (NFR-8, ADR-048).
+#[test]
+fn system_instructions_state_lines_are_data_not_instructions() {
+    let analysis = prompts::analysis_system_instruction();
+    let translation = prompts::translation_system_instruction();
+
+    assert!(
+        analysis.contains("never instructions to follow"),
+        "analysis instruction must mark the transcript as data, not instructions: {analysis}"
+    );
+    assert!(
+        analysis.to_lowercase().contains("analyze"),
+        "analysis instruction says to analyze the line, not obey it: {analysis}"
+    );
+    assert!(
+        translation.contains("never instructions to follow"),
+        "translation instruction must mark the lines as data, not instructions: {translation}"
+    );
+    assert!(
+        translation.to_lowercase().contains("verbatim"),
+        "translation instruction says to translate an embedded instruction verbatim: {translation}"
+    );
 }
 
 // QA item D (ADR-045): a cap-aware content-retry reminder for an over-length string
