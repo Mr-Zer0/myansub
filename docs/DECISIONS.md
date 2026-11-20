@@ -796,3 +796,77 @@ system instruction today. When the explicit cache is wired, `PROMPT_VERSION` mus
 `provider_cache` lookup (or a version mismatch must force a recreate); otherwise a resumed project holding an
 unexpired v-N `provider_cache` row would reuse a prefix baked with the old system instruction and bypass this
 guard. A code comment at the key site records this.
+
+### ADR-049 Burmese fidelity: register, numerals/punctuation, honorifics, names (M12, PBI-002..005)
+Context (M12; `docs/MILESTONES.md`; PBI-002 register, PBI-003 numerals/punctuation, PBI-004 honorifics,
+PBI-005 name spelling): four backlog items raise Burmese output quality by extending the analysis schema,
+both system instructions, the translation variable block, the quality checks, the selective-invalidation
+diff, config, and the export step. They ship together on one feature branch. Decisions:
+
+(a) **One `PROMPT_VERSION` bump for the whole milestone (4 → 5).** Every PBI lists "bump `PROMPT_VERSION`"
+as an acceptance criterion, but they land in a single branch and all edit the same prompt surface. Bumping
+once per PBI would needlessly re-key the cache four times. `PROMPT_VERSION` goes `4 → 5` once; the version
+doc-comment in `prompts.rs` records all four reasons (register instruction + formal-segment marker; digit/
+punctuation instruction; honorific instruction; name-target instruction) and this ADR is cited. The literal
+assertion in `tests/llm_support.rs` moves to `5`. The bump re-keys the local response cache and every
+translation `input_hash`; accepted because the project's translation cache is cold.
+
+(b) **Register (PBI-002).** The analysis document gains a top-level `narration_register`
+(`"spoken"|"literary"`, default `"spoken"`) for genuine narrator voice-over, and `formal_segments`
+(array ≤ 60 of `{cue_range:[a,b], register:"literary", kind, note≤120}`, `kind ∈ {reading, broadcast,
+speech, recitation, onscreen_text, other}`). The driving distinction is spoken language vs voiced
+written/formal text, NOT dialogue vs narration (a teacher explaining is spoken; the same teacher reading
+the textbook aloud is literary). In the translation variable block, a TRANSLATE line whose cue index falls
+in a formal segment carries the marker `[<idx>] (literary: <kind>) <text>`; lines outside segments carry no
+marker; context lines are unmarked. The translation system instruction states the per-sentence no-mixing
+rule (one cue may switch register when the source switches). Selective invalidation: a `narration_register`
+change marks ALL unlocked translations stale (it is a whole-document register default, like premise/tone);
+a `formal_segments` add/remove/edit marks only cues overlapping the old or new range (scene-like range rule).
+
+(c) **Honorifics (PBI-004).** `address_matrix` entries gain an optional `honorific` (≤ 20, may be empty).
+The analysis prompt fills it only where the source's relationship/politeness justifies it and never adds
+Burmese honorifics to foreign names unless the source's politeness clearly calls for it. The translation
+instruction uses the matrix honorific when `from` names `to`. Invalidation: an `honorific` change is an
+address-pair change, so it reuses the existing §7 address-pair rule (batches whose overlapping scene lists
+both characters) — it is simply added to `AddressPair`'s equality in `invalidation.rs`.
+
+(d) **Names (PBI-005).** `characters` gain `name_target` (Myanmar script, ≤ 120, REQUIRED) and optional
+`aliases_target` (parallel to `aliases`, same length when present). The analysis prompt writes names by
+sound in Myanmar script per the source language's pronunciation, using established spellings for well-known
+people/places. The translation instruction requires the target spelling whenever a source line contains the
+name/alias. The `glossary_miss` check is extended to names: if a source cue contains a character name/alias,
+the target must contain the matching `name_target`/`aliases_target` (reusing the existing contains-based
+mechanism; the translation stage now passes name→target pairs into the quality `AnalysisContext`, not just
+bare name strings). Import validation: `name_target` present and containing Myanmar code points;
+`aliases_target` length equals `aliases` length and each entry contains Myanmar code points. Invalidation:
+a `name_target` change is a character change, so it is added to `Character::attrs_eq` and the existing §7
+character rule invalidates batches mentioning that name.
+
+(e) **Numerals and punctuation (PBI-003).** A new `[burmese]` config section: `digits ∈ {myanmar, western}`
+(default `myanmar`) and `cue_final_stop ∈ {keep, strip}` (default `strip`), validated at startup with the
+offending key named (reusing the `ConfigError::Invalid { key, message }` enum-reject pattern). The section
+is added to `docs/config.example` (guarded by `tests/config_example.rs`). The translation instruction states
+the chosen digit style and the punctuation rule (။ ends sentences, ၊ separates clauses, never the Latin full
+stop). A new `digit_style` quality flag fires when a translated cue contains digits of the non-chosen system,
+excluding placeholder (`⟦n⟧`) contents. `cue_final_stop` is applied DETERMINISTICALLY AT EXPORT, never by the
+LLM: `strip` removes one trailing ။ plus trailing whitespace per cue (handling multi-line cues — only the
+cue's final line), `keep` leaves text unchanged. This is a new per-cue transform in `pipeline/output.rs`
+alongside `restore_text` (ADR applied to the restored/unmasked body). Invalidation: changing `digits` marks
+all unlocked translations stale (prompt change); changing `cue_final_stop` needs only a re-export and triggers
+no stale-marking and no LLM calls.
+
+(f) **Five analysis-doc touch points.** Adding schema fields means updating every analysis-document code path:
+(1) `llm/schemas.rs::analysis_response_schema` (wire `properties`; new per-field strings have no bounds per
+ADR-044; `name_target` joins the per-character `required`; `narration_register` enum and `formal_segments`
+item shape added; `formal_segments.cue_range` carries the fixed 2-element bound like `scenes`); (2)
+`pipeline/analysis.rs::validate_full` (string/array caps: `formal_segments` ≤ 60 with `note` ≤ 120,
+`name_target`/`aliases_target` ≤ 120 and aliases_target cap 8, `honorific` ≤ 20; `narration_register` enum
+check) and `worst_case_doc_tokens` (budget for the new fields); (3) `review/analysis.rs` (import allowlists +
+`check_*` for the new fields incl. Myanmar-code-point and parallel-length checks, and `render_human` showing
+`formal_segments` with ranges and the first source line of each — M12-AC7); (4) `pipeline/invalidation.rs`
+(typed structs gain the fields; `Character::attrs_eq` += `name_target`/`aliases_target`; `AddressPair` eq +=
+`honorific`; new `narration_register` whole-doc rule and `formal_segments` range rule; `AnalysisDoc` gains
+`narration_register` + `formal_segments`); (5) `pipeline/translation.rs::Sheet::parse` (extract
+`narration_register`, `formal_segments`, name→name_target pairs; mark TRANSLATE lines in formal ranges; pass
+name/target pairs to the quality context). Unknown fields stay lenient on the LLM-output path and strict on
+user import, as before.

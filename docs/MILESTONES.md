@@ -174,6 +174,101 @@ instructions and…`) cannot change the model's behaviour (`REQUIREMENTS.md` NFR
   one JSON string value and is confined to the sheet).
 - M11-AC4 `PROMPT_VERSION` bumped and the bump reason recorded in `prompts.rs` and ADR-048.
 
+## M12 — Burmese fidelity: register, numerals, honorifics, names
+
+Four product backlog items that raise Burmese output quality. They extend the already-shipped
+analysis schema/prompt (M5), translation prompt and quality checks (M6), and export (M7), and
+carry one manual native-review item (M9). They land together on one feature branch; because they
+all edit the shared prompt surface, `PROMPT_VERSION` is bumped **once** for the whole milestone
+(see `DECISIONS.md` ADR-049) rather than once per PBI.
+
+Docs: `DATA_MODEL.md` §3/§5, `LLM.md` §2/§7/§8, `CONFIG.md`, `config.example`.
+
+### PBI-002 — Burmese register policy (spoken vs literary)
+
+Distinguish spoken language from written/formal text that a character voices (reading, a letter,
+a broadcast, a speech, recitation, on-screen text). The distinction is spoken vs voiced-written,
+**not** dialogue vs narration.
+
+- M12-AC1 (=PBI-002-AC1) Analysis schema gains `narration_register: "spoken" | "literary"`
+  (default `"spoken"`) for genuine narrator voice-over. Validated on import.
+- M12-AC2 (=PBI-002-AC2) Analysis schema gains `formal_segments`: array (max 60) of
+  `{ "cue_range": [a, b], "register": "literary", "kind": "reading" | "broadcast" | "speech" |
+  "recitation" | "onscreen_text" | "other", "note": string ≤ 120 }`. Import validation: ranges
+  within existing cue indices, ascending, non-overlapping; unknown `kind` rejected.
+- M12-AC3 (=PBI-002-AC3) The analysis prompt asks the model to list scenes where characters read,
+  recite, broadcast, or deliver written/formal text, and on-screen text, as `formal_segments`; and
+  to add an `unresolved_ambiguities` entry when unsure.
+- M12-AC4 (=PBI-002-AC4) The translation system instruction states: spoken register is the default
+  for characters speaking; narrator voice-over uses `narration_register`; lines marked as formal
+  segments, and any line where a character clearly reads/recites/broadcasts written/formal text,
+  use literary register (e.g. သည်၊ ၏၊ ၌) for that part only.
+- M12-AC5 (=PBI-002-AC5) Lines inside a formal segment carry a short marker in the variable block,
+  e.g. `[214] (literary: reading) …`. Lines outside segments carry no marker. Test: a batch
+  spanning a segment boundary marks exactly the in-range lines.
+- M12-AC6 (=PBI-002-AC6) The no-mixing rule applies per sentence: one cue may switch register when
+  the source switches (reading a line, then commenting on it). The instruction says so explicitly.
+- M12-AC7 (=PBI-002-AC7) Analysis review shows `formal_segments` with their cue ranges and the first
+  source line of each, so the reviewer can confirm or correct them.
+- M12-AC8 (=PBI-002-AC8) Selective invalidation: changing `narration_register` marks all unlocked
+  translations stale; adding, removing or editing a formal segment marks only batches overlapping
+  the old or new range stale. Tests for both.
+- M12-AC9 (=PBI-002-AC10, manual, M9) Native review sample includes at least one reading or
+  broadcast scene; it is rendered in literary register while surrounding conversation stays spoken.
+
+### PBI-003 — Numerals and punctuation policy
+
+Myanmar digits (၀–၉) by default; cue-final ။ stripped at export by default. Both configurable
+(ADR-024 product-owner decision).
+
+- M12-AC10 (=PBI-003-AC1) Config section `[burmese]` with `digits = "myanmar" | "western"`
+  (default `"myanmar"`) and `cue_final_stop = "keep" | "strip"` (default `"strip"`); invalid
+  values rejected at startup naming the key. Test asserts both defaults.
+- M12-AC11 (=PBI-003-AC2) Translation system instruction states the chosen digit style, and that ။
+  ends sentences and ၊ separates clauses (never the Latin full stop in Burmese text).
+- M12-AC12 (=PBI-003-AC3) New quality flag `digit_style`: set when a translated cue contains digits
+  of the non-chosen system (placeholder contents excluded). Positive and negative tests.
+- M12-AC13 (=PBI-003-AC4) Cue-final ။ handling is applied deterministically at export
+  (`cue_final_stop = "strip"` removes one trailing ။ and trailing whitespace per cue; `"keep"`
+  leaves text unchanged). Not done by the LLM. Tests for both modes, including multi-line cues.
+- M12-AC14 (=PBI-003-AC5) Changing `digits` marks unlocked translations stale (it changes the
+  prompt). Changing `cue_final_stop` needs only a re-export and triggers no LLM calls. Tests for both.
+
+### PBI-004 — Honorifics in the address matrix
+
+- M12-AC15 (=PBI-004-AC1) `address_matrix` entries gain optional `honorific` (string ≤ 20, may be
+  empty): the honorific `from` uses before `to`'s name.
+- M12-AC16 (=PBI-004-AC2) The analysis prompt asks for honorifics only where the source's
+  relationship and politeness justify them, and never adds Burmese honorifics to foreign names
+  unless the source's own politeness level clearly calls for it.
+- M12-AC17 (=PBI-004-AC3) The translation system instruction tells the model to use the matrix
+  honorific when `from` names `to`, and to keep it consistent unless the relationship changes.
+- M12-AC18 (=PBI-004-AC4) Import validation: honorific length limit enforced; unknown fields still
+  rejected.
+- M12-AC19 (=PBI-004-AC5) Changing an honorific marks affected batches stale (address-pair rule,
+  `LLM.md` §7). Test included.
+
+### PBI-005 — Consistent Burmese spelling of names
+
+- M12-AC20 (=PBI-005-AC1) `characters` entries gain `name_target` (Myanmar script, ≤ 120, required)
+  and optional `aliases_target` (parallel to `aliases`, same length when present).
+- M12-AC21 (=PBI-005-AC2) The analysis prompt instructs: write names by sound in Myanmar script,
+  following the source language's pronunciation (e.g. Mandarin readings for Chinese names); use
+  established Myanmar spellings for well-known people and places.
+- M12-AC22 (=PBI-005-AC3) The translation system instruction requires `name_target` / `aliases_target`
+  whenever the source line contains the name or alias.
+- M12-AC23 (=PBI-005-AC4) The `glossary_miss` check also covers names: if a source cue contains a
+  character name or alias, the translation must contain the matching target spelling. Positive and
+  negative tests.
+- M12-AC24 (=PBI-005-AC5) Import validation: `name_target` contains Myanmar code points;
+  `aliases_target` length equals `aliases` length.
+- M12-AC25 (=PBI-005-AC6) Changing a name spelling marks batches mentioning that name stale.
+
+### Shared
+
+- M12-AC26 `PROMPT_VERSION` bumped once (covers PBI-002-AC9, PBI-003-AC6, PBI-004-AC6, PBI-005-AC7);
+  bump reason recorded in `prompts.rs` and `DECISIONS.md` ADR-049.
+
 ## Later (not v1)
 
 TXT support, Batch API mode, series projects with cross-episode memory, other target
