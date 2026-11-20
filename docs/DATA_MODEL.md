@@ -172,6 +172,18 @@ falls back to its defaults: output format = source format, output path =
 so existing projects migrate without data loss (fills the output-preference gap
 deferred from M4-B).
 
+### Migration 4 — translation digit style (ADR-050)
+
+```sql
+ALTER TABLE project ADD COLUMN translation_digits TEXT;  -- myanmar|western, nullable
+```
+
+Nullable, defaults to `NULL` ("not yet recorded"). The translation stage records the
+`[burmese].digits` style in use when it first creates the translation batches, and on a
+later run marks all unlocked translations stale if the current `digits` setting differs
+from the recorded value (`LLM.md` §7, ADR-050). Append-only, so existing projects migrate
+without data loss.
+
 ## 3. Analysis document (schema_version 1)
 
 Prose fields are written in English. The array caps and the per-field string-length limits

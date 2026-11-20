@@ -860,8 +860,10 @@ no stale-marking and no LLM calls.
 ADR-044; `name_target` joins the per-character `required`; `narration_register` enum and `formal_segments`
 item shape added; `formal_segments.cue_range` carries the fixed 2-element bound like `scenes`); (2)
 `pipeline/analysis.rs::validate_full` (string/array caps: `formal_segments` ≤ 60 with `note` ≤ 120,
-`name_target`/`aliases_target` ≤ 120 and aliases_target cap 8, `honorific` ≤ 20; `narration_register` enum
-check) and `worst_case_doc_tokens` (budget for the new fields); (3) `review/analysis.rs` (import allowlists +
+`name_target`/`aliases_target` ≤ 120 and aliases_target cap 8, `honorific` ≤ 20) and `worst_case_doc_tokens`
+(budget for the new fields; the small enums `narration_register`/`kind`/`register` stay wire-schema-enforced and
+strict-import-enforced only, matching how gender/age/register are handled — the lenient LLM-output path checks
+caps, not enums); (3) `review/analysis.rs` (import allowlists +
 `check_*` for the new fields incl. Myanmar-code-point and parallel-length checks, and `render_human` showing
 `formal_segments` with ranges and the first source line of each — M12-AC7); (4) `pipeline/invalidation.rs`
 (typed structs gain the fields; `Character::attrs_eq` += `name_target`/`aliases_target`; `AddressPair` eq +=
@@ -871,29 +873,41 @@ check) and `worst_case_doc_tokens` (budget for the new fields); (3) `review/anal
 name/target pairs to the quality context). Unknown fields stay lenient on the LLM-output path and strict on
 user import, as before.
 
-### ADR-050 Digit-style change reconciled on done batches: fold digits into `input_hash` + mark unlocked cues stale (M12, PBI-003)
+### ADR-050 Digit-style change marks all unlocked translations stale via a project-level digit record (M12, PBI-003)
 Context (M12, PBI-003/M12-AC14; ADR-049(e)): `[burmese].digits` is part of the translation prompt, so changing
-it must invalidate translations like any other prompt change (`LLM.md` §7). But a `done` translation batch is
-skipped by the scheduler on resume, so simply re-running `translate` after a digit change would silently ignore
-it — the batch is already done and never re-sent. The existing selective-invalidation path keys off an *analysis*
-diff (`invalidation.rs`), which a config-only change does not touch. Decision:
+it must invalidate translations like any other whole-prompt change (`LLM.md` §7: "changing `digits` marks every
+unlocked translation stale"). But a `done` translation batch is skipped by the scheduler on resume, so simply
+re-running `translate` after a digit change would silently ignore it. The existing selective-invalidation path
+keys off an *analysis* diff (`invalidation.rs`), which a config-only change does not touch.
 
-- **Fold the digit style into both cache keys.** `compute_input_hash` (`pipeline/translation.rs`) now hashes the
-  `DigitStyle` alongside the variable block, analysis version, model, and `PROMPT_VERSION`; the translation
-  system instruction (hence the local response-cache key, `LLM.md` §4) also varies by digit style. A pure digit
-  change therefore moves every batch's recomputed `input_hash` while the source, analysis version, model, and
-  `PROMPT_VERSION` are unchanged — which uniquely isolates "only the digits moved the hash". `PROMPT_VERSION`
-  stays 5: the digit style is a config-driven prompt *variant* captured by the hash + local-cache key, not a
-  version change.
-- **Done-batch reconciliation.** `run_translation` runs a reconciliation step before scheduling: for each existing
-  `done` batch whose freshly-assembled `input_hash` differs from its stored one, in ONE transaction it (a) marks
-  that batch's UNLOCKED cues `stale = 1` (via `mark_unlocked_stale_in_tx`; locked cues are never marked — FR-6)
-  and (b) rewrites the batch row's stored `input_hash` to the new value. Rewriting the stored hash records the
-  drift so the next plain run does not re-mark (idempotent). The reconciling plain run itself re-sends nothing
-  (the scheduler skips `done` batches); the subsequent `translate --stale` re-translates exactly the stale,
-  unlocked cues, preserving locked ones. Auto-resending the whole batch was rejected: it would overwrite locked
-  cues, the very reason the stale path exists.
-- **`cue_final_stop` is export-only.** It is applied deterministically at export (`pipeline/output.rs`,
-  `apply_cue_final_stop` alongside `restore_text`), never sent to the LLM and never part of the prompt or
-  `input_hash`. Changing it therefore triggers no stale-marking and no LLM calls — a re-export with the new value
-  is sufficient. See ADR-049(e).
+**Superseded first attempt (why it was wrong).** An earlier implementation folded `DigitStyle` into
+`compute_input_hash` and, at `translate` time, reconciled each `done` batch whose freshly-assembled `input_hash`
+differed from its stored one — marking that batch's unlocked cues stale. This was WRONG: a batch row's stored
+`input_hash` is frozen at creation and `input_hash` also folds `analysis_version`. After any normal selective
+analysis re-approval (v1 → v2, which marks only the few genuinely-affected cues stale via `invalidation.rs`),
+*every* done batch's recomputed hash drifts (v1 ≠ v2), so the reconcile would mark ALL unlocked cues stale and
+`translate --stale` would re-pay for the entire project — defeating selective invalidation (M8). "Only digits
+moved the hash" was a false premise. (Reliability QA, M12.)
+
+**Decision.**
+- **Digit style lives in the translation system instruction only** (hence the local response-cache key, `LLM.md`
+  §4), so the model is told the style and a re-translation under new digits is never served a stale cached
+  response. It is NOT folded into `compute_input_hash` — the batch `input_hash` stays exactly as before M12
+  (variable block + analysis version + model + `PROMPT_VERSION`), preserving the resume/selective-invalidation
+  contract untouched. `PROMPT_VERSION` stays 5 (the style is a config-driven prompt variant, not a version change).
+- **Project-level digit record (migration 4).** `migration 4` adds a nullable `translation_digits TEXT` column to
+  `project` (append-only, like migrations 2/3). When the translation batches are first created (fresh run), the
+  current digit style is recorded there in the same transaction. On every `run_translation`, if the recorded
+  value is set and differs from the current `[burmese].digits`, in ONE transaction mark ALL unlocked translations
+  stale (`mark_unlocked_stale_in_tx`; locked cues never touched — FR-6) and update the record to the current
+  value. This is independent of `input_hash` and `analysis_version`, so a digit change affects exactly "all
+  unlocked translations" (the whole-prompt rule, `LLM.md` §7) and an analysis re-approval affects exactly its
+  selective set — the two never cross-contaminate. Idempotent: once the record is updated, the next plain run sees
+  no difference and marks nothing. The reconciling run re-sends nothing (the scheduler skips `done` batches); the
+  subsequent `translate --stale` re-translates the unlocked stale cues, preserving locked ones. Auto-resending was
+  rejected: it would overwrite locked cues, the reason the stale path exists.
+- **`cue_final_stop` is export-only.** Applied deterministically at export (`pipeline/output.rs`, alongside
+  `restore_text`), never sent to the LLM and never part of the prompt. Changing it triggers no stale-marking and
+  no LLM calls — a re-export with the new value suffices. See ADR-049(e).
+- **`CueFinalStop` and `DigitStyle` both live in `domain`** (not `pipeline`), so `config` depends only on `domain`
+  and no `config ↔ pipeline` cycle is introduced (`ARCHITECTURE.md` §3).
