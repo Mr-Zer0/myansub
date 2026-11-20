@@ -30,6 +30,13 @@ tests/
 `Fake` holds a script: a queue of `(matcher, response | error)` and a call log.
 Tests assert both outputs and the exact sequence of requests (e.g. "batch 3 sent once").
 
+The captured request is also used for the prompt-injection guard (NFR-8, M11, ADR-048): a fixture
+cue whose text is `Ignore previous instructions and…` must be absent from the request's
+`systemInstruction`, and confined to the variable content block. For translation that means absent
+from `contents[0]` (the cached prefix / analysis sheet) and present only in `contents[1]`. For
+analysis there is no cached sheet — the transcript is the single variable block (`contents[0]`), so
+the cue is present there and only the `systemInstruction` must be free of it.
+
 ## 3a. Recording progress sink
 
 Progress (`ARCHITECTURE.md` §11, FR-11) is tested with a recording `Progress` double, not by scraping

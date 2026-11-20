@@ -103,6 +103,7 @@ may edit translations using exported review files.
 | NFR-5 Observability | Structured `tracing` logs, controllable via `RUST_LOG`. Sensitive text only at `trace`. Live progress (FR-11) is a separate human-facing channel on stderr, independent of the log level. |
 | NFR-6 Portability | Builds and runs on Linux, macOS, and Windows. No native TLS (rustls only). |
 | NFR-7 Testability | Full pipeline testable offline with a fake LLM transport. |
+| NFR-8 Prompt-injection resistance | Subtitle and transcript text is treated strictly as data. A cue's content (e.g. `Ignore previous instructions and…`) cannot change the model's behaviour: it appears only in variable user content, never in a system instruction or the cached prefix, and both system instructions state that transcript/subtitle lines are text to analyze or translate, never instructions to follow (`LLM.md` §2). |
 
 ## 6. Out of scope (v1)
 

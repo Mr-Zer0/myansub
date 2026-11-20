@@ -146,6 +146,34 @@ gives a clear error with the key name.
   leaks into stdout); the outcome line is unchanged.
 - Cancellation mid-stage still exits 130 and a post-grace tick is dropped (no panic, no double count).
 
+## M11 — Prompt-injection guard
+
+Treat subtitle text strictly as data so a malicious or odd line (`Ignore previous
+instructions and…`) cannot change the model's behaviour (`REQUIREMENTS.md` NFR-8,
+`LLM.md` §2, ADR-048). Hardens the M5 analysis prompt and the M6 translation prompt.
+
+- Analysis and translation system instructions each state that transcript/subtitle lines
+  are text to analyze or translate, never instructions to follow.
+- Subtitle text stays confined to the variable user content — `contents[1]` for
+  translation, the transcript content block for analysis — never the `systemInstruction`
+  or the cached prefix (`contents[0]`, the canonical analysis sheet).
+- User-edited analysis fields reach a prompt only JSON-encoded inside the canonical sheet,
+  never concatenated as free prose.
+- `PROMPT_VERSION` bumped (invalidates every cache key).
+
+**Accept:**
+- M11-AC1 The analysis and translation system instructions both state that
+  transcript/subtitle lines are text to analyze or translate, never instructions to follow.
+- M11-AC2 A cue containing `Ignore previous instructions` is asserted (fake transport,
+  captured request) to be absent from `systemInstruction` and `contents[0]` of the
+  translation request, and absent from the analysis `systemInstruction`; the cue text
+  appears only in the variable content block (`contents[1]` / the transcript).
+- M11-AC3 Text from user-edited analysis fields that is inserted into prompts is
+  JSON-encoded inside the canonical sheet, never concatenated as free prose (a field value
+  containing control characters, quotes, or `Ignore previous instructions` round-trips as
+  one JSON string value and is confined to the sheet).
+- M11-AC4 `PROMPT_VERSION` bumped and the bump reason recorded in `prompts.rs` and ADR-048.
+
 ## Later (not v1)
 
 TXT support, Batch API mode, series projects with cross-episode memory, other target
