@@ -623,9 +623,11 @@ async fn dry_run_map_reduce_reports_chunks_and_writes_nothing() {
 // Review #1: generous output budget (truncation risk)
 // ---------------------------------------------------------------------------
 
-// AC (review #1) — the analysis maxOutputTokens budget exceeds the old fixed 16384
-// and comfortably covers the worst-case document (from the schema caps), while
-// staying within the model output ceiling.
+// AC (review #1 / QA-M12) — the analysis maxOutputTokens budget exceeds the old fixed
+// 16384 and is pinned to the model's hard output ceiling (65,536). The TRUE worst-case
+// schema-maximum document (`worst_case_doc_tokens`, ~69,539) exceeds that ceiling, so
+// the budget is honestly clamped to the ceiling rather than claiming to cover a
+// document the model cannot emit; realistic documents fit well under it.
 #[test]
 fn analysis_output_budget_is_generous_and_bounded() {
     let budget = analysis_output_budget();
@@ -633,12 +635,17 @@ fn analysis_output_budget_is_generous_and_bounded() {
         budget > 16_384,
         "budget must exceed the old fixed 16384, got {budget}"
     );
+    assert_eq!(
+        budget, 65_536,
+        "budget is pinned to the model's hard output ceiling"
+    );
+    // The honest worst case exceeds the ceiling, which is exactly why the budget clamps
+    // rather than covering it.
     assert!(
-        u64::from(budget) >= worst_case_doc_tokens(),
-        "budget {budget} must cover the worst-case doc {}",
+        worst_case_doc_tokens() > u64::from(budget),
+        "the true worst-case doc {} must exceed the clamped budget {budget}",
         worst_case_doc_tokens()
     );
-    assert!(budget <= 65_536, "budget stays within the model ceiling");
 }
 
 // AC (review #1) — the actual single-pass request carries the generous budget, so a

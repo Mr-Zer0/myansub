@@ -115,3 +115,36 @@ fn valid_config_passes() {
     assert_eq!(config.translation.batch_size, 100);
     assert_eq!(config.translation.concurrency, 8);
 }
+
+// AC: M12-AC10 — the `[burmese]` section defaults to `digits = "myanmar"` and
+// `cue_final_stop = "strip"` (docs/CONFIG.md §6, ADR-049(e)).
+#[test]
+fn burmese_section_defaults_to_myanmar_and_strip() {
+    let config = load_toml("").expect("empty config is valid");
+    assert_eq!(config.burmese.digits, "myanmar");
+    assert_eq!(config.burmese.cue_final_stop, "strip");
+}
+
+// AC: M12-AC10 — an invalid `burmese.digits` value is rejected at startup, naming
+// the offending key (docs/CONFIG.md §5/§6).
+#[test]
+fn burmese_digits_invalid_value_names_the_key() {
+    let err =
+        load_toml("[burmese]\ndigits = \"arabic\"\n").expect_err("should reject digits = arabic");
+    assert!(
+        err.to_string().contains("burmese.digits"),
+        "error should name burmese.digits, got: {err}"
+    );
+}
+
+// AC: M12-AC10 — an invalid `burmese.cue_final_stop` value is rejected at startup,
+// naming the offending key (docs/CONFIG.md §5/§6).
+#[test]
+fn burmese_cue_final_stop_invalid_value_names_the_key() {
+    let err = load_toml("[burmese]\ncue_final_stop = \"maybe\"\n")
+        .expect_err("should reject cue_final_stop = maybe");
+    assert!(
+        err.to_string().contains("burmese.cue_final_stop"),
+        "error should name burmese.cue_final_stop, got: {err}"
+    );
+}

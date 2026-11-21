@@ -48,6 +48,10 @@ max_lines = 2
 max_gps = 20.0                   # graphemes per second
 drift_ratio = 3.0                # boundary-drift sensitivity
 
+[burmese]
+digits = "myanmar"               # myanmar (၀–၉) | western (0–9); part of the prompt (changing it marks translations stale)
+cue_final_stop = "strip"         # strip (remove one trailing ။ per cue at export) | keep; applied at export, not by the LLM
+
 [estimate]
 bytes_per_token_latin = 4.0
 bytes_per_token_myanmar = 3.0    # tune with real usage data

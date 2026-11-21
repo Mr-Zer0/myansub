@@ -28,7 +28,7 @@ const VALID: &str = r#"{
   "schema_version": 1,
   "premise": "A traveller arrives at dawn.",
   "tone": "calm",
-  "characters": [{"id":"c1","name":"Aoi","gender":"f","age_group":"young"}],
+  "characters": [{"id":"c1","name":"Aoi","name_target":"အာအိုအိ","gender":"f","age_group":"young"}],
   "address_matrix": [{"from":"c1","to":"c1","relation":"self","register":"polite"}],
   "glossary": [{"term":"sakura","target":"cherry blossom","keep":false}],
   "scenes": [
@@ -430,6 +430,252 @@ async fn import_accepts_valid_document() {
     let version = analysis::import_doc(&store, VALID).await.expect("import");
     assert_eq!(version, 2);
     assert_eq!(version_count(&store).await, 2);
+}
+
+// AC: M12-AC18 — an address_matrix honorific over the 20-char cap is rejected,
+// located at the offending field (ADR-049(c)).
+#[tokio::test]
+async fn import_rejects_over_length_honorific() {
+    assert_rejected_with(
+        |doc| {
+            doc["address_matrix"][0]["honorific"] = serde_json::Value::String("x".repeat(21));
+        },
+        "address_matrix[0].honorific",
+    )
+    .await;
+}
+
+// AC: M12-AC18 — a valid (≤ 20 char) honorific is accepted.
+#[tokio::test]
+async fn import_accepts_valid_honorific() {
+    let store = seeded_store(VALID).await;
+    let mut doc: serde_json::Value = serde_json::from_str(VALID).expect("parse");
+    doc["address_matrix"][0]["honorific"] = serde_json::Value::String("ဦး".into());
+    let body = serde_json::to_string(&doc).expect("serialize");
+    let version = analysis::import_doc(&store, &body).await.expect("import");
+    assert_eq!(version, 2);
+}
+
+// AC: M12-AC18 — an unknown field alongside a valid honorific is still rejected
+// (strict import; the new field does not relax the allowlist).
+#[tokio::test]
+async fn import_rejects_unknown_field_beside_honorific() {
+    assert_rejected_with(
+        |doc| {
+            doc["address_matrix"][0]["honorific"] = serde_json::Value::String("ဦး".into());
+            doc["address_matrix"][0]["bogus"] = serde_json::Value::Bool(true);
+        },
+        "address_matrix[0]",
+    )
+    .await;
+}
+
+// AC: M12-AC24 — a missing `name_target` is rejected (required) naming the field
+// (ADR-049(d)).
+#[tokio::test]
+async fn import_rejects_missing_name_target() {
+    assert_rejected_with(
+        |doc| {
+            doc["characters"][0]
+                .as_object_mut()
+                .expect("char object")
+                .remove("name_target");
+        },
+        "characters[0].name_target",
+    )
+    .await;
+}
+
+// AC: M12-AC24 — a `name_target` without Myanmar code points is rejected.
+#[tokio::test]
+async fn import_rejects_non_myanmar_name_target() {
+    assert_rejected_with(
+        |doc| {
+            doc["characters"][0]["name_target"] = serde_json::Value::String("Aoi".into());
+        },
+        "characters[0].name_target",
+    )
+    .await;
+}
+
+// AC: M12-AC24 — `aliases_target` whose length differs from `aliases` is rejected
+// (they must run parallel).
+#[tokio::test]
+async fn import_rejects_aliases_target_length_mismatch() {
+    assert_rejected_with(
+        |doc| {
+            doc["characters"][0]["aliases"] = serde_json::json!(["A", "B"]);
+            doc["characters"][0]["aliases_target"] = serde_json::json!(["အေ"]);
+        },
+        "characters[0].aliases_target",
+    )
+    .await;
+}
+
+// AC: M12-AC24 — a non-Myanmar `aliases_target` entry is rejected.
+#[tokio::test]
+async fn import_rejects_non_myanmar_aliases_target_entry() {
+    assert_rejected_with(
+        |doc| {
+            doc["characters"][0]["aliases"] = serde_json::json!(["A"]);
+            doc["characters"][0]["aliases_target"] = serde_json::json!(["Ay"]);
+        },
+        "characters[0].aliases_target[0]",
+    )
+    .await;
+}
+
+// AC: M12-AC24 — a valid parallel `aliases_target` (same length, Myanmar) is accepted.
+#[tokio::test]
+async fn import_accepts_valid_name_and_aliases_target() {
+    let store = seeded_store(VALID).await;
+    let mut doc: serde_json::Value = serde_json::from_str(VALID).expect("parse");
+    doc["characters"][0]["aliases"] = serde_json::json!(["A", "Blue"]);
+    doc["characters"][0]["aliases_target"] = serde_json::json!(["အေ", "အပြာ"]);
+    let body = serde_json::to_string(&doc).expect("serialize");
+    let version = analysis::import_doc(&store, &body).await.expect("import");
+    assert_eq!(version, 2);
+}
+
+// ---------------------------------------------------------------------------
+// M12-AC1 / M12-AC2 / M12-AC7 — register: narration_register + formal_segments
+// ---------------------------------------------------------------------------
+
+// AC: M12-AC7 — `show` lists each formal segment with its cue range, kind, and the
+// first source line of the range, so the reviewer can confirm or correct it.
+#[tokio::test]
+async fn show_lists_formal_segments_with_range_and_first_source_line() {
+    let mut doc: serde_json::Value = serde_json::from_str(VALID).expect("parse");
+    doc["narration_register"] = serde_json::Value::String("spoken".into());
+    doc["formal_segments"] = serde_json::json!([
+        {"cue_range":[10,12],"register":"literary","kind":"reading","note":"a letter"}
+    ]);
+    let body = serde_json::to_string(&doc).expect("serialize");
+    let store = seeded_store(&body).await;
+
+    let rendered = analysis::show(&store, false).await.expect("show");
+    assert!(rendered.contains("Formal segments"), "{rendered}");
+    assert!(rendered.contains("[10,12]"), "range shown: {rendered}");
+    assert!(rendered.contains("reading"), "kind shown: {rendered}");
+    // Seeded cues have text_raw "line {idx}"; the first in-range source line is cue 10.
+    assert!(
+        rendered.contains("line 10"),
+        "first source line shown: {rendered}"
+    );
+}
+
+// AC: M12-AC1 / M12-AC2 — a valid narration_register plus a valid formal_segments
+// array is accepted.
+#[tokio::test]
+async fn import_accepts_narration_register_and_formal_segments() {
+    let store = seeded_store(VALID).await;
+    let mut doc: serde_json::Value = serde_json::from_str(VALID).expect("parse");
+    doc["narration_register"] = serde_json::Value::String("literary".into());
+    doc["formal_segments"] = serde_json::json!([
+        {"cue_range":[10,20],"register":"literary","kind":"reading","note":"a letter"},
+        {"cue_range":[30,40],"register":"literary","kind":"broadcast"}
+    ]);
+    let body = serde_json::to_string(&doc).expect("serialize");
+    let version = analysis::import_doc(&store, &body).await.expect("import");
+    assert_eq!(version, 2);
+}
+
+// AC: M12-AC1 — a narration_register that is not "spoken"|"literary" is rejected.
+#[tokio::test]
+async fn import_rejects_bad_narration_register() {
+    assert_rejected_with(
+        |doc| {
+            doc["narration_register"] = serde_json::Value::String("casual".into());
+        },
+        "narration_register",
+    )
+    .await;
+}
+
+// AC: M12-AC2 — a formal_segments range outside the existing cue indices is rejected.
+#[tokio::test]
+async fn import_rejects_formal_segment_out_of_range() {
+    assert_rejected_with(
+        |doc| {
+            doc["formal_segments"] = serde_json::json!([
+                {"cue_range":[10,200],"register":"literary","kind":"reading"}
+            ]);
+        },
+        "formal_segments[0].cue_range",
+    )
+    .await;
+}
+
+// AC: M12-AC2 — a non-ascending formal_segments range is rejected.
+#[tokio::test]
+async fn import_rejects_formal_segment_descending_range() {
+    assert_rejected_with(
+        |doc| {
+            doc["formal_segments"] = serde_json::json!([
+                {"cue_range":[20,10],"register":"literary","kind":"reading"}
+            ]);
+        },
+        "formal_segments[0].cue_range",
+    )
+    .await;
+}
+
+// AC: M12-AC2 — overlapping (not ascending across entries) formal_segments are
+// rejected.
+#[tokio::test]
+async fn import_rejects_overlapping_formal_segments() {
+    assert_rejected_with(
+        |doc| {
+            doc["formal_segments"] = serde_json::json!([
+                {"cue_range":[10,30],"register":"literary","kind":"reading"},
+                {"cue_range":[25,40],"register":"literary","kind":"broadcast"}
+            ]);
+        },
+        "formal_segments[1].cue_range",
+    )
+    .await;
+}
+
+// AC: M12-AC2 — an unknown `kind` is rejected.
+#[tokio::test]
+async fn import_rejects_formal_segment_unknown_kind() {
+    assert_rejected_with(
+        |doc| {
+            doc["formal_segments"] = serde_json::json!([
+                {"cue_range":[10,20],"register":"literary","kind":"singing"}
+            ]);
+        },
+        "formal_segments[0].kind",
+    )
+    .await;
+}
+
+// AC: M12-AC2 — a `register` other than "literary" is rejected.
+#[tokio::test]
+async fn import_rejects_formal_segment_non_literary_register() {
+    assert_rejected_with(
+        |doc| {
+            doc["formal_segments"] = serde_json::json!([
+                {"cue_range":[10,20],"register":"spoken","kind":"reading"}
+            ]);
+        },
+        "formal_segments[0].register",
+    )
+    .await;
+}
+
+// AC: M12-AC2 — an unknown field inside a formal segment is rejected (strict import).
+#[tokio::test]
+async fn import_rejects_formal_segment_unknown_field() {
+    assert_rejected_with(
+        |doc| {
+            doc["formal_segments"] = serde_json::json!([
+                {"cue_range":[10,20],"register":"literary","kind":"reading","bogus":true}
+            ]);
+        },
+        "formal_segments[0]",
+    )
+    .await;
 }
 
 // AC: M5-AC3 — invalid JSON is a parse error, not a validation error.

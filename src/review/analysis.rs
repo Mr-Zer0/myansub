@@ -36,10 +36,12 @@ const TOP_FIELDS: &[&str] = &[
     "schema_version",
     "premise",
     "tone",
+    "narration_register",
     "characters",
     "address_matrix",
     "glossary",
     "scenes",
+    "formal_segments",
     "style_rules",
     "unresolved_ambiguities",
 ];
@@ -49,6 +51,7 @@ const CAP_CHARACTERS: usize = 40;
 const CAP_ADDRESS_MATRIX: usize = 80;
 const CAP_GLOSSARY: usize = 120;
 const CAP_SCENES: usize = 120;
+const CAP_FORMAL_SEGMENTS: usize = 60;
 const CAP_ALIASES: usize = 8;
 const CAP_STYLE_RULES: usize = 12;
 const CAP_AMBIGUITIES: usize = 12;
@@ -68,8 +71,19 @@ pub async fn show(store: &Store, json: bool) -> Result<String, ReviewError> {
     if json {
         render_json(&value)
     } else {
-        Ok(render_human(&value))
+        // The human view shows each formal segment's first source line (M12-AC7), so
+        // load the cue idx → source-text map alongside the document.
+        let cue_texts = store
+            .call(|conn| Ok(cue_source_texts(&load_cues(conn)?)))
+            .await?;
+        Ok(render_human(&value, &cue_texts))
     }
+}
+
+/// The cue `idx` → source-text (`text_raw`) map, used by [`render_human`] to show the
+/// first source line of each formal segment (M12-AC7).
+fn cue_source_texts(cues: &[crate::domain::Cue]) -> std::collections::BTreeMap<u32, String> {
+    cues.iter().map(|c| (c.idx, c.text_raw.clone())).collect()
 }
 
 /// Renders the document as pretty JSON (`docs/DATA_MODEL.md` §6).
@@ -79,7 +93,7 @@ pub fn render_json(value: &Value) -> Result<String, ReviewError> {
 
 /// Renders the human `show` view with `unresolved_ambiguities` first (M5-AC4),
 /// then premise, tone, characters, address matrix, glossary, scenes, style rules.
-pub fn render_human(value: &Value) -> String {
+pub fn render_human(value: &Value, cue_texts: &std::collections::BTreeMap<u32, String>) -> String {
     let mut out = String::new();
 
     // M5-AC4: unresolved ambiguities are shown first.
@@ -138,12 +152,48 @@ pub fn render_human(value: &Value) -> String {
         out.push_str(&format!("  {range} {summary}\n"));
     }
 
+    // M12-AC7: formal segments with their cue ranges, kind, and the first source line
+    // of each range, so the reviewer can confirm or correct them (ADR-049(b)).
+    out.push_str("Formal segments:\n");
+    for seg in array(value, "formal_segments") {
+        let kind = str_field(seg, "kind").unwrap_or("");
+        let (a, b) = cue_range_bounds(seg);
+        let first_line = first_source_line(cue_texts, a, b).unwrap_or_default();
+        out.push_str(&format!("  [{a},{b}] ({kind}) {first_line}\n"));
+    }
+
     out.push_str("Style rules:\n");
     for item in string_array(value, "style_rules") {
         out.push_str(&format!("  - {item}\n"));
     }
 
     out
+}
+
+/// The `(a, b)` of a `cue_range` array field, defaulting each missing element to 0.
+fn cue_range_bounds(value: &Value) -> (i64, i64) {
+    value
+        .get("cue_range")
+        .and_then(|r| r.as_array())
+        .map(|r| {
+            let a = r.first().and_then(Value::as_i64).unwrap_or_default();
+            let b = r.get(1).and_then(Value::as_i64).unwrap_or_default();
+            (a, b)
+        })
+        .unwrap_or_default()
+}
+
+/// The first source line in the inclusive cue range `[a, b]` — the lowest cue idx in
+/// range present in `cue_texts` (M12-AC7).
+fn first_source_line(
+    cue_texts: &std::collections::BTreeMap<u32, String>,
+    a: i64,
+    b: i64,
+) -> Option<String> {
+    cue_texts
+        .range(u32::try_from(a.max(0)).ok()?..)
+        .find(|(idx, _)| i64::from(**idx) <= b)
+        .map(|(_, text)| text.clone())
 }
 
 fn section(title: &str, body: &str) -> String {
@@ -344,11 +394,22 @@ fn validate(value: &Value, bounds: Option<(u32, u32)>) -> Vec<Violation> {
     check_schema_version(obj, &mut violations);
     check_string(obj, "premise", 500, true, "<root>", &mut violations);
     check_string(obj, "tone", 160, false, "<root>", &mut violations);
+    // `narration_register`, when present, must be "spoken" or "literary" (ADR-049(b)).
+    if obj.contains_key("narration_register") {
+        check_enum(
+            obj,
+            "narration_register",
+            &["spoken", "literary"],
+            "<root>",
+            &mut violations,
+        );
+    }
 
     let char_ids = validate_characters(obj, &mut violations);
     validate_address_matrix(obj, &char_ids, &mut violations);
     validate_glossary(obj, &mut violations);
     validate_scenes(obj, &char_ids, bounds, &mut violations);
+    validate_formal_segments(obj, bounds, &mut violations);
     validate_string_list(
         obj,
         "unresolved_ambiguities",
@@ -380,7 +441,9 @@ fn validate_characters(
     const KNOWN: &[&str] = &[
         "id",
         "name",
+        "name_target",
         "aliases",
+        "aliases_target",
         "gender",
         "age_group",
         "role",
@@ -405,13 +468,83 @@ fn validate_characters(
             ids.insert(id);
         }
         check_required_string(ch, "name", 120, &loc, violations);
+        // `name_target` is required, ≤ 120, and must contain Myanmar code points
+        // (`docs/DATA_MODEL.md` §3, ADR-049(d)).
+        if let Some(target) = check_required_string(ch, "name_target", 120, &loc, violations)
+            && !has_myanmar(&target)
+        {
+            violations.push(Violation::new(
+                field_loc(&loc, "name_target"),
+                "must contain Myanmar (Burmese) characters",
+            ));
+        }
         check_enum(ch, "gender", GENDERS, &loc, violations);
         check_enum(ch, "age_group", AGES, &loc, violations);
         check_string(ch, "role", 260, false, &loc, violations);
         check_string(ch, "speech_style", 180, false, &loc, violations);
         check_optional_string_list(ch, "aliases", CAP_ALIASES, 80, &loc, violations);
+        validate_aliases_target(ch, &loc, violations);
     }
     ids
+}
+
+/// Validates an optional `aliases_target` (`docs/DATA_MODEL.md` §3, ADR-049(d)): when
+/// present it must be an array whose length equals `aliases` (so the two run parallel),
+/// each entry ≤ 120 chars and containing Myanmar code points.
+fn validate_aliases_target(
+    ch: &serde_json::Map<String, Value>,
+    parent: &str,
+    violations: &mut Vec<Violation>,
+) {
+    let loc = field_loc(parent, "aliases_target");
+    let Some(value) = ch.get("aliases_target") else {
+        return;
+    };
+    let Some(items) = value.as_array() else {
+        violations.push(Violation::new(loc, "must be an array"));
+        return;
+    };
+    let aliases_len = ch
+        .get("aliases")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if items.len() != aliases_len {
+        violations.push(Violation::new(
+            &loc,
+            format!(
+                "has {} entries but aliases has {aliases_len} (they must run parallel)",
+                items.len()
+            ),
+        ));
+    }
+    for (i, item) in items.iter().enumerate() {
+        let iloc = format!("{loc}[{i}]");
+        match item.as_str() {
+            Some(s) if s.chars().count() > 120 => {
+                violations.push(Violation::new(iloc, "exceeds 120 characters"));
+            }
+            Some(s) if !has_myanmar(s) => {
+                violations.push(Violation::new(
+                    iloc,
+                    "must contain Myanmar (Burmese) characters",
+                ));
+            }
+            Some(_) => {}
+            None => violations.push(Violation::new(iloc, "must be a string")),
+        }
+    }
+}
+
+/// True when `s` contains at least one Myanmar code point in any of the three ranges
+/// used for Burmese: main (U+1000–U+109F), Extended-A (U+AA60–U+AA7F), Extended-B
+/// (U+A9E0–U+A9FF). Kept local so the review layer carries no dependency on `quality`
+/// (`docs/ARCHITECTURE.md` §3, ADR-049(d)).
+fn has_myanmar(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c as u32,
+            0x1000..=0x109F | 0xAA60..=0xAA7F | 0xA9E0..=0xA9FF)
+    })
 }
 
 fn validate_address_matrix(
@@ -425,6 +558,7 @@ fn validate_address_matrix(
         "relation",
         "self_ref",
         "addressee_ref",
+        "honorific",
         "register",
         "particle",
     ];
@@ -444,6 +578,7 @@ fn validate_address_matrix(
         check_reference(entry, "to", char_ids, &loc, violations);
         check_enum(entry, "register", REGISTERS, &loc, violations);
         check_string(entry, "relation", 160, false, &loc, violations);
+        check_string(entry, "honorific", 20, false, &loc, violations);
     }
 }
 
@@ -546,6 +681,68 @@ fn validate_scenes(
                     format!("overlaps scenes[{first}]"),
                 ));
             }
+        }
+    }
+}
+
+/// Validates `formal_segments` on user import (`docs/DATA_MODEL.md` §3, ADR-049(b)):
+/// an optional array (cap 60); each item has only the known fields `{cue_range,
+/// register, kind, note}`, `register` must equal `"literary"`, `kind` is one of the
+/// six enum values (unknown rejected), `note` ≤ 120; each `cue_range` lies within the
+/// existing cue indices and is ascending; and across entries the ranges must be
+/// ascending and non-overlapping. Mirrors `validate_scenes`, reusing
+/// [`validate_cue_range`] for the per-entry range check.
+fn validate_formal_segments(
+    obj: &serde_json::Map<String, Value>,
+    bounds: Option<(u32, u32)>,
+    violations: &mut Vec<Violation>,
+) {
+    const KNOWN: &[&str] = &["cue_range", "register", "kind", "note"];
+    const KINDS: &[&str] = &[
+        "reading",
+        "broadcast",
+        "speech",
+        "recitation",
+        "onscreen_text",
+        "other",
+    ];
+
+    let Some(items) = optional_array(obj, "formal_segments", CAP_FORMAL_SEGMENTS, violations)
+    else {
+        return;
+    };
+
+    // Collected ascending, in-bounds ranges (in document order) for the ascending /
+    // non-overlapping cross-entry check.
+    let mut ranges: Vec<(usize, i64, i64)> = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        let loc = format!("formal_segments[{i}]");
+        let Some(seg) = object_at(item, &loc, violations) else {
+            continue;
+        };
+        reject_unknown(seg.keys(), KNOWN, &loc, violations);
+
+        // `register` must be exactly "literary" (the only allowed value).
+        check_enum(seg, "register", &["literary"], &loc, violations);
+        check_enum(seg, "kind", KINDS, &loc, violations);
+        check_string(seg, "note", 120, false, &loc, violations);
+
+        if let Some((a, b)) = validate_cue_range(seg, &loc, bounds, violations) {
+            ranges.push((i, a, b));
+        }
+    }
+
+    // Across entries: ascending and non-overlapping. Compare consecutive valid entries
+    // in document order; each must start strictly after the previous one ends.
+    for w in ranges.windows(2) {
+        let (_, _, prev_b) = w[0];
+        let (iy, next_a, _) = w[1];
+        if next_a <= prev_b {
+            violations.push(Violation::new(
+                format!("formal_segments[{iy}].cue_range"),
+                "must be ascending and non-overlapping across entries",
+            ));
         }
     }
 }

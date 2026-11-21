@@ -13,7 +13,7 @@
 //! the virama U+1039. The samples below are built from explicit code points so
 //! the test is deterministic and needs no copyrighted material.
 
-use myansub::domain::{Cue, QualityFlag};
+use myansub::domain::{Cue, DigitStyle, QualityFlag};
 use myansub::quality::checks::{
     self, AnalysisContext, GlossaryTerm, Limits, check_batch_drift, check_cue,
 };
@@ -147,6 +147,8 @@ fn untranslated_not_flagged_for_keep_glossary_term() {
     let ctx = AnalysisContext {
         glossary: &glossary,
         names: &[],
+        name_targets: &[],
+        digits: DigitStyle::Myanmar,
     };
     assert!(!checks::untranslated(&src, "Tokyo", &ctx));
 }
@@ -159,6 +161,8 @@ fn untranslated_not_flagged_for_known_character_name() {
     let ctx = AnalysisContext {
         glossary: &[],
         names: &names,
+        name_targets: &[],
+        digits: DigitStyle::Myanmar,
     };
     assert!(!checks::untranslated(&src, "Aoi", &ctx));
 }
@@ -306,6 +310,8 @@ fn glossary_miss_flags_missing_target_term() {
     let ctx = AnalysisContext {
         glossary: &glossary,
         names: &[],
+        name_targets: &[],
+        digits: DigitStyle::Myanmar,
     };
     // Target omits the glossary target entirely.
     assert!(checks::glossary_miss(&src, "ဘုရင်ပေါ်လာတယ်", &ctx));
@@ -323,8 +329,109 @@ fn glossary_miss_not_flagged_when_target_present() {
     let ctx = AnalysisContext {
         glossary: &glossary,
         names: &[],
+        name_targets: &[],
+        digits: DigitStyle::Myanmar,
     };
     assert!(!checks::glossary_miss(&src, "နတ်ဆိုးဘုရင် ပေါ်လာတယ်", &ctx));
+}
+
+// AC: M12-AC23 — the source cue names a character but the target lacks the matching
+// `name_target` spelling → `glossary_miss` fires (name coverage, ADR-049(d)).
+#[test]
+fn glossary_miss_flags_name_without_name_target() {
+    let src = cue("Aoi runs away.");
+    let name_targets = [("Aoi".to_string(), "အာအိုအိ".to_string())];
+    let ctx = AnalysisContext {
+        glossary: &[],
+        names: &[],
+        name_targets: &name_targets,
+        digits: DigitStyle::Myanmar,
+    };
+    // Target translates the sentence but omits the name's Burmese spelling.
+    assert!(checks::glossary_miss(&src, "ထွက်ပြေးသွားတယ်", &ctx));
+}
+
+// AC: M12-AC23 — the target contains the matching `name_target` spelling → no flag.
+#[test]
+fn glossary_miss_not_flagged_when_name_target_present() {
+    let src = cue("Aoi runs away.");
+    let name_targets = [("Aoi".to_string(), "အာအိုအိ".to_string())];
+    let ctx = AnalysisContext {
+        glossary: &[],
+        names: &[],
+        name_targets: &name_targets,
+        digits: DigitStyle::Myanmar,
+    };
+    assert!(!checks::glossary_miss(&src, "အာအိုအိ ထွက်ပြေးသွားတယ်", &ctx));
+}
+
+// AC: M12-AC23 — name coverage also applies to an alias → its `aliases_target`
+// spelling must appear in the target.
+#[test]
+fn glossary_miss_flags_alias_without_alias_target() {
+    let src = cue("X-man waves.");
+    let name_targets = [("X-man".to_string(), "အိတ်စ်မန်".to_string())];
+    let ctx = AnalysisContext {
+        glossary: &[],
+        names: &[],
+        name_targets: &name_targets,
+        digits: DigitStyle::Myanmar,
+    };
+    assert!(checks::glossary_miss(&src, "လက်ပြတယ်", &ctx));
+    assert!(!checks::glossary_miss(&src, "အိတ်စ်မန် လက်ပြတယ်", &ctx));
+}
+
+// --- digit_style -----------------------------------------------------------
+
+// AC: M12-AC12 — with `digits = myanmar`, a Western digit in the target fires
+// `digit_style`; a target using Myanmar digits does not (ADR-049(e), LLM.md §8).
+#[test]
+fn digit_style_flags_western_digit_when_myanmar_chosen() {
+    // Target contains Western "3" — the non-chosen system.
+    assert!(checks::digit_style("အခန်း 3 မှာ", DigitStyle::Myanmar));
+    // Target uses the Myanmar digit ၃ (U+1043) — the chosen system.
+    assert!(!checks::digit_style("အခန်း ၃ မှာ", DigitStyle::Myanmar));
+    // No digits at all — never flagged.
+    assert!(!checks::digit_style("အခန်းထဲမှာ", DigitStyle::Myanmar));
+}
+
+// AC: M12-AC12 — with `digits = western`, a Myanmar digit in the target fires
+// `digit_style`; a Western-digit target does not (ADR-049(e), LLM.md §8).
+#[test]
+fn digit_style_flags_myanmar_digit_when_western_chosen() {
+    assert!(checks::digit_style("chapter ၃", DigitStyle::Western));
+    assert!(!checks::digit_style("chapter 3", DigitStyle::Western));
+}
+
+// AC: M12-AC12 — digits *inside* a `⟦n⟧` placeholder do NOT trigger the check: the
+// placeholder index is masked markup, not translated content (ADR-049(e)).
+#[test]
+fn digit_style_ignores_digits_inside_placeholders() {
+    // `⟦0⟧` holds a Western "0", but it is placeholder markup, so with myanmar
+    // chosen and no other Western digit, the check must not fire.
+    let target = format!("{} အခန်း ၃", ph(0));
+    assert!(!checks::digit_style(&target, DigitStyle::Myanmar));
+    // A Western digit OUTSIDE the placeholder still fires.
+    let target_bad = format!("{} အခန်း 3", ph(0));
+    assert!(checks::digit_style(&target_bad, DigitStyle::Myanmar));
+}
+
+// AC: M12-AC12 — `digit_style` joins the flags returned by `check_cue` when the
+// target uses the non-chosen digit system (ADR-049(e), LLM.md §8).
+#[test]
+fn check_cue_includes_digit_style_flag() {
+    let src = cue("Room 3");
+    let ctx = AnalysisContext {
+        glossary: &[],
+        names: &[],
+        name_targets: &[],
+        digits: DigitStyle::Myanmar,
+    };
+    let flags = check_cue(&src, "အခန်း 3", &ctx, &limits());
+    assert!(
+        flags.contains(&QualityFlag::DigitStyle),
+        "check_cue should surface digit_style, got: {flags:?}"
+    );
 }
 
 // --- too_long --------------------------------------------------------------

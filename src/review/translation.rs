@@ -26,7 +26,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Cue, QualityFlag};
+use crate::domain::{Cue, DigitStyle, QualityFlag};
 use crate::quality::checks::{self, AnalysisContext, GlossaryTerm, Limits};
 use crate::store::repo_analysis::{current_analysis, get_analysis_version};
 use crate::store::repo_cues::load_cues;
@@ -194,6 +194,7 @@ pub async fn set_target(
     id: u32,
     text: &str,
     limits: &Limits,
+    digits: DigitStyle,
 ) -> Result<(), ReviewError> {
     require_translation_ready(store).await?;
     let snap = load_snapshot(store).await?;
@@ -212,7 +213,7 @@ pub async fn set_target(
         return Err(ReviewError::PlaceholderMismatch { id });
     }
     let ctx = AnalysisSheet::parse(&snap.analysis_doc);
-    let flags = ctx.check(&cue, text, limits);
+    let flags = ctx.check(&cue, text, limits, digits);
     let fallback_version = snap.fallback_version();
     let text = text.to_string();
 
@@ -276,6 +277,7 @@ pub async fn edit<L>(
     work_dir: &Path,
     selection: &ReviewSelection,
     limits: &Limits,
+    digits: DigitStyle,
 ) -> Result<ImportSummary, ReviewError>
 where
     L: EditorLauncher + Send + 'static,
@@ -286,7 +288,7 @@ where
     let work_dir = work_dir.to_path_buf();
     let edited =
         on_blocking(move || capture_edit(&launcher, &work_dir, "translation", &bytes)).await?;
-    import(store, &edited, limits).await
+    import(store, &edited, limits, digits).await
 }
 
 /// Imports a translation review file (`review import`, `docs/DATA_MODEL.md` §6),
@@ -301,6 +303,7 @@ pub async fn import(
     store: &Store,
     content: &str,
     limits: &Limits,
+    digits: DigitStyle,
 ) -> Result<ImportSummary, ReviewError> {
     require_translation_ready(store).await?;
     let file: ImportFile =
@@ -344,7 +347,7 @@ pub async fn import(
         if checks::placeholder_mismatch(cue, &ic.target) {
             return Err(ReviewError::PlaceholderMismatch { id: ic.id });
         }
-        let flags = ctx.check(cue, &ic.target, limits);
+        let flags = ctx.check(cue, &ic.target, limits, digits);
         changes.push((cue_id, ic.target.clone(), flags));
     }
 
@@ -693,6 +696,7 @@ fn flag_label(flag: &QualityFlag) -> String {
 struct AnalysisSheet {
     glossary: Vec<(String, String, bool)>,
     names: Vec<String>,
+    name_targets: Vec<(String, String)>,
 }
 
 impl AnalysisSheet {
@@ -700,18 +704,37 @@ impl AnalysisSheet {
         let value: serde_json::Value = serde_json::from_str(doc).unwrap_or(serde_json::Value::Null);
 
         let mut names = Vec::new();
+        let mut name_targets = Vec::new();
         if let Some(chars) = value.get("characters").and_then(|v| v.as_array()) {
             for ch in chars {
-                if let Some(name) = ch.get("name").and_then(|v| v.as_str())
-                    && !name.is_empty()
-                {
+                let name = ch.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let name_target = ch
+                    .get("name_target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !name.is_empty() {
                     names.push(name.to_string());
+                    if !name_target.is_empty() {
+                        name_targets.push((name.to_string(), name_target.to_string()));
+                    }
                 }
-                if let Some(aliases) = ch.get("aliases").and_then(|v| v.as_array()) {
-                    for alias in aliases.iter().filter_map(|a| a.as_str()) {
-                        if !alias.is_empty() {
-                            names.push(alias.to_string());
-                        }
+                let aliases: Vec<&str> = ch
+                    .get("aliases")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                let aliases_target: Vec<&str> = ch
+                    .get("aliases_target")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                    .unwrap_or_default();
+                for (i, alias) in aliases.iter().enumerate() {
+                    if alias.is_empty() {
+                        continue;
+                    }
+                    names.push((*alias).to_string());
+                    if aliases_target.len() == aliases.len() && !aliases_target[i].is_empty() {
+                        name_targets.push(((*alias).to_string(), aliases_target[i].to_string()));
                     }
                 }
             }
@@ -729,13 +752,24 @@ impl AnalysisSheet {
             }
         }
 
-        AnalysisSheet { glossary, names }
+        AnalysisSheet {
+            glossary,
+            names,
+            name_targets,
+        }
     }
 
     /// Re-runs the deterministic quality checks for one edited cue (`docs/LLM.md`
     /// §8). Soft flags (e.g. `too_long`) only update the stored flags; they never
-    /// reject — the hard placeholder check is done by the caller before this.
-    fn check(&self, source: &Cue, target: &str, limits: &Limits) -> Vec<QualityFlag> {
+    /// reject — the hard placeholder check is done by the caller before this. The
+    /// `digits` style drives the `digit_style` check (ADR-049(e)).
+    fn check(
+        &self,
+        source: &Cue,
+        target: &str,
+        limits: &Limits,
+        digits: DigitStyle,
+    ) -> Vec<QualityFlag> {
         let glossary: Vec<GlossaryTerm> = self
             .glossary
             .iter()
@@ -749,6 +783,8 @@ impl AnalysisSheet {
         let ctx = AnalysisContext {
             glossary: &glossary,
             names: &names,
+            name_targets: &self.name_targets,
+            digits,
         };
         checks::check_cue(source, target, &ctx, limits)
     }

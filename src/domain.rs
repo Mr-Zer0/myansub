@@ -142,7 +142,52 @@ pub enum QualityFlag {
     ZawgyiSuspect,
     BoundaryDrift,
     GlossaryMiss,
+    /// The target uses digits of the system *not* chosen in `[burmese].digits`
+    /// (placeholder contents excluded) (`docs/DATA_MODEL.md` §5, ADR-049(e)).
+    DigitStyle,
     TooLong,
     TooFast,
     Failed,
+}
+
+/// The digit style the Burmese output requests (`[burmese].digits`, ADR-049(e)).
+///
+/// A pure domain type so the config, prompt, quality, and pipeline layers can all
+/// share it without crossing the dependency direction (`docs/ARCHITECTURE.md` §3).
+/// The default is [`DigitStyle::Myanmar`] (`docs/CONFIG.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DigitStyle {
+    /// Myanmar digits ၀–၉ (U+1040–U+1049).
+    #[default]
+    Myanmar,
+    /// Western digits 0–9 (U+0030–U+0039).
+    Western,
+}
+
+impl DigitStyle {
+    /// The canonical label (`myanmar`/`western`) matching `[burmese].digits` and the
+    /// value recorded in `project.translation_digits` (`docs/DATA_MODEL.md` §2,
+    /// ADR-050).
+    pub fn label(self) -> &'static str {
+        match self {
+            DigitStyle::Myanmar => "myanmar",
+            DigitStyle::Western => "western",
+        }
+    }
+}
+
+/// How a trailing ။ at the end of a cue is handled at export
+/// (`[burmese].cue_final_stop`, `docs/CONFIG.md` §6, ADR-049(e), ADR-050).
+///
+/// A pure domain type (like [`DigitStyle`]) so `config` can read the policy without
+/// depending on `pipeline` (`docs/ARCHITECTURE.md` §3: nothing depends on
+/// `pipeline`). The output stage applies it deterministically at export, never the
+/// LLM. The default is [`CueFinalStop::Strip`] (`docs/CONFIG.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CueFinalStop {
+    /// Remove one trailing ။ (and trailing whitespace) at the end of the cue.
+    #[default]
+    Strip,
+    /// Leave the cue text unchanged.
+    Keep,
 }

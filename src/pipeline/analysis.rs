@@ -73,11 +73,12 @@ const OUTPUT_CHARS_PER_TOKEN: u64 = 4;
 /// never eats into the document's room.
 const ANALYSIS_THINKING_HEADROOM: u64 = 8_192;
 
-/// The largest `maxOutputTokens` we will ever request for analysis — a value within
-/// current Gemini Flash/Pro output-token limits, so the request itself is never
-/// rejected for an out-of-range budget. The absolute schema-maximum document can
-/// exceed this; such a pathological input may still truncate, but every realistic
-/// large-cast analysis fits well under it (see `analysis_output_budget`).
+/// The largest `maxOutputTokens` we will ever request for analysis — Gemini Flash's
+/// hard output ceiling (65,536), so the request itself is never rejected for an
+/// out-of-range budget. Realistic documents fit well under it; the absolute
+/// schema-maximum document (every array at its cap, every string at its length cap)
+/// exceeds it and may truncate. We do NOT raise this — 65,536 is the model's hard
+/// limit — so [`analysis_output_budget`] clamps to it (see `worst_case_doc_tokens`).
 const ANALYSIS_OUTPUT_CEILING: u32 = 65_536;
 
 // ---------------------------------------------------------------------------
@@ -169,28 +170,45 @@ pub fn analysis_signature(model: &str) -> String {
     format!("prompt_v{PROMPT_VERSION}|{model}")
 }
 
-/// The worst-case analysis-document size in output tokens, derived from the schema
-/// caps (`docs/DATA_MODEL.md` §3) at [`OUTPUT_CHARS_PER_TOKEN`], including per-element
-/// key/structure overhead. Used to size [`analysis_output_budget`].
+/// The worst-case analysis-document size in output tokens, computed HONESTLY from the
+/// TRUE enforced caps (`docs/DATA_MODEL.md` §3; the caps `validate_full`/user import
+/// actually enforce), at [`OUTPUT_CHARS_PER_TOKEN`] and including per-element
+/// key/structure overhead. This is the absolute schema-maximum document (every array
+/// at its cap, every string at its length cap); realistic documents are far smaller.
+///
+/// The result (~69,539 tokens) exceeds [`ANALYSIS_OUTPUT_CEILING`] (65,536, Gemini
+/// Flash's hard output limit), so [`analysis_output_budget`] clamps to the ceiling
+/// rather than covering this pathological maximum, which may truncate — we do not
+/// (and cannot) raise the ceiling to cover it.
 pub fn worst_case_doc_tokens() -> u64 {
-    // maxLength budgets × caps, plus a per-element allowance for ids, enums, keys,
-    // quotes, and separators. (`docs/DATA_MODEL.md` §3.)
-    let characters = 40 * (120 + 8 * 80 + 260 + 180 + 120); // name, aliases, role, speech_style, +ids/enums/keys
-    let address_matrix = 80 * (160 + 120 + 120 + 60 + 120); // relation, self_ref, addressee_ref, particle, +from/to/register/keys
+    // Per-field length caps × array caps, plus a per-element allowance for ids, enums,
+    // keys, quotes, and separators (`docs/DATA_MODEL.md` §3). Each string field is
+    // budgeted at its true enforced cap — `aliases_target` at 120 (its cap, not the
+    // parallel `aliases` 80) and each `formal_segments` note at 120 (its cap) — so the
+    // figure is the honest worst case, not one tuned to fit under the ceiling.
+    // name, name_target, aliases, aliases_target, role, speech_style, +ids/enums/keys.
+    let characters = 40 * (120 + 120 + 8 * 80 + 8 * 120 + 260 + 180 + 120);
+    let address_matrix = 80 * (160 + 120 + 120 + 60 + 20 + 120); // relation, self_ref, addressee_ref, particle, honorific, +from/to/register/keys
     let glossary = 120 * (120 + 120 + 180 + 60); // term, target, note, +keep/keys
     let scenes = 120 * (300 + 80 + 60 + 60); // summary, mood, +cue_range/speakers/keys
     let lists = 12 * 180 + 12 * 220; // style_rules + unresolved_ambiguities
-    let top = 500 + 160 + 256; // premise + tone + schema_version/outer braces
-    let chars: u64 = characters + address_matrix + glossary + scenes + lists + top;
+    // formal_segments ≤ 60 (ADR-049(b)): two ints, two short enums (`register`/`kind`),
+    // and a note at its true 120 cap.
+    let formal_segments = 60 * (120 + 60); // note (120 cap) + cue_range/register/kind/keys
+    let top = 500 + 160 + 40 + 256; // premise + tone + narration_register + schema_version/outer braces
+    let chars: u64 =
+        characters + address_matrix + glossary + scenes + lists + formal_segments + top;
     chars / OUTPUT_CHARS_PER_TOKEN
 }
 
 /// The analysis `maxOutputTokens` budget (`docs/LLM.md` §5: "Always set
 /// `maxOutputTokens`"). The worst-case document plus thinking headroom (since
 /// `maxOutputTokens` includes thinking tokens), bounded by [`ANALYSIS_OUTPUT_CEILING`]
-/// so the request stays within the model's output limit. Comfortably above the old
-/// fixed 16 384, so a large-cast single-pass or a full merged reduce is not truncated
-/// into a content-retry failure for an input the schema permits.
+/// so the request stays within the model's hard output limit. Because the absolute
+/// schema-maximum document (`worst_case_doc_tokens`, ~69,539) now exceeds the ceiling,
+/// this clamps to [`ANALYSIS_OUTPUT_CEILING`]; realistic documents fit well under it.
+/// Still far above the old fixed 16 384, so a large-cast single-pass or a full merged
+/// reduce is not truncated into a content-retry failure for a realistic input.
 pub fn analysis_output_budget() -> u32 {
     let want = worst_case_doc_tokens().saturating_add(ANALYSIS_THINKING_HEADROOM);
     want.min(u64::from(ANALYSIS_OUTPUT_CEILING)) as u32
@@ -988,11 +1006,16 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
     require_array_within(obj, "characters", 40)?;
     for ch in object_items(obj, "characters") {
         string_cap(ch.get("name"), "characters[].name", 120)?;
+        string_cap(ch.get("name_target"), "characters[].name_target", 120)?;
         string_cap(ch.get("role"), "characters[].role", 260)?;
         string_cap(ch.get("speech_style"), "characters[].speech_style", 180)?;
         array_cap(ch.get("aliases"), "characters[].aliases", 8)?;
         for alias in string_items(ch.get("aliases")) {
             string_cap(Some(alias), "characters[].aliases[]", 80)?;
+        }
+        array_cap(ch.get("aliases_target"), "characters[].aliases_target", 8)?;
+        for alias_target in string_items(ch.get("aliases_target")) {
+            string_cap(Some(alias_target), "characters[].aliases_target[]", 120)?;
         }
     }
 
@@ -1006,6 +1029,7 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
     optional_array_within(obj, "address_matrix", 80)?;
     for am in object_items(obj, "address_matrix") {
         string_cap(am.get("relation"), "address_matrix[].relation", 160)?;
+        string_cap(am.get("honorific"), "address_matrix[].honorific", 20)?;
     }
 
     optional_array_within(obj, "glossary", 120)?;
@@ -1013,6 +1037,14 @@ fn validate_full(text: &str) -> Result<(), ValidationError> {
         string_cap(g.get("term"), "glossary[].term", 120)?;
         string_cap(g.get("target"), "glossary[].target", 120)?;
         string_cap(g.get("note"), "glossary[].note", 180)?;
+    }
+
+    // `formal_segments` ≤ 60 (ADR-049(b)); each `note` ≤ 120. The enum/shape of
+    // `kind`/`register` and the `cue_range` bound are enforced by the wire schema and
+    // by strict user import, so the lenient LLM-output path checks only the caps here.
+    optional_array_within(obj, "formal_segments", 60)?;
+    for fs in object_items(obj, "formal_segments") {
+        string_cap(fs.get("note"), "formal_segments[].note", 120)?;
     }
 
     array_cap(obj.get("style_rules"), "style_rules", 12)?;
@@ -1412,7 +1444,9 @@ mod tests {
                 {
                     "id": "c1",
                     "name": "Aoi",
+                    "name_target": "အာအိုအိ",
                     "aliases": ["A"],
+                    "aliases_target": ["အေ"],
                     "gender": "f",
                     "age_group": "young",
                     "role": "the lead",
@@ -1480,6 +1514,52 @@ mod tests {
             validate_doc(&doc),
             Err(ValidationError::StringTooLong {
                 field: "characters[].name",
+                ..
+            })
+        ));
+    }
+
+    // AC: M12-AC20 — an over-120 `name_target` is a located StringTooLong on the
+    // lenient LLM-output path (ADR-049(d), caps enforced in `validate_full`).
+    #[test]
+    fn validate_full_rejects_over_length_name_target() {
+        let mut doc = base_doc();
+        doc["characters"][0]["name_target"] = json!("က".repeat(121));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "characters[].name_target",
+                ..
+            })
+        ));
+        // Exactly at the cap is fine.
+        doc["characters"][0]["name_target"] = json!("က".repeat(120));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    // AC: M12-AC20 — too many `aliases_target` entries is a located CapExceeded.
+    #[test]
+    fn validate_full_rejects_too_many_aliases_target() {
+        let mut doc = base_doc();
+        doc["characters"][0]["aliases_target"] = serde_json::Value::Array(vec![json!("က"); 9]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded {
+                field: "characters[].aliases_target",
+                ..
+            })
+        ));
+    }
+
+    // AC: M12-AC20 — an over-120 `aliases_target` entry is a located StringTooLong.
+    #[test]
+    fn validate_full_rejects_over_length_aliases_target_entry() {
+        let mut doc = base_doc();
+        doc["characters"][0]["aliases_target"] = json!(["က".repeat(121)]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "characters[].aliases_target[]",
                 ..
             })
         ));
@@ -1581,6 +1661,71 @@ mod tests {
         ));
         // Exactly at the cap is fine.
         doc["address_matrix"][0]["relation"] = json!("x".repeat(160));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    // AC: M12-AC15 / M12-AC18 — an over-20 honorific is a located StringTooLong.
+    #[test]
+    fn validate_full_rejects_over_length_honorific() {
+        let mut doc = base_doc();
+        doc["address_matrix"][0]["honorific"] = json!("x".repeat(21));
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "address_matrix[].honorific",
+                ..
+            })
+        ));
+        // Exactly at the cap is fine.
+        doc["address_matrix"][0]["honorific"] = json!("x".repeat(20));
+        assert!(validate_doc(&doc).is_ok());
+    }
+
+    // AC: M12-AC2 — more than 60 formal_segments is a located CapExceeded on the
+    // lenient LLM-output path (ADR-049(b), caps enforced in `validate_full`).
+    #[test]
+    fn validate_full_rejects_too_many_formal_segments() {
+        let mut doc = base_doc();
+        let one = json!({
+            "cue_range": [1, 2],
+            "register": "literary",
+            "kind": "reading",
+            "note": "a note"
+        });
+        doc["formal_segments"] = serde_json::Value::Array(vec![one; 61]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::CapExceeded {
+                field: "formal_segments",
+                ..
+            })
+        ));
+    }
+
+    // AC: M12-AC2 — an over-120 formal_segments note is a located StringTooLong.
+    #[test]
+    fn validate_full_rejects_over_length_formal_segment_note() {
+        let mut doc = base_doc();
+        doc["formal_segments"] = json!([{
+            "cue_range": [1, 2],
+            "register": "literary",
+            "kind": "reading",
+            "note": "x".repeat(121)
+        }]);
+        assert!(matches!(
+            validate_doc(&doc),
+            Err(ValidationError::StringTooLong {
+                field: "formal_segments[].note",
+                ..
+            })
+        ));
+        // Exactly at the cap is fine.
+        doc["formal_segments"] = json!([{
+            "cue_range": [1, 2],
+            "register": "literary",
+            "kind": "reading",
+            "note": "x".repeat(120)
+        }]);
         assert!(validate_doc(&doc).is_ok());
     }
 

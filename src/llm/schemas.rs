@@ -75,6 +75,7 @@ pub fn analysis_response_schema() -> Value {
             "schema_version": { "type": "integer" },
             "premise": { "type": "string" },
             "tone": { "type": "string" },
+            "narration_register": { "type": "string", "enum": ["spoken", "literary"] },
             "characters": {
                 "type": "array",
                 "items": {
@@ -82,7 +83,12 @@ pub fn analysis_response_schema() -> Value {
                     "properties": {
                         "id": { "type": "string" },
                         "name": { "type": "string" },
+                        "name_target": { "type": "string" },
                         "aliases": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "aliases_target": {
                             "type": "array",
                             "items": { "type": "string" }
                         },
@@ -94,7 +100,7 @@ pub fn analysis_response_schema() -> Value {
                         "role": { "type": "string" },
                         "speech_style": { "type": "string" }
                     },
-                    "required": ["id", "name", "gender", "age_group"]
+                    "required": ["id", "name", "name_target", "gender", "age_group"]
                 }
             },
             "address_matrix": {
@@ -107,6 +113,7 @@ pub fn analysis_response_schema() -> Value {
                         "relation": { "type": "string" },
                         "self_ref": { "type": "string" },
                         "addressee_ref": { "type": "string" },
+                        "honorific": { "type": "string" },
                         "register": {
                             "type": "string",
                             "enum": ["colloquial", "polite", "formal"]
@@ -148,6 +155,34 @@ pub fn analysis_response_schema() -> Value {
                         "mood": { "type": "string" }
                     },
                     "required": ["cue_range", "summary"]
+                }
+            },
+            "formal_segments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "cue_range": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "minItems": 2,
+                            "maxItems": 2
+                        },
+                        "register": { "type": "string", "enum": ["literary"] },
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "reading",
+                                "broadcast",
+                                "speech",
+                                "recitation",
+                                "onscreen_text",
+                                "other"
+                            ]
+                        },
+                        "note": { "type": "string" }
+                    },
+                    "required": ["cue_range", "register", "kind"]
                 }
             },
             "style_rules": {

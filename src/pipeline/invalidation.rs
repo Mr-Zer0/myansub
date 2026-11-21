@@ -54,6 +54,11 @@ pub struct AnalysisDoc {
     pub premise: String,
     #[serde(default)]
     pub tone: String,
+    /// The whole-document narrator voice-over register (ADR-049(b), `docs/LLM.md` §7).
+    /// A change joins the row-1 whole-document rule → all translatable cues, like
+    /// premise/tone/style_rules.
+    #[serde(default)]
+    pub narration_register: String,
     #[serde(default)]
     pub style_rules: Vec<String>,
     #[serde(default)]
@@ -64,6 +69,10 @@ pub struct AnalysisDoc {
     pub address_matrix: Vec<AddressPair>,
     #[serde(default)]
     pub scenes: Vec<Scene>,
+    /// Formal-segment ranges (ADR-049(b), `docs/LLM.md` §7). A segment added/removed/
+    /// edited invalidates only cues overlapping its old or new range (scene-like rule).
+    #[serde(default)]
+    pub formal_segments: Vec<FormalSegment>,
 }
 
 /// A glossary entry (`docs/DATA_MODEL.md` §3). Equality drives the "changed"
@@ -90,8 +99,17 @@ pub struct Character {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    /// The character's name spelled in Myanmar script (ADR-049(d), `docs/LLM.md` §7).
+    /// Part of the invalidation-relevant fields, so a name-spelling change is a
+    /// character change (reuses the §7 character rule).
+    #[serde(default)]
+    pub name_target: String,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// The parallel Burmese spellings of `aliases` (ADR-049(d)). Part of the
+    /// invalidation-relevant fields.
+    #[serde(default)]
+    pub aliases_target: Vec<String>,
     #[serde(default)]
     pub gender: String,
     #[serde(default)]
@@ -101,10 +119,13 @@ pub struct Character {
 }
 
 impl Character {
-    /// Whether the five invalidation-relevant fields (`docs/LLM.md` §7) are equal.
+    /// Whether the invalidation-relevant fields (`docs/LLM.md` §7) are equal, including
+    /// the name-spelling fields `name_target`/`aliases_target` (ADR-049(d)).
     fn attrs_eq(&self, other: &Character) -> bool {
         self.name == other.name
+            && self.name_target == other.name_target
             && self.aliases == other.aliases
+            && self.aliases_target == other.aliases_target
             && self.gender == other.gender
             && self.age_group == other.age_group
             && self.speech_style == other.speech_style
@@ -129,6 +150,11 @@ pub struct AddressPair {
     pub register: String,
     #[serde(default)]
     pub particle: String,
+    /// The Burmese honorific `from` uses before `to`'s name (ADR-049(c), ≤ 20, may be
+    /// empty). Part of the whole-entry equality, so a honorific change counts as an
+    /// address-pair change and reuses the §7 address-pair rule.
+    #[serde(default)]
+    pub honorific: String,
 }
 
 /// A scene (`docs/DATA_MODEL.md` §3). Equality on the whole scene drives the
@@ -147,6 +173,31 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// The ascending inclusive `(a, b)` cue range, when well formed.
+    fn range(&self) -> Option<(i64, i64)> {
+        match self.cue_range.as_slice() {
+            [a, b] => Some((*a.min(b), *a.max(b))),
+            _ => None,
+        }
+    }
+}
+
+/// A `formal_segments` entry (`docs/DATA_MODEL.md` §3, ADR-049(b)). Whole-entry
+/// equality drives the change detection: a segment is affected when it appears (as a
+/// whole) in only one document, and the cues of its range are invalidated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct FormalSegment {
+    #[serde(default)]
+    pub cue_range: Vec<i64>,
+    #[serde(default)]
+    pub register: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+impl FormalSegment {
     /// The ascending inclusive `(a, b)` cue range, when well formed.
     fn range(&self) -> Option<(i64, i64)> {
         match self.cue_range.as_slice() {
@@ -181,9 +232,15 @@ pub fn affected_cues(old: &AnalysisDoc, new: &AnalysisDoc, cues: &[Cue]) -> BTre
     let mut affected = BTreeSet::new();
     let translatable: Vec<&Cue> = cues.iter().filter(|c| c.translatable).collect();
 
-    // Row 1: premise / tone / style_rules → every translatable cue. This is the
-    // whole set, so later rows can only re-add the same cues; return early.
-    if old.premise != new.premise || old.tone != new.tone || old.style_rules != new.style_rules {
+    // Row 1: premise / tone / style_rules / narration_register → every translatable
+    // cue. `narration_register` is a whole-document register default (ADR-049(b),
+    // `docs/LLM.md` §7), so a change joins this rule. This is the whole set, so later
+    // rows can only re-add the same cues; return early.
+    if old.premise != new.premise
+        || old.tone != new.tone
+        || old.style_rules != new.style_rules
+        || old.narration_register != new.narration_register
+    {
         for c in &translatable {
             affected.insert(c.idx);
         }
@@ -224,25 +281,71 @@ pub fn affected_cues(old: &AnalysisDoc, new: &AnalysisDoc, cues: &[Cue]) -> BTre
     // Row 5: scene changed → cues of the OLD or NEW cue range. A scene is "changed"
     // when it appears (as a whole) in only one document.
     for scene in symmetric_difference(&old.scenes, &new.scenes) {
-        add_cues_in_range(&translatable, scene, &mut affected);
+        if let Some((a, b)) = scene.range() {
+            add_cues_in_bounds(&translatable, a, b, &mut affected);
+        }
+    }
+
+    // Row 6: formal_segments added / removed / edited → cues of the OLD or NEW range.
+    // A segment is "changed" when its whole entry appears in only one document
+    // (ADR-049(b), `docs/LLM.md` §7).
+    for seg in formal_symmetric_difference(&old.formal_segments, &new.formal_segments) {
+        if let Some((a, b)) = seg.range() {
+            add_cues_in_bounds(&translatable, a, b, &mut affected);
+        }
     }
 
     affected
 }
 
-/// Returns a copy of `doc` with every set-semantic list sorted, so order carries no
-/// meaning when diffing (`style_rules`, each character's `aliases`, each scene's
-/// `speakers`). Fields whose order is significant (e.g. `cue_range`) are untouched.
+/// Returns a copy of `doc` with every set-semantic list sorted and whole-document
+/// defaults normalized, so neither a pure reorder nor an absent-vs-explicit default
+/// invalidates anything (`docs/LLM.md` §7 is about real changes). Sorted:
+/// `style_rules`, each scene's `speakers`, and each character's `aliases` — the latter
+/// sorted **in parallel** with `aliases_target` (as `(alias, alias_target)` pairs when
+/// the two lists run parallel) so a joint reorder is a no-op even though `attrs_eq`
+/// compares both lists. Normalized: an empty/absent `narration_register` becomes its
+/// semantic default `"spoken"`, so a doc that omitted the field never differs from one
+/// that spelled out `"spoken"`. Fields whose order is significant (`cue_range`) are
+/// untouched.
 fn normalized(doc: &AnalysisDoc) -> AnalysisDoc {
     let mut doc = doc.clone();
     doc.style_rules.sort();
+    // An absent/empty `narration_register` means the `"spoken"` default (ADR-049(b),
+    // `docs/DATA_MODEL.md` §3), so normalize before diffing to avoid `"" != "spoken"`
+    // invalidating every cue on a semantically-identical document.
+    if doc.narration_register.is_empty() {
+        doc.narration_register = "spoken".to_string();
+    }
     for ch in &mut doc.characters {
-        ch.aliases.sort();
+        sort_aliases(ch);
     }
     for scene in &mut doc.scenes {
         scene.speakers.sort();
     }
     doc
+}
+
+/// Sorts a character's `aliases` for set-semantics, keeping `aliases_target` positionally
+/// aligned when the two lists run parallel (equal, non-zero length). A parallel reorder of
+/// both lists then normalizes to the same order, so it is not seen as a change even though
+/// [`Character::attrs_eq`] compares both. When the lists are not parallel (different
+/// lengths, e.g. `aliases_target` absent), `aliases` is sorted alone and `aliases_target`
+/// is left untouched.
+fn sort_aliases(ch: &mut Character) {
+    if !ch.aliases.is_empty() && ch.aliases.len() == ch.aliases_target.len() {
+        let mut pairs: Vec<(String, String)> = ch
+            .aliases
+            .iter()
+            .cloned()
+            .zip(ch.aliases_target.iter().cloned())
+            .collect();
+        pairs.sort();
+        ch.aliases = pairs.iter().map(|(a, _)| a.clone()).collect();
+        ch.aliases_target = pairs.into_iter().map(|(_, t)| t).collect();
+    } else {
+        ch.aliases.sort();
+    }
 }
 
 /// The glossary terms that were added, removed, or whose entry changed, keyed by the
@@ -336,12 +439,29 @@ fn add_cues_in_range(translatable: &[&Cue], scene: &Scene, affected: &mut BTreeS
     let Some((a, b)) = scene.range() else {
         return;
     };
+    add_cues_in_bounds(translatable, a, b, affected);
+}
+
+/// Inserts every translatable cue whose `idx` falls within the inclusive `[a, b]`
+/// cue range (shared by the scene and formal-segment range rules, `docs/LLM.md` §7).
+fn add_cues_in_bounds(translatable: &[&Cue], a: i64, b: i64, affected: &mut BTreeSet<u32>) {
     for c in translatable {
         let idx = i64::from(c.idx);
         if a <= idx && idx <= b {
             affected.insert(c.idx);
         }
     }
+}
+
+/// The formal segments present in exactly one of the two documents (the "changed"
+/// segments), by whole-entry equality (ADR-049(b), `docs/LLM.md` §7).
+fn formal_symmetric_difference<'a>(
+    old: &'a [FormalSegment],
+    new: &'a [FormalSegment],
+) -> Vec<&'a FormalSegment> {
+    let mut out: Vec<&FormalSegment> = old.iter().filter(|s| !new.contains(s)).collect();
+    out.extend(new.iter().filter(|s| !old.contains(s)));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +666,7 @@ mod tests {
             gender: "unknown".to_string(),
             age_group: "adult".to_string(),
             speech_style: "plain".to_string(),
+            ..Character::default()
         }
     }
 
@@ -567,10 +688,20 @@ mod tests {
         }
     }
 
+    fn formal(range: [i64; 2], kind: &str, note: &str) -> FormalSegment {
+        FormalSegment {
+            cue_range: range.to_vec(),
+            register: "literary".to_string(),
+            kind: kind.to_string(),
+            note: note.to_string(),
+        }
+    }
+
     fn base_doc() -> AnalysisDoc {
         AnalysisDoc {
             premise: "a tale".to_string(),
             tone: "wistful".to_string(),
+            narration_register: "spoken".to_string(),
             style_rules: vec!["short lines".to_string()],
             glossary: vec![],
             characters: vec![
@@ -585,6 +716,7 @@ mod tests {
                 scene([1, 2], "morning", &["c1", "c2"]),
                 scene([4, 5], "evening", &["c3"]),
             ],
+            formal_segments: vec![],
         }
     }
 
@@ -676,6 +808,20 @@ mod tests {
         assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[4]));
     }
 
+    // AC: M12-AC25 — a `name_target`-only change (the name's Burmese spelling) is a
+    // character change, so the §7 character rule invalidates cues mentioning the
+    // (unchanged source) name; c4 "Zed" is in no scene, isolating the name-mention path.
+    #[test]
+    fn character_name_target_change_affects_name_mentions() {
+        let old = base_doc();
+        let mut new = base_doc();
+        new.characters[3] = Character {
+            name_target: "ဇက်".to_string(),
+            ..character("c4", "Zed", &[])
+        };
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[4]));
+    }
+
     // AC: M8-AC3 (row 3) — a character ALIAS change invalidates cues mentioning an
     // alias; c5 "Xavier"/"X-man" is in no scene, isolating the alias-mention path.
     #[test]
@@ -720,6 +866,20 @@ mod tests {
         let old = base_doc();
         let mut new = base_doc();
         new.address_matrix = vec![pair("c1", "c2", "formal")];
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[1, 2]));
+    }
+
+    // AC: M12-AC19 — a honorific-only change on an address pair invalidates the cues of
+    // a scene that lists BOTH characters (honorific is part of AddressPair equality, so
+    // it reuses the §7 address-pair rule; ADR-049(c)).
+    #[test]
+    fn honorific_change_affects_scene_listing_both() {
+        let old = base_doc();
+        let mut new = base_doc();
+        new.address_matrix = vec![AddressPair {
+            honorific: "ဦး".to_string(),
+            ..pair("c1", "c2", "polite")
+        }];
         assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[1, 2]));
     }
 
@@ -810,6 +970,60 @@ mod tests {
         assert!(affected_cues(&old, &new, &base_cues()).is_empty());
     }
 
+    // AC: M12-AC8 — a `narration_register` change joins the whole-document row-1 rule:
+    // it invalidates ALL translatable cues (the non-translatable cue 3 is never
+    // affected), like premise/tone/style_rules (ADR-049(b), `docs/LLM.md` §7).
+    #[test]
+    fn narration_register_change_affects_all_translatable_cues() {
+        let old = base_doc();
+        let mut new = base_doc();
+        new.narration_register = "literary".to_string();
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[1, 2, 4, 5]));
+    }
+
+    // AC: M12-AC8 — ADDING a formal segment invalidates only the cues in the NEW range
+    // ([4,5]); nothing outside it (ADR-049(b), `docs/LLM.md` §7).
+    #[test]
+    fn formal_segment_add_affects_new_range_only() {
+        let old = base_doc();
+        let mut new = base_doc();
+        new.formal_segments = vec![formal([4, 5], "reading", "a letter")];
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[4, 5]));
+    }
+
+    // AC: M12-AC8 — REMOVING a formal segment invalidates only the cues in the OLD
+    // range ([1,2]).
+    #[test]
+    fn formal_segment_remove_affects_old_range_only() {
+        let mut old = base_doc();
+        old.formal_segments = vec![formal([1, 2], "reading", "a letter")];
+        let new = base_doc();
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[1, 2]));
+    }
+
+    // AC: M12-AC8 — EDITING a formal segment (here a range change [1,1] → [4,5], but a
+    // note/kind edit behaves the same via whole-entry equality) invalidates the union
+    // of the OLD and NEW ranges.
+    #[test]
+    fn formal_segment_edit_affects_old_union_new_range() {
+        let mut old = base_doc();
+        old.formal_segments = vec![formal([1, 1], "reading", "a letter")];
+        let mut new = base_doc();
+        new.formal_segments = vec![formal([4, 5], "reading", "a letter")];
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[1, 4, 5]));
+    }
+
+    // AC: M12-AC8 — a note-only edit to a formal segment still invalidates its range
+    // (whole-entry equality), confirming non-range edits are caught too.
+    #[test]
+    fn formal_segment_note_edit_affects_its_range() {
+        let mut old = base_doc();
+        old.formal_segments = vec![formal([1, 2], "reading", "old note")];
+        let mut new = base_doc();
+        new.formal_segments = vec![formal([1, 2], "reading", "new note")];
+        assert_eq!(affected_cues(&old, &new, &base_cues()), idxs(&[1, 2]));
+    }
+
     // AC: M8-AC3 — a pure REORDER of a character's `aliases` invalidates nothing.
     #[test]
     fn character_aliases_reorder_invalidates_nothing() {
@@ -817,6 +1031,41 @@ mod tests {
         old.characters[4] = character("c5", "Xavier", &["X-man", "X"]);
         let mut new = base_doc();
         new.characters[4] = character("c5", "Xavier", &["X", "X-man"]);
+        assert!(affected_cues(&old, &new, &base_cues()).is_empty());
+    }
+
+    // AC: M12-AC8 (footgun) — an omitted `narration_register` (semantic default "spoken")
+    // vs an explicit "spoken" is NOT a change: `normalized()` fills the default before
+    // diffing, so `"" != "spoken"` never invalidates every translatable cue.
+    #[test]
+    fn narration_register_omitted_vs_explicit_spoken_invalidates_nothing() {
+        let mut old = base_doc();
+        old.narration_register = String::new(); // field omitted on this document
+        let mut new = base_doc();
+        new.narration_register = "spoken".to_string(); // spelled out, same meaning
+        assert!(affected_cues(&old, &new, &base_cues()).is_empty());
+    }
+
+    // AC: M12-AC8 (footgun) — a PARALLEL reorder of `aliases` and `aliases_target`
+    // (keeping the pairs aligned) is not a semantic change: `sort_aliases` sorts the two
+    // lists as pairs, so a joint reorder normalizes identically even though
+    // `attrs_eq` compares both lists.
+    #[test]
+    fn aliases_target_parallel_reorder_invalidates_nothing() {
+        let with_aliases = |aliases: &[&str], targets: &[&str]| Character {
+            id: "c5".to_string(),
+            name: "Xavier".to_string(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            aliases_target: targets.iter().map(|s| s.to_string()).collect(),
+            gender: "unknown".to_string(),
+            age_group: "adult".to_string(),
+            speech_style: "plain".to_string(),
+            ..Character::default()
+        };
+        let mut old = base_doc();
+        old.characters[4] = with_aliases(&["X-man", "X"], &["ဧက်စ်မန်", "ဧက်စ်"]);
+        let mut new = base_doc();
+        new.characters[4] = with_aliases(&["X", "X-man"], &["ဧက်စ်", "ဧက်စ်မန်"]);
         assert!(affected_cues(&old, &new, &base_cues()).is_empty());
     }
 }

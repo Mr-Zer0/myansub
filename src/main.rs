@@ -839,7 +839,8 @@ fn run_translation_review_command(cli: &Cli, command: &ReviewCommand) -> anyhow:
                 // Cues (source placeholders) are read, so the source must be unchanged
                 // (docs/ARCHITECTURE.md §6 rule 5).
                 check_source_unchanged(&store, &source).await?;
-                translation_review::set_target(&store, id, text, &limits).await?;
+                translation_review::set_target(&store, id, text, &limits, config.digit_style())
+                    .await?;
                 println!("set and locked cue {id}.");
                 Ok(exit::SUCCESS)
             }
@@ -858,6 +859,7 @@ fn run_translation_review_command(cli: &Cli, command: &ReviewCommand) -> anyhow:
                     &location.dir,
                     &selection,
                     &limits,
+                    config.digit_style(),
                 )
                 .await?;
                 println!(
@@ -885,7 +887,9 @@ fn run_translation_review_command(cli: &Cli, command: &ReviewCommand) -> anyhow:
                 })
                 .await
                 .context("read import file")??;
-                let summary = translation_review::import(&store, &content, &limits).await?;
+                let summary =
+                    translation_review::import(&store, &content, &limits, config.digit_style())
+                        .await?;
                 println!(
                     "imported {} changed and {} unchanged cue(s); \
                      run `myansub review approve` to approve the review.",
@@ -960,6 +964,7 @@ fn run_export_command(cli: &Cli, args: &ExportArgs) -> anyhow::Result<i32> {
             &config.output.ass_font_override,
             config.output.utf8_bom,
             args.allow_incomplete,
+            config.cue_final_stop(),
         )
         .await?;
         report_export(&report);

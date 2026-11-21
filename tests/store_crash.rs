@@ -56,8 +56,9 @@ async fn fresh_open_sets_user_version_and_creates_all_tables() {
     let store = Store::open(&dir.path().join("project.db")).expect("open");
 
     assert_eq!(user_version(&store).await, SCHEMA_VERSION as i64);
-    // Migration 3 (M7-C) added `stage_state.approved_origin`.
-    assert_eq!(SCHEMA_VERSION, 3);
+    // Migration 3 (M7-C) added `stage_state.approved_origin`; migration 4 (M12, ADR-050)
+    // added `project.translation_digits`.
+    assert_eq!(SCHEMA_VERSION, 4);
 
     let tables = table_names(&store).await;
     for expected in EXPECTED_TABLES {
@@ -334,6 +335,7 @@ async fn failing_migration_rolls_back_and_leaves_schema_consistent() {
                     "-- v1 already applied; skipped",
                     "-- v2 already applied; skipped",
                     "-- v3 already applied; skipped",
+                    "-- v4 already applied; skipped",
                     "CREATE TABLE migration_next_partial (x INTEGER); \
                      CREATE TABLE this_is_not_valid_sql (;",
                 ],
@@ -361,6 +363,7 @@ async fn failing_migration_rolls_back_and_leaves_schema_consistent() {
                     "-- v1 already applied; skipped",
                     "-- v2 already applied; skipped",
                     "-- v3 already applied; skipped",
+                    "-- v4 already applied; skipped",
                     "CREATE TABLE migration_next (x INTEGER);",
                 ],
             )

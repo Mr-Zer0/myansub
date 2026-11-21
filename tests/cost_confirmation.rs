@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use myansub::domain::Cue;
+use myansub::domain::{Cue, DigitStyle};
 use myansub::error::ExitCode;
 use myansub::error::exit;
 use myansub::llm::client::{CommitToken, LlmResponse, ServiceTier, ThinkingSetting, Usage};
@@ -233,6 +233,7 @@ fn translation_params() -> TranslationParams {
         context_after: 0,
         max_content_attempts: 3,
         output_ratio: 4.0,
+        digits: DigitStyle::Myanmar,
         estimator: estimator(),
         limits: Limits {
             max_graphemes_per_line: 42,

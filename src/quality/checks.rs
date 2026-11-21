@@ -10,7 +10,7 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::domain::{Cue, QualityFlag};
+use crate::domain::{Cue, DigitStyle, QualityFlag};
 
 const PLACEHOLDER_OPEN: char = '\u{27E6}'; // ⟦
 const PLACEHOLDER_CLOSE: char = '\u{27E7}'; // ⟧
@@ -43,6 +43,14 @@ pub struct AnalysisContext<'a> {
     pub glossary: &'a [GlossaryTerm<'a>],
     /// Character names and aliases (`docs/DATA_MODEL.md` §3 `characters`).
     pub names: &'a [&'a str],
+    /// Source name/alias → Burmese target-spelling pairs: `(name, name_target)` and,
+    /// positionally, `(aliases[i], aliases_target[i])` (`docs/DATA_MODEL.md` §3). The
+    /// `glossary_miss` check uses these to require the matching spelling when a source
+    /// cue names a character (`docs/LLM.md` §8, ADR-049(d)).
+    pub name_targets: &'a [(String, String)],
+    /// The chosen digit style (`[burmese].digits`, ADR-049(e)); the `digit_style`
+    /// check flags a target using the other system's digits.
+    pub digits: DigitStyle,
 }
 
 /// True when `c` is a Myanmar code point in any of the three ranges used for
@@ -175,16 +183,74 @@ fn is_burmese_core(c: char) -> bool {
     is_myanmar(c) && !is_zawgyi_band(c)
 }
 
-/// `glossary_miss`: the source contains a glossary term (case-insensitive) but
-/// the target lacks that entry's `target` (`docs/LLM.md` §8).
+/// `glossary_miss`: the source contains a glossary term (case-insensitive) but the
+/// target lacks that entry's `target`; **or** the source contains a character name /
+/// alias but the target lacks the matching `name_target` / `aliases_target` spelling
+/// (`docs/LLM.md` §8, ADR-049(d)).
 pub fn glossary_miss(source: &Cue, target: &str, ctx: &AnalysisContext) -> bool {
     let src = source.text_masked.to_lowercase();
     let tgt = target.to_lowercase();
-    ctx.glossary.iter().any(|g| {
+    let glossary_hit = ctx.glossary.iter().any(|g| {
         !g.term.is_empty()
             && !g.target.is_empty()
             && src.contains(&g.term.to_lowercase())
             && !tgt.contains(&g.target.to_lowercase())
+    });
+    if glossary_hit {
+        return true;
+    }
+    ctx.name_targets.iter().any(|(name, spelling)| {
+        !name.is_empty()
+            && !spelling.is_empty()
+            && src.contains(&name.to_lowercase())
+            && !tgt.contains(&spelling.to_lowercase())
+    })
+}
+
+/// Returns `target` with every `⟦n⟧` placeholder token removed, so digits *inside*
+/// a placeholder (e.g. the `0` in `⟦0⟧`) do not count toward the digit-style check
+/// (`docs/LLM.md` §8, ADR-049(e)). Honors the doubled-bracket escape like
+/// [`placeholders`].
+fn strip_placeholders(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == PLACEHOLDER_OPEN {
+            if chars.get(i + 1) == Some(&PLACEHOLDER_OPEN) {
+                // Escaped literal `⟦`.
+                out.push(PLACEHOLDER_OPEN);
+                i += 2;
+                continue;
+            }
+            let mut j = i + 1;
+            let mut digits = String::new();
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                digits.push(chars[j]);
+                j += 1;
+            }
+            if !digits.is_empty() && chars.get(j) == Some(&PLACEHOLDER_CLOSE) {
+                // A real placeholder token — drop it entirely.
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `digit_style`: the target contains digits of the system *not* chosen in
+/// `[burmese].digits`, after removing `⟦n⟧` placeholder tokens so their indices do
+/// not count (`docs/LLM.md` §8, ADR-049(e)). With `digits = myanmar`, any Western
+/// digit `0–9` fires; with `digits = western`, any Myanmar digit `၀–၉`
+/// (U+1040–U+1049) fires.
+pub fn digit_style(target: &str, digits: DigitStyle) -> bool {
+    let stripped = strip_placeholders(target);
+    stripped.chars().any(|c| match digits {
+        DigitStyle::Myanmar => c.is_ascii_digit(),
+        DigitStyle::Western => ('\u{1040}'..='\u{1049}').contains(&c),
     })
 }
 
@@ -238,6 +304,9 @@ pub fn check_cue(
     }
     if glossary_miss(source, target, ctx) {
         flags.push(QualityFlag::GlossaryMiss);
+    }
+    if digit_style(target, ctx.digits) {
+        flags.push(QualityFlag::DigitStyle);
     }
     if too_long(target, limits) {
         flags.push(QualityFlag::TooLong);

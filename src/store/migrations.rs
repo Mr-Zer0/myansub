@@ -12,7 +12,7 @@ use super::db::StoreError;
 
 /// Migration scripts in order. Index `i` (0-based) upgrades the database to
 /// `user_version = i + 1`. Append new scripts here; never edit a released one.
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3];
+const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4];
 
 /// The current schema version (highest migration applied by a fresh open).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -207,6 +207,18 @@ const MIGRATION_3: &str = r#"
 ALTER TABLE stage_state ADD COLUMN approved_origin TEXT;
 "#;
 
+/// Migration 4: the translation digit style recorded on the `project` row
+/// (`docs/DATA_MODEL.md` §2, ADR-050). `translation_digits` is nullable (`myanmar`/
+/// `western`); a `NULL` means "not yet recorded". The translation stage records the
+/// `[burmese].digits` style when it first creates the translation batches, and a
+/// later run marks all unlocked translations stale when the current setting differs
+/// from the recorded value (`docs/LLM.md` §7). `ALTER TABLE ADD COLUMN` is
+/// append-only, so existing projects migrate without data loss (a migrated row reads
+/// `NULL`).
+const MIGRATION_4: &str = r#"
+ALTER TABLE project ADD COLUMN translation_digits TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,8 +303,9 @@ mod tests {
         )
         .expect("insert stage");
 
-        // Apply the full set: versions 1 and 2 skipped, version 3 applied.
-        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 3");
+        // Apply through migration 3: versions 1 and 2 skipped, version 3 applied.
+        run_migrations_with(&mut conn, &[MIGRATION_1, MIGRATION_2, MIGRATION_3])
+            .expect("apply migration 3");
         let v3: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
@@ -308,5 +321,42 @@ mod tests {
             .expect("read stage row");
         assert_eq!(status, "approved");
         assert_eq!(origin, None);
+    }
+
+    // AC: M12-AC14 — migration 4 adds `project.translation_digits` without losing an
+    // existing project row: the prior columns survive, the new column reads NULL for a
+    // row written before the migration, and user_version → 4.
+    #[test]
+    fn migration_four_adds_translation_digits_column() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Bring the database up to version 3 only, then populate a project row.
+        run_migrations_with(&mut conn, &[MIGRATION_1, MIGRATION_2, MIGRATION_3])
+            .expect("apply 1+2+3");
+        conn.execute(
+            "INSERT INTO project \
+             (id, source_path, source_hash, source_format, source_encoding, source_lang) \
+             VALUES (1, 'movie.en.srt', 'sha256:abc', 'srt', 'utf-8', 'en')",
+            [],
+        )
+        .expect("insert project");
+
+        // Apply the full set: versions 1..3 skipped, version 4 applied.
+        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 4");
+        let v4: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(v4, 4);
+
+        // The pre-existing row survives; the new column is NULL for the migrated row.
+        let (path, digits): (String, Option<String>) = conn
+            .query_row(
+                "SELECT source_path, translation_digits FROM project WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read project row");
+        assert_eq!(path, "movie.en.srt");
+        assert_eq!(digits, None);
     }
 }

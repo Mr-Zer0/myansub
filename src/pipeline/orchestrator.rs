@@ -599,6 +599,7 @@ async fn export_output(
         &config.output.ass_font_override,
         config.output.utf8_bom,
         req.options.allow_incomplete,
+        config.cue_final_stop(),
     )
     .await?;
 
@@ -820,6 +821,7 @@ pub fn translation_params(config: &Config) -> TranslationParams {
         context_after: config.translation.context_after,
         max_content_attempts: config.translation.max_content_attempts,
         output_ratio: config.translation.output_ratio,
+        digits: config.digit_style(),
         estimator: estimator_from(config),
         limits: (&config.quality).into(),
         scheduler: scheduler_from(config),

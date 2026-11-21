@@ -43,4 +43,13 @@ Config is validated at startup:
 - `concurrency ≥ 1`, `batch_size` between 5 and 300, `max_retries ≤ 20`.
 - Models must be non-empty strings.
 - `service_tier ∈ {flex, standard}`, `cache.provider ∈ {off, implicit, explicit, auto}`.
+- `burmese.digits ∈ {myanmar, western}`, `burmese.cue_final_stop ∈ {keep, strip}`; an invalid
+  value is rejected at startup naming the key (ADR-049).
 - Missing price entries for a configured model produce a warning, not an error.
+
+## 6. Burmese output policy (`[burmese]`, ADR-049)
+
+| Key | Values | Default | Effect |
+|---|---|---|---|
+| `digits` | `myanmar` \| `western` | `myanmar` | Digit style the translation prompt requests. Part of the prompt, so changing it marks unlocked translations stale (`LLM.md` §7). The `digit_style` quality flag fires when a cue uses the other system. |
+| `cue_final_stop` | `keep` \| `strip` | `strip` | How a trailing ။ at the end of a cue is handled at export. `strip` removes one trailing ။ (and trailing whitespace) per cue; `keep` leaves the text unchanged. Applied deterministically at export, never by the LLM, so changing it needs only a re-export (no LLM calls, no stale-marking). |

@@ -172,6 +172,18 @@ falls back to its defaults: output format = source format, output path =
 so existing projects migrate without data loss (fills the output-preference gap
 deferred from M4-B).
 
+### Migration 4 — translation digit style (ADR-050)
+
+```sql
+ALTER TABLE project ADD COLUMN translation_digits TEXT;  -- myanmar|western, nullable
+```
+
+Nullable, defaults to `NULL` ("not yet recorded"). The translation stage records the
+`[burmese].digits` style in use when it first creates the translation batches, and on a
+later run marks all unlocked translations stale if the current `digits` setting differs
+from the recorded value (`LLM.md` §7, ADR-050). Append-only, so existing projects migrate
+without data loss.
+
 ## 3. Analysis document (schema_version 1)
 
 Prose fields are written in English. The array caps and the per-field string-length limits
@@ -187,11 +199,14 @@ states for serving"); see ADR-044. The wire schema still carries the full docume
   "schema_version": 1,
   "premise": "string ≤500 — stable whole-title facts",
   "tone": "string ≤160",
+  "narration_register": "spoken|literary",
   "characters": [
     {
       "id": "c1",
       "name": "string ≤120",
+      "name_target": "Myanmar script ≤120 — the name's spelling in Burmese",
       "aliases": ["string ≤80, max 8"],
+      "aliases_target": ["Myanmar script ≤120 — parallel to aliases, same length when present"],
       "gender": "m|f|unknown",
       "age_group": "child|young|adult|elder|unknown",
       "role": "string ≤260",
@@ -205,6 +220,7 @@ states for serving"); see ADR-044. The wire schema still carries the full docume
       "relation": "string ≤160",
       "self_ref": "Burmese self-reference used by `from`",
       "addressee_ref": "Burmese term `from` uses for `to`",
+      "honorific": "Burmese honorific `from` uses before `to`'s name, ≤20, may be empty",
       "register": "colloquial|polite|formal",
       "particle": "Burmese sentence-final particle, may be empty"
     }
@@ -215,19 +231,55 @@ states for serving"); see ADR-044. The wire schema still carries the full docume
   "scenes": [
     { "cue_range": [1, 85], "summary": "string ≤300", "speakers": ["c1", "c2"], "mood": "string ≤80" }
   ],
+  "formal_segments": [
+    {
+      "cue_range": [214, 220],
+      "register": "literary",
+      "kind": "reading|broadcast|speech|recitation|onscreen_text|other",
+      "note": "string ≤120"
+    }
+  ],
   "style_rules": ["string ≤180, max 12"],
   "unresolved_ambiguities": ["string ≤220, max 12"]
 }
 ```
 
 Array caps (enforced in code, ADR-044): characters ≤ 40, address_matrix ≤ 80, glossary ≤ 120,
-scenes ≤ 120, each character's `aliases` ≤ 8, `style_rules` ≤ 12, `unresolved_ambiguities` ≤ 12.
+scenes ≤ 120, `formal_segments` ≤ 60, each character's `aliases` ≤ 8, `style_rules` ≤ 12,
+`unresolved_ambiguities` ≤ 12.
+
+**Register fields (ADR-049, PBI-002).** `narration_register` (default `"spoken"`) is the register
+for genuine narrator voice-over (documentary narration, a storyteller) — not for ordinary dialogue.
+`formal_segments` lists cue ranges where a character voices written or formal text (reading a letter
+or textbook, a news broadcast, a speech, a recitation) or where on-screen text appears; those ranges
+are translated in literary Burmese (see `LLM.md` §2). The distinction throughout is spoken language
+vs voiced written/formal text, **not** dialogue vs narration.
+
+**Name-target fields (ADR-049, PBI-005).** `name_target` is each character's name spelled in Myanmar
+script (required) and `aliases_target` is the parallel Burmese spelling of `aliases` (optional; when
+present it must have the same length as `aliases`). These give consistent, pronunciation-faithful
+spellings the translation stage reuses and the `glossary_miss` check enforces (`LLM.md` §8).
+
+**Honorific field (ADR-049, PBI-004).** Each `address_matrix` entry may carry an optional `honorific`
+(≤ 20 chars, may be empty): the Burmese honorific `from` uses before `to`'s name (ဦး, ဒေါ်, ကို, မ,
+မောင်, ဆရာ …).
 
 Validation rules on import:
 - `from`, `to`, and `speakers` must reference existing character ids.
 - Scene ranges must lie within existing cue indices, ascending, non-overlapping.
+- `formal_segments` ranges must lie within existing cue indices, be ascending within each range,
+  ascending across entries, and non-overlapping; `kind` must be one of the enum values (unknown
+  `kind` rejected); `register` must be `"literary"`.
+- `narration_register`, when present, must be `"spoken"` or `"literary"`.
+- `name_target` must be present and contain Myanmar code points; when `aliases_target` is present its
+  length must equal that of `aliases`; each `aliases_target` entry contains Myanmar code points.
+- `honorific`, when present, must be ≤ 20 characters.
 - `keep: true` implies `target` equals `term`.
 - Unknown fields are rejected on user import (strict), ignored on LLM output (lenient).
+
+Required keys (strict import, `LLM.md`/ADR-036): `name_target` joins the per-character required set
+(`id`, `name`, `name_target`, `gender`, `age_group`). `narration_register`, `formal_segments`,
+`aliases_target`, and `honorific` are optional (defaulting to `"spoken"` / empty).
 
 Provenance (`source_digest`, `signature`) is stored in table columns, not in the JSON.
 
@@ -241,8 +293,13 @@ Provenance (`source_digest`, `signature`) is stored in table columns, not in the
 
 ```
 empty | placeholder_mismatch | untranslated | zawgyi_suspect | boundary_drift
-| glossary_miss | too_long | too_fast | failed
+| glossary_miss | digit_style | too_long | too_fast | failed
 ```
+
+`digit_style` (ADR-049, PBI-003) is set when a translated cue contains digits of the system
+*not* chosen in `[burmese].digits` (placeholder contents excluded). `glossary_miss` now also
+covers character names: if a source cue contains a character name or alias, the translation
+must contain the matching `name_target` / `aliases_target` spelling (`LLM.md` §8).
 
 Serialized as snake_case strings in `translations.flags`.
 
