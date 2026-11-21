@@ -66,16 +66,16 @@ use crate::quality::checks::{self, AnalysisContext, GlossaryTerm, Limits};
 use crate::store::repo_analysis::{current_analysis, get_analysis_version};
 use crate::store::repo_cues::load_cues;
 use crate::store::repo_llm::put_cache_in_tx;
-use crate::store::repo_project::set_stage;
+use crate::store::repo_project::{get_translation_digits, set_stage, set_translation_digits_in_tx};
 use crate::store::repo_translations::{
     NewTranslation, TranslationOrigin, cue_id_by_idx, delete_unlocked_translation,
-    list_translations, mark_unlocked_stale_in_tx, upsert_translation_in_tx,
+    list_translations, mark_all_unlocked_stale_in_tx, upsert_translation_in_tx,
 };
 use crate::store::repo_units::{
     NewTranslationBatch, claim_translation_batch, complete_translation_batch_in_tx,
     count_translation_batches_by_status, create_translation_batch, fail_translation_batch,
     get_translation_batch, list_translation_batches_by_status, requeue_failed_translation_batches,
-    requeue_translation_batch, reset_translation_batch, set_translation_batch_input_hash_in_tx,
+    requeue_translation_batch, reset_translation_batch,
 };
 use crate::store::{Stage, StageStatus, Store, StoreError, UnitStatus};
 
@@ -128,8 +128,11 @@ pub struct TranslationParams {
     /// (`[translation].output_ratio`).
     pub output_ratio: f64,
     /// The digit style requested in the translation prompt (`[burmese].digits`,
-    /// ADR-049(e)). Part of the prompt and folded into the `input_hash`, so a change
-    /// marks unlocked translations stale (`docs/LLM.md` §7).
+    /// ADR-049(e), ADR-050). Part of the system instruction (and therefore the local
+    /// response-cache key), but NOT folded into the batch `input_hash`. A digit-style
+    /// change is reconciled against `project.translation_digits`: when it differs from
+    /// the recorded value, all unlocked translations are marked stale (`docs/LLM.md`
+    /// §7), independently of the analysis diff and selective invalidation.
     pub digits: DigitStyle,
     /// Per-script token estimator (`[estimate]`).
     pub estimator: Estimator,
@@ -256,6 +259,7 @@ where
     // running, all in one transaction. On a resume the rows already exist and this
     // is skipped, so a `done` batch keeps its status (`docs/ARCHITECTURE.md` §6).
     let model = params.model.clone();
+    let digits_label = params.digits.label().to_string();
     let rows_for_create: Vec<NewTranslationBatch> = assembled
         .iter()
         .map(|b| NewTranslationBatch {
@@ -267,36 +271,61 @@ where
             analysis_version: Some(analysis_version),
         })
         .collect();
-    store
-        .call(move |conn| {
-            if list_translation_batches_by_status(conn, UnitStatus::Pending)?.is_empty()
-                && count_translation_batches_by_status(conn, UnitStatus::InFlight)? == 0
-                && count_translation_batches_by_status(conn, UnitStatus::Done)? == 0
-                && count_translation_batches_by_status(conn, UnitStatus::Failed)? == 0
-            {
-                let tx = conn.transaction()?;
-                for batch in &rows_for_create {
-                    create_translation_batch(&tx, batch)?;
+    {
+        let digits_label = digits_label.clone();
+        store
+            .call(move |conn| {
+                if list_translation_batches_by_status(conn, UnitStatus::Pending)?.is_empty()
+                    && count_translation_batches_by_status(conn, UnitStatus::InFlight)? == 0
+                    && count_translation_batches_by_status(conn, UnitStatus::Done)? == 0
+                    && count_translation_batches_by_status(conn, UnitStatus::Failed)? == 0
+                {
+                    let tx = conn.transaction()?;
+                    for batch in &rows_for_create {
+                        create_translation_batch(&tx, batch)?;
+                    }
+                    // Record the digit style the fresh batches were created under, so a
+                    // later run can detect a `[burmese].digits` change (ADR-050).
+                    set_translation_digits_in_tx(&tx, &digits_label)?;
+                    set_stage(&tx, Stage::Translation, StageStatus::Running)?;
+                    tx.commit()?;
                 }
-                set_stage(&tx, Stage::Translation, StageStatus::Running)?;
-                tx.commit()?;
-            }
-            Ok(())
-        })
-        .await?;
+                Ok(())
+            })
+            .await?;
+    }
 
     let idx_to_id = store.call(|conn| cue_id_by_idx(conn)).await?;
 
-    // Done-batch reconciliation for a config-driven prompt change (ADR-050, ADR-049(e)).
-    // A `done` batch is skipped by the scheduler on resume, so a pure `[burmese].digits`
-    // change — which moves each batch's recomputed `input_hash` while the source,
-    // analysis version, model, and PROMPT_VERSION are unchanged — would otherwise be
-    // silently ignored. For each `done` batch whose freshly-assembled hash differs from
-    // its stored one, in ONE transaction mark its UNLOCKED cues stale (locked cues are
-    // never touched, FR-6) and rewrite the stored hash so the drift is recorded and the
-    // next plain run does not re-mark (idempotent). The subsequent `translate --stale`
-    // then re-translates exactly those unlocked cues; this run sends nothing new.
-    reconcile_done_batch_hashes(store, &assembled, &idx_to_id).await?;
+    // Digit-style reconciliation for the config-driven prompt change (ADR-050,
+    // ADR-049(e)). A `[burmese].digits` switch is a whole-prompt change (it lives in the
+    // translation system instruction), so it must mark every unlocked translation stale
+    // (`docs/LLM.md` §7) — but a `done` batch is skipped by the scheduler on resume, so a
+    // plain rerun would otherwise ignore it. This is tracked by the project-level
+    // `translation_digits` record, independently of the batch `input_hash` and
+    // `analysis_version`, so it never cross-contaminates with M8 selective invalidation
+    // (a normal analysis re-approval leaves the digit record unchanged and marks only its
+    // selective set). When the recorded value differs from the current digit style, in
+    // ONE transaction mark ALL unlocked translations stale (locked cues are never touched,
+    // FR-6) and update the record — idempotent, since the next plain run sees no
+    // difference. The subsequent `translate --stale` re-translates the unlocked cues; this
+    // run sends nothing new.
+    {
+        let digits_label = digits_label.clone();
+        store
+            .call(move |conn| {
+                if let Some(recorded) = get_translation_digits(conn)?
+                    && recorded != digits_label
+                {
+                    let tx = conn.transaction()?;
+                    mark_all_unlocked_stale_in_tx(&tx)?;
+                    set_translation_digits_in_tx(&tx, &digits_label)?;
+                    tx.commit()?;
+                }
+                Ok(())
+            })
+            .await?;
+    }
 
     // Apply the run-shaping flags (`docs/CLI.md` §6): requeue failed batches
     // (`--retry-failed`) or re-run unlocked / stale-unlocked cues (`--redo`/`--stale`),
@@ -606,60 +635,6 @@ async fn apply_run_flags(
     Ok(())
 }
 
-/// Reconciles `done` batches whose stored `input_hash` no longer matches the
-/// freshly-assembled one (ADR-050). Isolates a pure config-driven prompt change
-/// (`[burmese].digits`): same source, analysis version, model, and PROMPT_VERSION
-/// mean only the digit style can have moved the hash. For each drifted `done` batch,
-/// in one transaction, marks its UNLOCKED cues stale and rewrites the stored hash so
-/// the drift is recorded and re-marking is idempotent. Locked cues are never marked
-/// (FR-6). A plain run does no re-sending here; `translate --stale` does that next.
-async fn reconcile_done_batch_hashes(
-    store: &Store,
-    assembled: &[AssembledBatch],
-    idx_to_id: &BTreeMap<u32, i64>,
-) -> Result<(), PipelineError> {
-    let stored_done: BTreeMap<i64, Option<String>> = store
-        .call(|conn| list_translation_batches_by_status(conn, UnitStatus::Done))
-        .await?
-        .into_iter()
-        .map(|b| (b.batch_no, b.input_hash))
-        .collect();
-
-    // Each drifted done batch: (batch_no, new_hash, cue_ids of its cues).
-    let mut updates: Vec<(i64, String, Vec<i64>)> = Vec::new();
-    for batch in assembled {
-        let Some(stored) = stored_done.get(&batch.batch_no) else {
-            continue; // not a done batch
-        };
-        if stored.as_deref() == Some(batch.input_hash.as_str()) {
-            continue; // unchanged
-        }
-        let cue_ids: Vec<i64> = batch
-            .translate_cues
-            .iter()
-            .filter_map(|c| idx_to_id.get(&c.idx).copied())
-            .collect();
-        updates.push((batch.batch_no, batch.input_hash.clone(), cue_ids));
-    }
-
-    if updates.is_empty() {
-        return Ok(());
-    }
-
-    store
-        .call(move |conn| {
-            let tx = conn.transaction()?;
-            for (batch_no, new_hash, cue_ids) in &updates {
-                mark_unlocked_stale_in_tx(&tx, cue_ids)?;
-                set_translation_batch_input_hash_in_tx(&tx, *batch_no, new_hash)?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
-    Ok(())
-}
-
 /// Rebuilds a batch's variable block, `input_hash`, bounds, and cue list from a
 /// subset of its cues (used when a locked cue must be dropped from a `--redo`/`--stale`
 /// re-run so it is never re-sent). The scene header is preserved; context lines are
@@ -681,12 +656,7 @@ fn rebuild_batch_subset(
         context_after: &[],
     };
     let variable_block = block.render();
-    batch.input_hash = compute_input_hash(
-        &variable_block,
-        analysis_version,
-        params.model.as_str(),
-        params.digits,
-    );
+    batch.input_hash = compute_input_hash(&variable_block, analysis_version, params.model.as_str());
     if let Some(first) = cues.first() {
         batch.first_cue = i64::from(first.idx);
     }
@@ -1125,12 +1095,8 @@ fn assemble_all_batches(
             context_after: &after_lines,
         };
         let variable_block = block.render();
-        let input_hash = compute_input_hash(
-            &variable_block,
-            analysis_version,
-            params.model.as_str(),
-            params.digits,
-        );
+        let input_hash =
+            compute_input_hash(&variable_block, analysis_version, params.model.as_str());
 
         out.push(AssembledBatch {
             batch_no: i as i64 + 1,
@@ -1164,18 +1130,13 @@ fn to_lines(cues: &[&Cue], segments: &[FormalRange]) -> Vec<TranslationLine> {
 }
 
 /// The `input_hash` of a batch (`docs/LLM.md` §3): sha256 of the variable block +
-/// the analysis version + the model + [`PROMPT_VERSION`] + the digit style. A `done`
-/// batch whose `input_hash` is unchanged is never resent, and a re-approved analysis
-/// version changes the hash (the basis for M6-B2 selective invalidation). The digit
-/// style is folded in so a pure `[burmese].digits` change moves the hash — the basis
-/// for the done-batch reconciliation that marks unlocked cues stale (ADR-049(e),
-/// ADR-050).
-fn compute_input_hash(
-    variable_block: &str,
-    analysis_version: i64,
-    model: &str,
-    digits: DigitStyle,
-) -> String {
+/// the analysis version + the model + [`PROMPT_VERSION`]. A `done` batch whose
+/// `input_hash` is unchanged is never resent, and a re-approved analysis version
+/// changes the hash (the basis for M6-B2 selective invalidation). The digit style is
+/// deliberately NOT folded in (ADR-050): a `[burmese].digits` change is reconciled via
+/// the project-level `translation_digits` record instead, so it never drifts the hash
+/// and so never cross-contaminates selective invalidation.
+fn compute_input_hash(variable_block: &str, analysis_version: i64, model: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(variable_block.as_bytes());
     hasher.update([0u8]);
@@ -1184,12 +1145,6 @@ fn compute_input_hash(
     hasher.update(model.as_bytes());
     hasher.update([0u8]);
     hasher.update(PROMPT_VERSION.to_le_bytes());
-    hasher.update([0u8]);
-    let digit_tag: u8 = match digits {
-        DigitStyle::Myanmar => 0,
-        DigitStyle::Western => 1,
-    };
-    hasher.update([digit_tag]);
     hex_encode(&hasher.finalize())
 }
 

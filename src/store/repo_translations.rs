@@ -320,6 +320,20 @@ pub fn mark_unlocked_stale_in_tx(tx: &Transaction, cue_ids: &[i64]) -> Result<us
     Ok(marked)
 }
 
+/// Marks every unlocked translation stale (`stale = 1 WHERE locked = 0`) within the
+/// caller's transaction (ADR-050, `docs/LLM.md` §7). Used for a whole-prompt change —
+/// a `[burmese].digits` switch — which affects every unlocked translation regardless
+/// of the analysis diff. `locked = 1` rows are never touched (`docs/REQUIREMENTS.md`
+/// FR-6). Returns the number of rows updated.
+pub fn mark_all_unlocked_stale_in_tx(tx: &Transaction) -> Result<usize, StoreError> {
+    let marked = tx.execute(
+        "UPDATE translations SET stale = 1, updated_at = datetime('now') \
+         WHERE locked = 0 AND stale = 0",
+        [],
+    )?;
+    Ok(marked)
+}
+
 /// Counts the currently-stale, unlocked translations (`stale = 1 AND locked = 0`).
 /// The approve path reports this so a recovery re-run still signals how many
 /// translations are pending re-translation — including any left stale by an earlier

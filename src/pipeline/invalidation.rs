@@ -298,19 +298,54 @@ pub fn affected_cues(old: &AnalysisDoc, new: &AnalysisDoc, cues: &[Cue]) -> BTre
     affected
 }
 
-/// Returns a copy of `doc` with every set-semantic list sorted, so order carries no
-/// meaning when diffing (`style_rules`, each character's `aliases`, each scene's
-/// `speakers`). Fields whose order is significant (e.g. `cue_range`) are untouched.
+/// Returns a copy of `doc` with every set-semantic list sorted and whole-document
+/// defaults normalized, so neither a pure reorder nor an absent-vs-explicit default
+/// invalidates anything (`docs/LLM.md` §7 is about real changes). Sorted:
+/// `style_rules`, each scene's `speakers`, and each character's `aliases` — the latter
+/// sorted **in parallel** with `aliases_target` (as `(alias, alias_target)` pairs when
+/// the two lists run parallel) so a joint reorder is a no-op even though `attrs_eq`
+/// compares both lists. Normalized: an empty/absent `narration_register` becomes its
+/// semantic default `"spoken"`, so a doc that omitted the field never differs from one
+/// that spelled out `"spoken"`. Fields whose order is significant (`cue_range`) are
+/// untouched.
 fn normalized(doc: &AnalysisDoc) -> AnalysisDoc {
     let mut doc = doc.clone();
     doc.style_rules.sort();
+    // An absent/empty `narration_register` means the `"spoken"` default (ADR-049(b),
+    // `docs/DATA_MODEL.md` §3), so normalize before diffing to avoid `"" != "spoken"`
+    // invalidating every cue on a semantically-identical document.
+    if doc.narration_register.is_empty() {
+        doc.narration_register = "spoken".to_string();
+    }
     for ch in &mut doc.characters {
-        ch.aliases.sort();
+        sort_aliases(ch);
     }
     for scene in &mut doc.scenes {
         scene.speakers.sort();
     }
     doc
+}
+
+/// Sorts a character's `aliases` for set-semantics, keeping `aliases_target` positionally
+/// aligned when the two lists run parallel (equal, non-zero length). A parallel reorder of
+/// both lists then normalizes to the same order, so it is not seen as a change even though
+/// [`Character::attrs_eq`] compares both. When the lists are not parallel (different
+/// lengths, e.g. `aliases_target` absent), `aliases` is sorted alone and `aliases_target`
+/// is left untouched.
+fn sort_aliases(ch: &mut Character) {
+    if !ch.aliases.is_empty() && ch.aliases.len() == ch.aliases_target.len() {
+        let mut pairs: Vec<(String, String)> = ch
+            .aliases
+            .iter()
+            .cloned()
+            .zip(ch.aliases_target.iter().cloned())
+            .collect();
+        pairs.sort();
+        ch.aliases = pairs.iter().map(|(a, _)| a.clone()).collect();
+        ch.aliases_target = pairs.into_iter().map(|(_, t)| t).collect();
+    } else {
+        ch.aliases.sort();
+    }
 }
 
 /// The glossary terms that were added, removed, or whose entry changed, keyed by the
@@ -996,6 +1031,41 @@ mod tests {
         old.characters[4] = character("c5", "Xavier", &["X-man", "X"]);
         let mut new = base_doc();
         new.characters[4] = character("c5", "Xavier", &["X", "X-man"]);
+        assert!(affected_cues(&old, &new, &base_cues()).is_empty());
+    }
+
+    // AC: M12-AC8 (footgun) — an omitted `narration_register` (semantic default "spoken")
+    // vs an explicit "spoken" is NOT a change: `normalized()` fills the default before
+    // diffing, so `"" != "spoken"` never invalidates every translatable cue.
+    #[test]
+    fn narration_register_omitted_vs_explicit_spoken_invalidates_nothing() {
+        let mut old = base_doc();
+        old.narration_register = String::new(); // field omitted on this document
+        let mut new = base_doc();
+        new.narration_register = "spoken".to_string(); // spelled out, same meaning
+        assert!(affected_cues(&old, &new, &base_cues()).is_empty());
+    }
+
+    // AC: M12-AC8 (footgun) — a PARALLEL reorder of `aliases` and `aliases_target`
+    // (keeping the pairs aligned) is not a semantic change: `sort_aliases` sorts the two
+    // lists as pairs, so a joint reorder normalizes identically even though
+    // `attrs_eq` compares both lists.
+    #[test]
+    fn aliases_target_parallel_reorder_invalidates_nothing() {
+        let with_aliases = |aliases: &[&str], targets: &[&str]| Character {
+            id: "c5".to_string(),
+            name: "Xavier".to_string(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            aliases_target: targets.iter().map(|s| s.to_string()).collect(),
+            gender: "unknown".to_string(),
+            age_group: "adult".to_string(),
+            speech_style: "plain".to_string(),
+            ..Character::default()
+        };
+        let mut old = base_doc();
+        old.characters[4] = with_aliases(&["X-man", "X"], &["ဧက်စ်မန်", "ဧက်စ်"]);
+        let mut new = base_doc();
+        new.characters[4] = with_aliases(&["X", "X-man"], &["ဧက်စ်", "ဧက်စ်မန်"]);
         assert!(affected_cues(&old, &new, &base_cues()).is_empty());
     }
 }

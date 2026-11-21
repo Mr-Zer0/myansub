@@ -73,11 +73,12 @@ const OUTPUT_CHARS_PER_TOKEN: u64 = 4;
 /// never eats into the document's room.
 const ANALYSIS_THINKING_HEADROOM: u64 = 8_192;
 
-/// The largest `maxOutputTokens` we will ever request for analysis — a value within
-/// current Gemini Flash/Pro output-token limits, so the request itself is never
-/// rejected for an out-of-range budget. The absolute schema-maximum document can
-/// exceed this; such a pathological input may still truncate, but every realistic
-/// large-cast analysis fits well under it (see `analysis_output_budget`).
+/// The largest `maxOutputTokens` we will ever request for analysis — Gemini Flash's
+/// hard output ceiling (65,536), so the request itself is never rejected for an
+/// out-of-range budget. Realistic documents fit well under it; the absolute
+/// schema-maximum document (every array at its cap, every string at its length cap)
+/// exceeds it and may truncate. We do NOT raise this — 65,536 is the model's hard
+/// limit — so [`analysis_output_budget`] clamps to it (see `worst_case_doc_tokens`).
 const ANALYSIS_OUTPUT_CEILING: u32 = 65_536;
 
 // ---------------------------------------------------------------------------
@@ -169,27 +170,31 @@ pub fn analysis_signature(model: &str) -> String {
     format!("prompt_v{PROMPT_VERSION}|{model}")
 }
 
-/// The worst-case analysis-document size in output tokens, derived from the schema
-/// caps (`docs/DATA_MODEL.md` §3) at [`OUTPUT_CHARS_PER_TOKEN`], including per-element
-/// key/structure overhead. Used to size [`analysis_output_budget`].
+/// The worst-case analysis-document size in output tokens, computed HONESTLY from the
+/// TRUE enforced caps (`docs/DATA_MODEL.md` §3; the caps `validate_full`/user import
+/// actually enforce), at [`OUTPUT_CHARS_PER_TOKEN`] and including per-element
+/// key/structure overhead. This is the absolute schema-maximum document (every array
+/// at its cap, every string at its length cap); realistic documents are far smaller.
+///
+/// The result (~69,539 tokens) exceeds [`ANALYSIS_OUTPUT_CEILING`] (65,536, Gemini
+/// Flash's hard output limit), so [`analysis_output_budget`] clamps to the ceiling
+/// rather than covering this pathological maximum, which may truncate — we do not
+/// (and cannot) raise the ceiling to cover it.
 pub fn worst_case_doc_tokens() -> u64 {
-    // maxLength budgets × caps, plus a per-element allowance for ids, enums, keys,
-    // quotes, and separators. (`docs/DATA_MODEL.md` §3.)
+    // Per-field length caps × array caps, plus a per-element allowance for ids, enums,
+    // keys, quotes, and separators (`docs/DATA_MODEL.md` §3). Each string field is
+    // budgeted at its true enforced cap — `aliases_target` at 120 (its cap, not the
+    // parallel `aliases` 80) and each `formal_segments` note at 120 (its cap) — so the
+    // figure is the honest worst case, not one tuned to fit under the ceiling.
     // name, name_target, aliases, aliases_target, role, speech_style, +ids/enums/keys.
-    // `aliases_target` is budgeted at the parallel `aliases` allowance (80/entry, not its
-    // 120 cap): the two lists run positionally parallel, and this keeps the worst-case
-    // document within the model output ceiling (`ANALYSIS_OUTPUT_CEILING`) so the budget
-    // still covers it (ADR-049(d)).
-    let characters = 40 * (120 + 120 + 8 * 80 + 8 * 80 + 260 + 180 + 120);
+    let characters = 40 * (120 + 120 + 8 * 80 + 8 * 120 + 260 + 180 + 120);
     let address_matrix = 80 * (160 + 120 + 120 + 60 + 20 + 120); // relation, self_ref, addressee_ref, particle, honorific, +from/to/register/keys
     let glossary = 120 * (120 + 120 + 180 + 60); // term, target, note, +keep/keys
     let scenes = 120 * (300 + 80 + 60 + 60); // summary, mood, +cue_range/speakers/keys
     let lists = 12 * 180 + 12 * 220; // style_rules + unresolved_ambiguities
-    // formal_segments ≤ 60 (ADR-049(b)): each entry is tiny — two ints, two short
-    // enums (`register`/`kind`), and a note. The note is budgeted modestly at 60 (of
-    // its 120 cap), mirroring the `aliases_target` precedent above, so the worst-case
-    // document still fits under `ANALYSIS_OUTPUT_CEILING`.
-    let formal_segments = 60 * (60 + 60); // note (budgeted at 60) + cue_range/register/kind/keys
+    // formal_segments ≤ 60 (ADR-049(b)): two ints, two short enums (`register`/`kind`),
+    // and a note at its true 120 cap.
+    let formal_segments = 60 * (120 + 60); // note (120 cap) + cue_range/register/kind/keys
     let top = 500 + 160 + 40 + 256; // premise + tone + narration_register + schema_version/outer braces
     let chars: u64 =
         characters + address_matrix + glossary + scenes + lists + formal_segments + top;
@@ -199,9 +204,11 @@ pub fn worst_case_doc_tokens() -> u64 {
 /// The analysis `maxOutputTokens` budget (`docs/LLM.md` §5: "Always set
 /// `maxOutputTokens`"). The worst-case document plus thinking headroom (since
 /// `maxOutputTokens` includes thinking tokens), bounded by [`ANALYSIS_OUTPUT_CEILING`]
-/// so the request stays within the model's output limit. Comfortably above the old
-/// fixed 16 384, so a large-cast single-pass or a full merged reduce is not truncated
-/// into a content-retry failure for an input the schema permits.
+/// so the request stays within the model's hard output limit. Because the absolute
+/// schema-maximum document (`worst_case_doc_tokens`, ~69,539) now exceeds the ceiling,
+/// this clamps to [`ANALYSIS_OUTPUT_CEILING`]; realistic documents fit well under it.
+/// Still far above the old fixed 16 384, so a large-cast single-pass or a full merged
+/// reduce is not truncated into a content-retry failure for a realistic input.
 pub fn analysis_output_budget() -> u32 {
     let want = worst_case_doc_tokens().saturating_add(ANALYSIS_THINKING_HEADROOM);
     want.min(u64::from(ANALYSIS_OUTPUT_CEILING)) as u32

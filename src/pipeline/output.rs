@@ -287,16 +287,13 @@ fn restore_text(masked: &str, cue: &Cue) -> String {
 const BURMESE_SENTENCE_STOP: char = '\u{104B}';
 
 /// How a trailing ။ at the end of a cue is handled at export
-/// (`[burmese].cue_final_stop`, `docs/CONFIG.md` §6, ADR-049(e)). Applied
+/// (`[burmese].cue_final_stop`, `docs/CONFIG.md` §6, ADR-049(e), ADR-050). Applied
 /// deterministically here, never by the LLM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CueFinalStop {
-    /// Remove one trailing ။ (and trailing whitespace) at the end of the cue.
-    #[default]
-    Strip,
-    /// Leave the cue text unchanged.
-    Keep,
-}
+///
+/// The type lives in [`crate::domain`] so `config` can read the policy without
+/// depending on `pipeline` (`docs/ARCHITECTURE.md` §3); it is re-exported here for
+/// the output stage's callers.
+pub use crate::domain::CueFinalStop;
 
 /// Applies the cue-final ။ policy to one cue's restored body (ADR-049(e)).
 ///

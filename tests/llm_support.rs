@@ -30,15 +30,22 @@ fn prompt_version_is_five() {
 // matrix honorific when `from` names `to` (ADR-049(c), LLM.md §2).
 #[test]
 fn system_instructions_mention_honorifics() {
-    let analysis = prompts::analysis_system_instruction();
-    let translation = prompts::translation_system_instruction(DigitStyle::Myanmar);
+    let analysis = prompts::analysis_system_instruction().to_lowercase();
+    let translation = prompts::translation_system_instruction(DigitStyle::Myanmar).to_lowercase();
+    // M12-AC16: the analysis prompt must constrain honorifics to justified cases and
+    // forbid adding them to foreign names — not merely mention the word.
     assert!(
-        analysis.to_lowercase().contains("honorific"),
-        "analysis instruction must ask for honorifics: {analysis}"
+        analysis.contains("honorific") && analysis.contains("only where"),
+        "analysis instruction must ask for honorifics only where justified: {analysis}"
     );
     assert!(
-        translation.to_lowercase().contains("honorific"),
-        "translation instruction must use the matrix honorific: {translation}"
+        analysis.contains("foreign name"),
+        "analysis instruction must forbid honorifics on foreign names: {analysis}"
+    );
+    // M12-AC17: the translation prompt must use the matrix honorific and keep it consistent.
+    assert!(
+        translation.contains("honorific") && translation.contains("consistent"),
+        "translation instruction must use the matrix honorific consistently: {translation}"
     );
 }
 

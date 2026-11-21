@@ -633,9 +633,9 @@ impl Config {
     /// [`validate`] has already rejected.
     ///
     /// [`validate`]: Config::validate
-    /// [`CueFinalStop::Strip`]: crate::pipeline::output::CueFinalStop::Strip
-    pub fn cue_final_stop(&self) -> crate::pipeline::output::CueFinalStop {
-        use crate::pipeline::output::CueFinalStop;
+    /// [`CueFinalStop::Strip`]: crate::domain::CueFinalStop::Strip
+    pub fn cue_final_stop(&self) -> crate::domain::CueFinalStop {
+        use crate::domain::CueFinalStop;
         match self.burmese.cue_final_stop.as_str() {
             "keep" => CueFinalStop::Keep,
             _ => CueFinalStop::Strip,

@@ -27,7 +27,7 @@ use myansub::quality::checks::Limits;
 use myansub::store::repo_analysis::AnalysisOrigin;
 use myansub::store::repo_analysis::{approve_current_analysis, insert_analysis_version};
 use myansub::store::repo_cues::insert_cues;
-use myansub::store::repo_project::set_stage;
+use myansub::store::repo_project::{Project, insert_project, set_stage};
 use myansub::store::repo_translations::{
     NewTranslation, TranslationOrigin, cue_id_by_idx, get_translation, list_translations,
     upsert_translation,
@@ -209,6 +209,26 @@ fn text_response(text: &str) -> LlmResponse {
 /// Seeds an in-memory store with `cues` and an approved analysis version.
 async fn seed(cues: &[Cue]) -> Store {
     let store = Store::open_in_memory().expect("open");
+    // A real project always has its row (init inserts it); the digit-style record
+    // (ADR-050) lives on it, so the test harness must seed one too.
+    store
+        .call(|conn| {
+            insert_project(
+                conn,
+                &Project {
+                    source_path: "movie.en.srt".to_string(),
+                    source_hash: "sha256:proj".to_string(),
+                    source_format: "srt".to_string(),
+                    source_encoding: "utf-8".to_string(),
+                    encoding_confidence: None,
+                    source_lang: "en".to_string(),
+                    target_lang: "my".to_string(),
+                    format_meta: None,
+                },
+            )
+        })
+        .await
+        .expect("project");
     let cues = cues.to_vec();
     store
         .call(move |conn| insert_cues(conn, &cues))
@@ -2233,6 +2253,26 @@ async fn translation_cue_injection_stays_in_variable_block_only() {
 /// `analysis_doc` (used to plant an injection in a user-editable field).
 async fn seed_with_analysis(cues: &[Cue], analysis_doc: String) -> Store {
     let store = Store::open_in_memory().expect("open");
+    // A real project always has its row (init inserts it); the digit-style record
+    // (ADR-050) lives on it, so the test harness must seed one too.
+    store
+        .call(|conn| {
+            insert_project(
+                conn,
+                &Project {
+                    source_path: "movie.en.srt".to_string(),
+                    source_hash: "sha256:proj".to_string(),
+                    source_format: "srt".to_string(),
+                    source_encoding: "utf-8".to_string(),
+                    encoding_confidence: None,
+                    source_lang: "en".to_string(),
+                    target_lang: "my".to_string(),
+                    format_meta: None,
+                },
+            )
+        })
+        .await
+        .expect("project");
     let cues = cues.to_vec();
     store
         .call(move |conn| insert_cues(conn, &cues))
@@ -2437,5 +2477,85 @@ async fn changing_digits_marks_unlocked_stale_and_sends_nothing_until_stale_reru
     assert!(
         !texts.contains("[1]"),
         "locked cue 1 must never be re-sent: {texts}"
+    );
+}
+
+// AC: M12-AC14 (idempotency, ADR-050) — once a digit change has been reconciled (the
+// `project.translation_digits` record updated), a SECOND plain run with the SAME digit
+// style is a no-op: it detects no change, marks nothing further, and sends nothing. This
+// is the idempotency guarantee that lets the record (not the batch `input_hash`) drive
+// digit staleness without thrashing.
+#[tokio::test]
+async fn changing_digits_reconciliation_is_idempotent() {
+    let cues = mixed_cues(); // translatable [1,2,4,5]
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    let noop = || std::sync::Arc::new(myansub::pipeline::progress::NoopProgress);
+
+    // Run 1 (myanmar): everything translated.
+    let fake1 = Fake::new().always(|| Ok(lines_response(&[(1, MM), (2, MM), (4, MM), (5, MM)])));
+    run_translation(
+        fake1,
+        &store,
+        &cues,
+        &params_digits(2, DigitStyle::Myanmar),
+        TranslationFlags::default(),
+        &token,
+        noop(),
+    )
+    .await
+    .expect("run 1");
+
+    // Run 2 (western, plain): reconciliation marks the unlocked cues stale.
+    let fake2 = Fake::new().always(|| Ok(lines_response(&[(1, MM)])));
+    run_translation(
+        fake2.clone(),
+        &store,
+        &cues,
+        &params_digits(2, DigitStyle::Western),
+        TranslationFlags::default(),
+        &token,
+        noop(),
+    )
+    .await
+    .expect("run 2");
+    assert_eq!(fake2.call_count(), 0, "reconciling run sends nothing");
+    let stale_after_2 = store
+        .call(|c| list_translations(c))
+        .await
+        .expect("list")
+        .iter()
+        .filter(|r| r.stale)
+        .count();
+    assert_eq!(
+        stale_after_2, 4,
+        "all four unlocked cues stale after the switch"
+    );
+
+    // Run 3 (western again, plain): the record already reads western, so NOTHING changes
+    // and nothing is sent — idempotent.
+    let fake3 = Fake::new().always(|| Ok(lines_response(&[(1, MM)])));
+    run_translation(
+        fake3.clone(),
+        &store,
+        &cues,
+        &params_digits(2, DigitStyle::Western),
+        TranslationFlags::default(),
+        &token,
+        noop(),
+    )
+    .await
+    .expect("run 3");
+    assert_eq!(fake3.call_count(), 0, "second same-digit run sends nothing");
+    let stale_after_3 = store
+        .call(|c| list_translations(c))
+        .await
+        .expect("list")
+        .iter()
+        .filter(|r| r.stale)
+        .count();
+    assert_eq!(
+        stale_after_3, stale_after_2,
+        "a repeated same-digit run marks nothing further (idempotent)"
     );
 }

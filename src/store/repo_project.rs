@@ -6,7 +6,7 @@
 //! [`rusqlite::Connection`] (obtained inside a [`super::db::Store::call`] closure)
 //! and keep their work short (`docs/ARCHITECTURE.md` §7).
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::db::StoreError;
 
@@ -139,6 +139,35 @@ pub fn get_output_prefs(conn: &Connection) -> Result<(Option<String>, Option<Str
         )
         .optional()?;
     Ok(prefs.unwrap_or((None, None)))
+}
+
+/// Reads the recorded translation digit style (`project.translation_digits`,
+/// `docs/DATA_MODEL.md` §2, ADR-050). `None` when the column is `NULL` ("not yet
+/// recorded") or when no project row exists. The translation stage compares this
+/// against the current `[burmese].digits` to decide whether a digit-style change
+/// should mark all unlocked translations stale (`docs/LLM.md` §7).
+pub fn get_translation_digits(conn: &Connection) -> Result<Option<String>, StoreError> {
+    let value: Option<Option<String>> = conn
+        .query_row(
+            "SELECT translation_digits FROM project WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.flatten())
+}
+
+/// Records the translation digit style on the project row within the caller's
+/// transaction (`docs/DATA_MODEL.md` §2, ADR-050). Written when the translation
+/// batches are first created and updated when a digit-style change marks all unlocked
+/// translations stale, so both state changes land in one transaction with the work
+/// they describe (`docs/ARCHITECTURE.md` §6 rule 1).
+pub fn set_translation_digits_in_tx(tx: &Transaction, digits: &str) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE project SET translation_digits = ?1 WHERE id = 1",
+        params![digits],
+    )?;
+    Ok(())
 }
 
 /// A pipeline stage (`docs/ARCHITECTURE.md` §2).
