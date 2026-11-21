@@ -911,3 +911,12 @@ moved the hash" was a false premise. (Reliability QA, M12.)
   no LLM calls — a re-export with the new value suffices. See ADR-049(e).
 - **`CueFinalStop` and `DigitStyle` both live in `domain`** (not `pipeline`), so `config` depends only on `domain`
   and no `config ↔ pipeline` cycle is introduced (`ARCHITECTURE.md` §3).
+
+Consequence / known edge: a project whose translation batches were created BEFORE migration 4 (i.e. straddling the
+M12 upgrade with batches already present) keeps `translation_digits = NULL` permanently — the fresh-create block
+that records it is skipped (batches exist) and the reconcile block requires `Some(recorded)` to fire. A later
+`[burmese].digits` change on such a legacy project is therefore not auto-reconciled (it errs toward
+UNDER-invalidation — never corrupts, never re-pays; `--redo` or a cache prune still forces a fresh translation).
+Fresh M12-era projects record the style on first translation and are unaffected. Acceptable for v1 (cache cold, no
+straddling production projects); a future migration could backfill `translation_digits` for existing projects if
+the upgrade path matters.

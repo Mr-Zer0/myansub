@@ -61,8 +61,10 @@ pub fn analysis_system_instruction() -> String {
 /// ADR-049(e)): the instruction asks the model to write numbers in Myanmar ၀–၉ or
 /// Western 0–9 accordingly. The punctuation rule (။ ends sentences, ၊ separates
 /// clauses, never the Latin full stop) is stated regardless of digit style. The
-/// digit style is a config-driven prompt variant captured by the `input_hash` and
-/// the local-cache key, not a [`PROMPT_VERSION`] change.
+/// digit style is a config-driven prompt variant captured by the local-cache key
+/// (it varies this system instruction) and the project-level `translation_digits`
+/// record — deliberately NOT the `input_hash` — not a [`PROMPT_VERSION`] change
+/// (ADR-050).
 pub fn translation_system_instruction(digits: crate::domain::DigitStyle) -> String {
     let numerals = match digits {
         crate::domain::DigitStyle::Myanmar => {
