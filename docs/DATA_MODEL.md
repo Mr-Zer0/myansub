@@ -184,6 +184,26 @@ later run marks all unlocked translations stale if the current `digits` setting 
 from the recorded value (`LLM.md` §7, ADR-050). Append-only, so existing projects migrate
 without data loss.
 
+### Migration 5 — provider columns on `llm_calls` (ADR-051/052)
+
+```sql
+ALTER TABLE llm_calls ADD COLUMN provider        TEXT;  -- gemini|openrouter
+ALTER TABLE llm_calls ADD COLUMN generation_id   TEXT;  -- OpenRouter usage.id, nullable
+ALTER TABLE llm_calls ADD COLUMN served_provider TEXT;  -- upstream provider OpenRouter routed to, nullable
+ALTER TABLE llm_calls ADD COLUMN served_tier     TEXT;  -- tier OpenRouter actually served, nullable
+```
+
+All four columns are nullable. `provider` records which provider served the call (`gemini` or
+`openrouter`); `generation_id` / `served_provider` / `served_tier` are filled only by OpenRouter
+(`LLM.md` §10.5) and read `NULL` for Gemini. `ALTER TABLE ADD COLUMN` is append-only, so existing
+projects migrate without data loss.
+
+`translation_batches.model` and `translations.model` now store the **full `provider:model`
+reference** (e.g. `openrouter:anthropic/claude-sonnet-5.5`, or `gemini:gemini-flash-latest`) rather
+than a bare model id — a value change only, no DDL. The provider is likewise part of the local
+cache key (`llm_cache`, `LLM.md` §4), so a `gemini:` and an `openrouter:` request for byte-identical
+text never collide.
+
 ## 3. Analysis document (schema_version 1)
 
 Prose fields are written in English. The array caps and the per-field string-length limits
@@ -293,13 +313,16 @@ Provenance (`source_digest`, `signature`) is stored in table columns, not in the
 
 ```
 empty | placeholder_mismatch | untranslated | zawgyi_suspect | boundary_drift
-| glossary_miss | digit_style | too_long | too_fast | failed
+| glossary_miss | digit_style | too_long | too_fast | refused | failed
 ```
 
 `digit_style` (ADR-049, PBI-003) is set when a translated cue contains digits of the system
 *not* chosen in `[burmese].digits` (placeholder contents excluded). `glossary_miss` now also
 covers character names: if a source cue contains a character name or alias, the translation
-must contain the matching `name_target` / `aliases_target` spelling (`LLM.md` §8).
+must contain the matching `name_target` / `aliases_target` spelling (`LLM.md` §8). `refused`
+(ADR-051, PBI-009) is set when a provider refused the batch on moderation/guardrail grounds
+(OpenRouter 403 → `ErrorClass::ContentRefused`, `LLM.md` §10.6); the batch fails but the run
+continues.
 
 Serialized as snake_case strings in `translations.flags`.
 

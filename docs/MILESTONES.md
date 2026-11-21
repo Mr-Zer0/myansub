@@ -269,7 +269,112 @@ Myanmar digits (၀–၉) by default; cue-final ။ stripped at export by defau
 - M12-AC26 `PROMPT_VERSION` bumped once (covers PBI-002-AC9, PBI-003-AC6, PBI-004-AC6, PBI-005-AC7);
   bump reason recorded in `prompts.rs` and `DECISIONS.md` ADR-049.
 
+## M13 — OpenRouter as a second LLM provider (PBI-009)
+
+Keep Gemini as the default provider and add OpenRouter as a second transport, so any model
+available on OpenRouter can be chosen per stage or per run and compared without giving up the
+current setup. Gemini keeps everything in `LLM.md` §1–§9 (Flex tier, implicit/explicit caching,
+`RetryInfo`, price table). The shared layers (local cache, metering, retry engine, scheduler,
+prompts, quality checks) stay provider-agnostic. See `DECISIONS.md` ADR-051 (provider-neutral core
++ OpenRouter adapter) and ADR-052 (migration 5 + env-var key resolution; PBI-008 deferred).
+
+Because the codebase is already past M3 and M6, PBI-009's two conceptual slices (provider-neutral
+core, "cheap, with the Gemini transport"; OpenRouter adapter, "when translation works end to end")
+land together on one feature branch as this milestone. `PROMPT_VERSION` is unchanged — no prompt
+text changes (ADR-051).
+
+**Deviation from the PBI (ADR-052):** the PBI's AC6 referenced PBI-008 (a stored credential
+account + `auth set|status|remove` command), which is not implemented. Per the product owner, PBI-008
+is dropped for now: key resolution is **env-var only** (`GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
+resolved lazily so a missing key fails only when a stage actually uses that provider. No `auth`
+command, no stored accounts, no new crate.
+
+Docs: `LLM.md` §10, `ARCHITECTURE.md` §3/§5, `DATA_MODEL.md` §2/§5, `CONFIG.md`, `config.example`,
+`CLI.md`.
+
+### Provider-neutral core (PBI-009 A)
+
+- M13-AC1 (=PBI-009-AC1) Model references have the form `[provider:]model`, providers `gemini` and
+  `openrouter`. A reference with no prefix uses `llm.default_provider` (default `"gemini"`). Works in
+  config (`[llm.models]`) and on the CLI (`--model`). Unknown provider → exit 2. Example:
+  `translation = "openrouter:anthropic/claude-sonnet-5.5"`.
+- M13-AC2 (=PBI-009-AC2) `LlmRequest`, `LlmResponse`, and `Usage` are provider-neutral: message
+  roles, a "cached prefix ends here" marker, JSON schema, reasoning level, tier (`flex | default |
+  floor`), max output tokens; `Usage` fields are optional and include `cost_usd`. Provider-specific
+  field names appear only in `llm/gemini.rs` and `llm/openrouter.rs` (verified with grep).
+- M13-AC3 (=PBI-009-AC3) A provider-routing transport routes each request to the provider named in
+  its model reference. Both providers sit under the same `Metered → Cached → Retrying` layers.
+- M13-AC4 (=PBI-009-AC4) Each transport supplies `classify(&RawError) -> ErrorClass`; the retry
+  policy engine stays provider-agnostic. `ErrorClass` gains `Credits` (stop the run before further
+  dispatch) and `ContentRefused` (batch failed with a new `refused` flag; run continues).
+- M13-AC5 (=PBI-009-AC5) The provider is part of the local cache key; `llm_calls` gains a `provider`
+  column (migration 5); `translation_batches.model` and `translations.model` store the full
+  `provider:model` reference.
+- M13-AC6 (=PBI-009-AC6, reduced) Keys per provider: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+  resolved from the environment. A missing key fails only when a stage actually uses that provider.
+  (The PBI-008 stored-account store and `auth` command are deferred — ADR-052.)
+- M13-AC7 (=PBI-009-AC7) `ModelCatalog` trait supplies model validation, context length, supported
+  parameters, and prices. Gemini implementation: the `[pricing]` config table (as today).
+  `pricing.rs` reads prices only through the catalog.
+
+### OpenRouter adapter (PBI-009 B)
+
+- M13-AC8 (=PBI-009-AC8) `llm/openrouter.rs` sends `POST {base_url}/chat/completions` (default
+  `https://openrouter.ai/api/v1`), `Authorization: Bearer <key>`, messages in the cache-friendly
+  order of `LLM.md` §2: system (rules + style pack) → user (analysis sheet, `cache_control:
+  {type:"ephemeral"}` on its last block) → user (variable block). Every request of a stage sends the
+  same `session_id` (sha256 of source hash + stage + analysis version) for sticky routing. A wiremock
+  test asserts the request shape.
+- M13-AC9 (=PBI-009-AC9) Structured output: `response_format` `json_schema` with `strict: true` and
+  `provider.require_parameters = true`. A model without structured-output support (per catalog) fails
+  at startup, exit 2.
+- M13-AC10 (=PBI-009-AC10) `max_tokens` always set. Reasoning level maps to `reasoning.effort`,
+  falling back to the nearest supported lower level from the catalog (one warning per run).
+  `finish_reason = "length"` is a content failure (split / retry missing lines), not a transport retry.
+- M13-AC11 (=PBI-009-AC11) Usage parsing fills `prompt_tokens`, `cached_tokens`, `cache_write_tokens`,
+  `completion_tokens`, `reasoning_tokens`, `cost_usd` (actual, from `usage.cost`), and new `llm_calls`
+  columns `generation_id`, `served_provider`, `served_tier`.
+- M13-AC12 (=PBI-009-AC12) OpenRouter catalog: `GET {base_url}/models`, cached in the user cache
+  directory for 24 h (atomic write), stale cache used with a warning when offline. Used for model-id
+  validation (unknown id → exit 2 with up to 5 closest ids), parameters, reasoning levels, and prices
+  for dry-run estimates.
+- M13-AC13 (=PBI-009-AC13) Error handling detects non-200 statuses and errors inside a 200 body (top
+  level or `choices[0]`). One wiremock test per row of the §10 error table (400 fatal/unit;
+  401 fatal/stop; 402 Credits/stop; 403 moderation → ContentRefused; 408/429/502 retryable honoring
+  `Retry-After`; 503 no-provider retryable ×3 then fatal naming the routing settings).
+- M13-AC14 (=PBI-009-AC14) Config `[llm.openrouter]`: `tier = "floor" | "flex" | "default"` (default
+  `"floor"`: cheapest endpoint incl. flex, automatic fallback), `data_collection = "deny"` (default),
+  `zdr = false`, `attribution = false` (when true, send `X-OpenRouter-Title: myansub`).
+- M13-AC15 (=PBI-009-AC15) Free models: `:free` model ids are accepted and estimated at $0. If routing
+  fails because free endpoints require allowing data collection, the error names the `data_collection`
+  setting.
+- M13-AC16 (=PBI-009-AC16) `myansub models list [--provider p] [FILTER]` prints id, input/output price
+  per 1M tokens, context length, structured-output support. For `gemini`, entries come from the price
+  table.
+- M13-AC17 (=PBI-009-AC17) Docs updated: `LLM.md` §10, `ARCHITECTURE.md` module tree + deps,
+  `DATA_MODEL.md` new columns and flag, `CONFIG.md` + `config.example` (`[llm.default_provider]`,
+  `[llm.openrouter]`, prefixed model example), `CLI.md` (`--provider`, `models list`), ADR-051/052.
+- M13-AC18 (=PBI-009-AC18) All tests offline (wiremock for both providers; trimmed catalog fixture).
+  Parity test: equivalent fixtures through both transports produce equal parsed `LlmResponse` and
+  `Usage` (except provider-only fields). `PROMPT_VERSION` unchanged unless prompt text changes.
+
+**Accept:**
+- Model-reference parsing: prefixed/unprefixed/`default_provider`/unknown-provider (exit 2), in config
+  and `--model`.
+- Router dispatches each request to its provider under one `Metered<Cached<Retrying<_>>>` stack; the
+  provider is in the local cache key (a `gemini:` and an `openrouter:` request for the same text never
+  collide).
+- Gemini wiremock suite still passes unchanged; OpenRouter wiremock suite covers request shape,
+  structured output, usage parsing, and every §10 error row.
+- Catalog: unknown OpenRouter id → exit 2 with ≤5 closest ids; 24 h cache written atomically; stale
+  cache used with a warning when the fetch fails.
+- `models list` for both providers prints id, prices, context length, structured-output support.
+- Parity test green; `grep` finds no provider-specific wire field name outside `gemini.rs` /
+  `openrouter.rs`; `PROMPT_VERSION` still `5`.
+
 ## Later (not v1)
 
 TXT support, Batch API mode, series projects with cross-episode memory, other target
-languages, optional per-cue speaker attribution, budget caps.
+languages, optional per-cue speaker attribution, budget caps. **PBI-008** (stored credential
+accounts + `auth set|status|remove` command, OS keychain) is deferred (ADR-052); until it lands,
+API keys are env-var only.

@@ -277,3 +277,126 @@ Thresholds are configurable and must be tuned after native-speaker review.
   `ceil(utf8_bytes / bytes_per_token)` per script (config; Burmese is much denser than Latin),
   and output tokens via `output_ratio`. Nothing is written except `llm_calls` rows marked
   `dry_run = 1`, which are deleted at the end of the dry run after the report is printed.
+
+## 10. OpenRouter transport (ADR-051/052, M13)
+
+OpenRouter is a second provider. **Gemini stays the default and keeps everything in §1–§9**; this
+section covers only the OpenRouter adapter. The shared layers — local cache (§4), metering, retry
+engine (§6), scheduler, prompts (§2), quality checks (§8) — are provider-agnostic. Provider-specific
+wire field names live only in `llm/openrouter.rs` (as Gemini's do in `llm/gemini.rs`).
+
+> OpenRouter API details (tier/sort parameters, free-model routing policy) change over time. Items
+> marked **[verify]** must be checked against the current OpenRouter docs when implementing.
+
+### 10.1 Model references and routing
+
+- A model reference is `[provider:]model` (ADR-051a). `openrouter:anthropic/claude-sonnet-5.5` routes
+  to OpenRouter with the bare id `anthropic/claude-sonnet-5.5`; `gemini-flash-latest` (no prefix) uses
+  `llm.default_provider` (default `gemini`). An unknown provider prefix → **exit 2**.
+- The `provider` half is never sent on the wire; it selects the transport (`llm::Router`, ADR-051c) and
+  is folded into the local cache key (§4) and the stored `model` columns (`DATA_MODEL.md` §2).
+- Keys are env-var only (ADR-052a): `OPENROUTER_API_KEY`. A missing key fails only when a stage
+  dispatches to OpenRouter.
+
+### 10.2 Transport
+
+- Endpoint: `POST {base_url}/chat/completions` (default `base_url = https://openrouter.ai/api/v1`).
+- Auth header: `Authorization: Bearer $OPENROUTER_API_KEY`.
+- Messages in the cache-friendly order of §2:
+  1. `role: "system"` — the Burmese rules + style pack (the §2 `systemInstruction` text).
+  2. `role: "user"` — the analysis sheet (canonical JSON, §2 `contents[0]`), with
+     `cache_control: {type: "ephemeral"}` on its last content block (the "cached prefix ends here"
+     marker, ADR-051b).
+  3. `role: "user"` — the variable block (§2 `contents[1]`): scene, context, lines to translate.
+  The text of all three blocks is byte-identical to the Gemini path, so `PROMPT_VERSION` is unchanged.
+- **Sticky routing.** Every request of a stage sends the same `session_id` = sha256 of
+  `source_hash + stage + analysis_version`, so OpenRouter keeps a stage on one upstream endpoint
+  (better implicit caching and consistency). **[verify]** the current field name for session affinity.
+- `max_tokens` is always set (§5.8, same budget as Gemini's `maxOutputTokens`).
+- Timeout per request from config; one shared `reqwest::Client`.
+- `[llm.openrouter].attribution = true` sends `X-OpenRouter-Title: myansub` (off by default).
+
+### 10.3 Structured output
+
+- `response_format` = `{type: "json_schema", json_schema: {name, strict: true, schema: <llm/schemas.rs>}}`
+  and `provider.require_parameters = true` (so only endpoints honoring the schema are routed to).
+- A model the catalog reports as lacking structured-output support fails **at startup, exit 2** (before
+  any request is sent).
+
+### 10.4 Reasoning and output
+
+- Reasoning level maps to `reasoning.effort`. If the model does not support the requested level (per
+  catalog), fall back to the **nearest supported lower level** and emit **one warning per run**.
+- `finish_reason = "length"` is a **content failure** (handled by the pipeline's content retries — split
+  or re-request missing lines, §6), **not** a transport retry.
+
+### 10.5 Usage parsing
+
+Fill the neutral `Usage` (§1 types; ADR-051b) from OpenRouter's `usage`:
+
+| `Usage` field | Source |
+|---|---|
+| `prompt_tokens` | `usage.prompt_tokens` |
+| `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` (when present) |
+| `cache_write_tokens` | cache-write tokens when the response reports them |
+| `completion_tokens` (`output_tokens`) | `usage.completion_tokens` |
+| `reasoning_tokens` | `usage.completion_tokens_details.reasoning_tokens` (when present) |
+| `cost_usd` | `usage.cost` (actual) |
+
+New `llm_calls` columns (`DATA_MODEL.md` §2): `generation_id` (`id`), `served_provider` (the upstream
+provider OpenRouter routed to), `served_tier`. Gemini leaves these `NULL`.
+
+### 10.6 Error handling
+
+Detect non-200 statuses **and** errors inside a 200 body (top level `error`, or `choices[0].error` /
+`choices[0].finish_reason: "error"`). `openrouter.rs::classify(&RawError) -> ErrorClass` maps them; the
+retry engine (§6) stays provider-agnostic. One wiremock test per row:
+
+| Condition | Class / behaviour |
+|---|---|
+| 400 | `Fatal` — unit fails, run continues |
+| 401 | `Fatal`, run stops: "check key: set `OPENROUTER_API_KEY`" |
+| 402 | `Credits` — run stops: "add OpenRouter credits, or use a `:free` model" |
+| 403 moderation / guardrail | `ContentRefused` — batch fails with the `refused` flag; run continues |
+| 408, 429, 502 | `Retryable`, honor `Retry-After` if present |
+| 503 (no provider meets routing) | `Retryable` ×3, then `Fatal` naming the routing settings (`tier`, `data_collection`, `zdr`) |
+
+`ErrorClass::Credits` and `ErrorClass::ContentRefused` are new (ADR-051e). `Credits` surfaces to `main`
+as a run-stopping error (before further dispatch); `ContentRefused` is a content failure (no transport
+retry) that marks the batch `failed` and records the `refused` flag.
+
+### 10.7 Config `[llm.openrouter]`
+
+| Key | Values | Default | Effect |
+|---|---|---|---|
+| `tier` | `floor` \| `flex` \| `default` | `floor` | `floor` = cheapest endpoint (incl. flex) with automatic fallback. **[verify]** the current tier/sort parameter. |
+| `data_collection` | `deny` \| `allow` | `deny` | Whether endpoints that train on data are allowed. |
+| `zdr` | bool | `false` | Require zero-data-retention endpoints. |
+| `attribution` | bool | `false` | When true, send `X-OpenRouter-Title: myansub`. |
+
+### 10.8 Free models
+
+- `:free` model ids (e.g. `meta-llama/llama-3.1-8b-instruct:free`) are accepted and estimated at **$0**
+  in dry-run.
+- If routing fails because free endpoints require allowing data collection, the error says so and names
+  the `data_collection` setting. **[verify]** the current free-model routing policy.
+
+### 10.9 Catalog (`llm/catalog.rs`, ADR-051f/052b)
+
+- `trait ModelCatalog` supplies model validation, context length, supported parameters (structured-output
+  support, reasoning levels), and prices. `pricing.rs` reads prices only through the catalog.
+- `GeminiCatalog`: backed by the `[pricing]` table (§9, unchanged).
+- `OpenRouterCatalog`: `GET {base_url}/models`, cached in the **user cache directory**
+  (`myansub/openrouter-models.json`) for **24 h**, written atomically (ADR-052b). On a failed fetch a
+  present-but-stale cache is used with one warning; with no cache and no network, a catalog-dependent
+  command fails clearly. Used for: id validation (unknown id → **exit 2** with up to **5 closest** ids),
+  parameters, reasoning levels, and prices for dry-run estimates.
+
+### 10.10 Parity and tests
+
+- All tests offline: wiremock for both providers; a trimmed `/models` catalog fixture; the on-disk cache
+  uses a `tempfile` dir.
+- **Parity test:** equivalent fixtures through the Gemini and OpenRouter transports produce equal parsed
+  `LlmResponse` and `Usage`, except provider-only fields (`cost_usd`, `generation_id`, `served_provider`,
+  `served_tier`, `applied_tier`).
+- `PROMPT_VERSION` is unchanged unless prompt text changes (it does not for M13).

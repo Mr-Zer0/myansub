@@ -108,7 +108,19 @@ myansub review approve
 myansub export [--output-format F] [-o PATH] [--allow-incomplete]
 
 myansub cache prune [--older-than DAYS]
+
+myansub models list [--provider gemini|openrouter] [FILTER]
+    List available models with id, input/output price per 1M tokens, context length, and
+    structured-output support. --provider filters to one provider (default: both). FILTER is a
+    case-insensitive substring match on the id. Gemini entries come from the [pricing] table;
+    OpenRouter entries from its cached /models catalog (LLM.md §10.9).
 ```
+
+**Model references.** `--model M` (on `analyze` / `translate`) and the `[llm.models]` config keys
+accept `[provider:]model` (providers `gemini`, `openrouter`). A reference with no prefix uses
+`llm.default_provider` (default `gemini`). Example: `--model openrouter:anthropic/claude-sonnet-5.5`.
+An unknown provider prefix, or (for OpenRouter) an unknown model id, exits 2 — the id error lists up
+to 5 closest ids (`LLM.md` §10.9).
 
 Commands that spend tokens print an estimate and ask for confirmation when the estimate
 exceeds `confirm_above_usd` (config), unless `--yes`.
