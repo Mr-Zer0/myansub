@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use myansub::llm::catalog::{ModelCatalog, OpenRouterCatalog, ReasoningLevel};
 use myansub::llm::client::{
     ContentBlock, GenerationConfig, LlmClient, LlmError, LlmRequest, ServiceTier, ThinkingSetting,
 };
@@ -47,6 +48,30 @@ fn request() -> LlmRequest {
             thinking: ThinkingSetting::Off,
         },
     }
+}
+
+fn request_with_thinking(thinking: ThinkingSetting) -> LlmRequest {
+    LlmRequest {
+        generation_config: GenerationConfig {
+            thinking,
+            ..request().generation_config
+        },
+        ..request()
+    }
+}
+
+/// Builds a transport whose config carries the given catalog-derived reasoning levels.
+fn openrouter_with_levels(server: &MockServer, levels: Vec<ReasoningLevel>) -> OpenRouter {
+    OpenRouter::new(
+        server.uri(),
+        API_KEY,
+        Duration::from_secs(120),
+        OpenRouterConfig {
+            reasoning_levels: levels,
+            ..OpenRouterConfig::default()
+        },
+    )
+    .expect("build openrouter")
 }
 
 fn success_body() -> serde_json::Value {
@@ -303,6 +328,78 @@ async fn error_503_retries_then_fatal_naming_routing() {
     assert!(msg.contains("tier"), "should name routing settings: {msg}");
     assert!(msg.contains("data_collection"), "{msg}");
     assert!(msg.contains("zdr"), "{msg}");
+}
+
+// AC: M13-AC10 — the transport downgrades a request's reasoning effort to the nearest
+// supported LOWER level on the wire when the model (per the catalog-derived config)
+// does not support the requested level. LLM.md §10.4.
+#[tokio::test]
+async fn reasoning_effort_downgraded_to_nearest_lower_on_wire() {
+    let server = MockServer::start().await;
+    mount_once(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_body()),
+    )
+    .await;
+
+    // A model reporting only [minimal, low] (a trimmed catalog subset). A `High`
+    // request must be downgraded to `low` (the nearest supported lower level).
+    let transport =
+        openrouter_with_levels(&server, vec![ReasoningLevel::Minimal, ReasoningLevel::Low]);
+    transport
+        .generate(request_with_thinking(ThinkingSetting::High))
+        .await
+        .expect("request succeeds");
+
+    let received = server.received_requests().await.expect("has request log");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(
+        body["reasoning"]["effort"], "low",
+        "High must downgrade to the nearest supported lower level, got {:?}",
+        body["reasoning"]
+    );
+}
+
+// AC: M13-AC10 — a non-reasoning OpenRouter model (per the catalog) never receives
+// `reasoning.effort`, so `provider.require_parameters=true` cannot turn it into a 503.
+// This threads the catalog's `supported_reasoning_levels` (empty) into the transport.
+// LLM.md §10.4.
+#[tokio::test]
+async fn reasoning_omitted_for_non_reasoning_catalog_model() {
+    let server = MockServer::start().await;
+    mount_once(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_body()),
+    )
+    .await;
+
+    // A trimmed /models fixture whose model declares no `reasoning` parameter.
+    let catalog_body = serde_json::json!({
+        "data": [ {
+            "id": BARE,
+            "context_length": 32768,
+            "pricing": { "prompt": "0.000001", "completion": "0.000002" },
+            "supported_parameters": ["response_format", "max_tokens"]
+        } ]
+    });
+    let catalog = OpenRouterCatalog::from_models_bytes(catalog_body.to_string().as_bytes())
+        .expect("parse catalog");
+    let levels = catalog.supported_reasoning_levels(BARE);
+    assert!(levels.is_empty(), "fixture model has no reasoning support");
+
+    let transport = openrouter_with_levels(&server, levels);
+    transport
+        .generate(request_with_thinking(ThinkingSetting::High))
+        .await
+        .expect("request succeeds");
+
+    let received = server.received_requests().await.expect("has request log");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert!(
+        body.get("reasoning").is_none(),
+        "a non-reasoning model must not receive reasoning.effort, got {:?}",
+        body.get("reasoning")
+    );
 }
 
 // AC: M13-AC13 — an error inside a 200 body (choices[0].error) is detected.
