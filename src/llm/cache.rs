@@ -249,6 +249,20 @@ mod tests {
         assert_ne!(cache_key(&request(ServiceTier::Flex)), cache_key(&other));
     }
 
+    #[test]
+    fn cache_key_differs_when_provider_differs() {
+        // AC: M13-AC5 — the provider is part of the local cache key (it is folded in
+        // through the full `provider:model` reference carried in `req.model`). Two
+        // requests identical except their provider prefix must never collide, so a
+        // `gemini:` and an `openrouter:` call for byte-identical text keep separate
+        // cache entries. Would fail if the provider half were stripped before hashing.
+        let mut gemini = request(ServiceTier::Flex);
+        gemini.model = "gemini:foo".to_string();
+        let mut openrouter = request(ServiceTier::Flex);
+        openrouter.model = "openrouter:foo".to_string();
+        assert_ne!(cache_key(&gemini), cache_key(&openrouter));
+    }
+
     #[tokio::test]
     async fn request_differing_in_contents_is_a_miss() {
         // AC: M3-AC3 — committing one request must not satisfy a different one; a
