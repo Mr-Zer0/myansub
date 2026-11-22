@@ -19,8 +19,8 @@ use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewE
 use myansub::llm::client::{LlmError, Secret};
 use myansub::llm::pricing::{Cost, PriceTable};
 use myansub::llm::{
-    DryRun, Estimator, Gemini, GeminiCatalog, ModelInfo, OpenRouter, OpenRouterCatalog,
-    OpenRouterConfig, Router, catalog_cache_path,
+    DryRun, Estimator, Gemini, GeminiCatalog, ModelCatalog, ModelInfo, OpenRouter,
+    OpenRouterCatalog, OpenRouterConfig, Router, catalog_cache_path,
 };
 use myansub::pipeline::analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, DryRunReport, analysis_exit_code,
@@ -271,6 +271,11 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
             )
             .await
         } else {
+            // OpenRouter models are validated against the catalog before any request
+            // is sent (M13-AC9/AC12): an unknown id or a model without structured
+            // output exits 2. Gemini models are a no-op.
+            ensure_model_supported(&config, &config.llm.models.analysis).await?;
+            ensure_model_supported(&config, &config.llm.models.translation).await?;
             // Cost-confirmation gate (docs/CLI.md §4/§5): `--auto-approve` does not
             // imply `--yes`, so the gate still applies to an auto-approving run.
             // `build_router` runs only once the gate is cleared.
@@ -515,6 +520,10 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
             return Ok(exit::SUCCESS);
         }
 
+        // An OpenRouter analysis model is validated against the catalog before any
+        // request is sent (M13-AC9/AC12); a Gemini model is a no-op.
+        ensure_model_supported(&config, &config.llm.models.analysis).await?;
+
         // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6).
         let signal_token = token.clone();
         tokio::spawn(async move {
@@ -610,6 +619,10 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
             print_translation_dry_run(&report);
             return Ok(exit::SUCCESS);
         }
+
+        // An OpenRouter translation model is validated against the catalog before any
+        // request is sent (M13-AC9/AC12); a Gemini model is a no-op.
+        ensure_model_supported(&config, &config.llm.models.translation).await?;
 
         // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6).
         let signal_token = token.clone();
@@ -1120,6 +1133,38 @@ fn run_models_command(cli: &Cli, command: &ModelsCommand) -> anyhow::Result<i32>
     }
 
     Ok(exit::SUCCESS)
+}
+
+/// Validates an OpenRouter-routed model against the catalog before any request is
+/// sent (M13-AC9/AC12): an unknown id lists up to five close ids and exits 2; a model
+/// without structured-output support exits 2. A Gemini model (or an unparseable ref,
+/// already rejected by `validate_model_refs`) is a no-op, so a Gemini-only run never
+/// touches the network here.
+async fn ensure_model_supported(config: &Config, raw_model: &str) -> Result<(), PipelineError> {
+    use myansub::domain::{ModelRef, Provider};
+    let Ok(model_ref) = ModelRef::parse(raw_model, config.default_provider()) else {
+        return Ok(());
+    };
+    if model_ref.provider != Provider::OpenRouter {
+        return Ok(());
+    }
+    let cache = catalog_cache_path().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("myansub")
+            .join("openrouter-models.json")
+    });
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    let catalog = OpenRouterCatalog::load(
+        &client,
+        &config.llm.openrouter.base_url,
+        &cache,
+        std::time::SystemTime::now(),
+    )
+    .await?;
+    catalog.validate(&model_ref.model)?;
+    Ok(())
 }
 
 /// Loads the OpenRouter catalog for `models list` (fetch + 24 h cache, ADR-052b).

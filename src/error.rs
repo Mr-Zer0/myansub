@@ -8,6 +8,7 @@
 pub use crate::config::ConfigError;
 pub use crate::formats::codec::FormatError;
 pub use crate::formats::encoding::EncodingError;
+pub use crate::llm::catalog::CatalogError;
 pub use crate::llm::client::LlmError;
 pub use crate::pipeline::PipelineError;
 pub use crate::project::ProjectError;
@@ -95,6 +96,9 @@ impl ExitCode for PipelineError {
             PipelineError::OutputFormatExtensionMismatch { .. } => exit::USAGE,
             // An unknown `provider:` prefix is a usage error (exit 2, ADR-051a).
             PipelineError::InvalidModel(_) => exit::USAGE,
+            // An unknown/unsupported OpenRouter model is a usage error (exit 2); an
+            // unavailable catalog is a generic error (exit 1, ADR-051f/052b).
+            PipelineError::Catalog(e) => e.exit_code(),
             // A missing API key is a generic error (exit 1), not a precondition.
             PipelineError::MissingApiKey => exit::ERROR,
             PipelineError::ProjectResolution(err) => err.exit_code(),
@@ -103,6 +107,20 @@ impl ExitCode for PipelineError {
             PipelineError::Store(err) => err.exit_code(),
             PipelineError::Llm(err) => err.exit_code(),
             PipelineError::Io { .. } => exit::ERROR,
+        }
+    }
+}
+
+impl ExitCode for CatalogError {
+    /// An unknown model id and a model without structured-output support are usage
+    /// errors (exit 2, `docs/LLM.md` §10.3/§10.9); an unavailable catalog is a
+    /// generic error (exit 1).
+    fn exit_code(&self) -> i32 {
+        match self {
+            CatalogError::UnknownModel { .. } | CatalogError::NoStructuredOutput { .. } => {
+                exit::USAGE
+            }
+            CatalogError::Unavailable(_) => exit::ERROR,
         }
     }
 }
@@ -156,6 +174,39 @@ mod tests {
                 message: "bad".to_string(),
             }
             .exit_code(),
+            exit::ERROR
+        );
+    }
+
+    // AC: M13-AC1/AC9/AC12 — an unknown model reference and a catalog validation
+    // failure (unknown id / no structured output) are usage errors (exit 2); an
+    // unavailable catalog is a generic error (exit 1).
+    #[test]
+    fn model_and_catalog_errors_map_to_expected_codes() {
+        use crate::domain::ParseModelRefError;
+
+        assert_eq!(
+            PipelineError::InvalidModel(ParseModelRefError::UnknownProvider("openai".to_string()))
+                .exit_code(),
+            exit::USAGE
+        );
+        assert_eq!(
+            PipelineError::Catalog(CatalogError::UnknownModel {
+                id: "x".to_string(),
+                suggestions: Vec::new(),
+            })
+            .exit_code(),
+            exit::USAGE
+        );
+        assert_eq!(
+            PipelineError::Catalog(CatalogError::NoStructuredOutput {
+                id: "x".to_string()
+            })
+            .exit_code(),
+            exit::USAGE
+        );
+        assert_eq!(
+            PipelineError::Catalog(CatalogError::Unavailable("offline".to_string())).exit_code(),
             exit::ERROR
         );
     }
