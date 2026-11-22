@@ -1044,6 +1044,15 @@ analysis stage, which already returns `Err(PipelineError::Llm)` on a single-pass
 (or pick a `:free` model) before the run can proceed, like the other precondition stops in `CLI.md` §7. Not
 transport-retried (already `GiveUp` in `retry.rs`).
 
+(b) **403 ContentRefused now records `QualityFlag::Refused` (M13-AC4, `DATA_MODEL.md` §5).** A `ContentRefused` batch
+now fails AND, in the same transaction, upserts one `translations` row per translatable cue carrying the `refused`
+flag (empty target). The flag is persisted exactly like every other quality flag (on the cue's `translations.flags`,
+the only place flags live); `upsert_translation_in_tx` still respects a locked row. The run continues — only Credits
+stops it. Known side effect: a refused cue now has an empty-text `translations` row, so `export` treats it the same
+way it already treats a genuinely `empty`-flagged translation (exports blank / source text), rather than as a
+no-row "failed" cue. This matches existing empty-translation behaviour and is noted as a pre-existing export nuance,
+not changed here.
+
 (c) **Catalog reasoning levels are wired into the live transport (M13-AC10, `LLM.md` §10.4).** `build_router` /
 `openrouter_config` previously used `OpenRouterConfig { .., ..Default::default() }`, whose `reasoning_levels` default
 is ALL levels, so `OpenRouterCatalog::supported_reasoning_levels` never affected a real run (the nearest-lower/omit

@@ -1504,6 +1504,52 @@ impl<T> TranslationBatchUnit<T> {
             .await;
         self.state.store(ST_FAILED, Ordering::Relaxed);
     }
+
+    /// Fails the batch on a provider content refusal (OpenRouter 403, `docs/LLM.md`
+    /// §10.6) and records [`QualityFlag::Refused`] on each of its translatable cues, all
+    /// in one transaction (`docs/ARCHITECTURE.md` §6 rule 1). The flag is persisted the
+    /// same way every quality flag is — on the cue's `translations` row
+    /// (`docs/DATA_MODEL.md` §5) — so the review gate surfaces the refusal. A `locked`
+    /// cue is never clobbered (`upsert_translation_in_tx` respects the lock). The run
+    /// continues (only Credits stops it).
+    async fn mark_refused(&self, err: &LlmError) {
+        let batch_no = self.batch_no;
+        let message = err.to_string();
+        let analysis_version = self.ctx.analysis_version;
+        let model = self.ctx.model.clone();
+        // One refused row per translatable cue that has a `cues.id` mapping (empty
+        // target, the `refused` flag). A cue missing its mapping is skipped rather than
+        // aborting the refusal record.
+        let rows: Vec<NewTranslation> = self
+            .translate_cues
+            .iter()
+            .filter_map(|c| {
+                self.ctx.idx_to_id.get(&c.idx).map(|cue_id| NewTranslation {
+                    cue_id: *cue_id,
+                    text: String::new(),
+                    origin: TranslationOrigin::Llm,
+                    locked: false,
+                    stale: false,
+                    flags: vec![QualityFlag::Refused],
+                    analysis_version,
+                    model: Some(model.clone()),
+                })
+            })
+            .collect();
+        let store = self.ctx.store.clone();
+        let _ = store
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                fail_translation_batch(&tx, batch_no, &message)?;
+                for row in &rows {
+                    upsert_translation_in_tx(&tx, row)?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await;
+        self.state.store(ST_FAILED, Ordering::Relaxed);
+    }
 }
 
 impl<T> WorkUnit for TranslationBatchUnit<T>
@@ -1634,6 +1680,13 @@ where
                         slot.get_or_insert(err);
                     }
                     self.ctx.token.cancel();
+                    UnitOutcome::Failed
+                }
+                // 403 ContentRefused is a content failure (`docs/LLM.md` §10.6): fail
+                // the batch and record the `refused` flag on its cues, but let the run
+                // continue (only Credits stops it).
+                ErrorClass::ContentRefused => {
+                    self.mark_refused(&err).await;
                     UnitOutcome::Failed
                 }
                 _ => {
