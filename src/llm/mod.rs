@@ -17,6 +17,7 @@ pub mod context_cache;
 pub mod dry_run;
 pub mod gemini;
 pub mod metered;
+pub mod openrouter;
 pub mod pricing;
 pub mod prompts;
 pub mod retry;
@@ -43,6 +44,7 @@ pub use context_cache::{
 pub use dry_run::{DryRun, Estimator};
 pub use gemini::Gemini;
 pub use metered::{CallContext, CallOutcome, LlmCallRecord, Metered, SinkError, UsageSink};
+pub use openrouter::{OpenRouter, OpenRouterConfig};
 pub use pricing::{Cost, ModelPrice, PriceSource, PriceTable, cost, storage_cost};
 pub use prompts::{PROMPT_VERSION, TranslationBlock, TranslationLine};
 pub use retry::{Decision, RetryConfig, Xorshift, decide};
