@@ -62,6 +62,9 @@ pub struct LlmCallRecord {
     pub stage: String,
     pub unit: Option<i64>,
     pub model: String,
+    /// The provider that served the call (`gemini`/`openrouter`), parsed from the
+    /// request's model reference (`docs/DATA_MODEL.md` §2, migration 5).
+    pub provider: Option<String>,
     pub service_tier: Option<String>,
     pub prompt_tokens: Option<i64>,
     pub cached_tokens: Option<i64>,
@@ -71,6 +74,12 @@ pub struct LlmCallRecord {
     pub cache_hit_local: bool,
     pub dry_run: bool,
     pub outcome: CallOutcome,
+    /// OpenRouter generation id (`None` for Gemini, `docs/LLM.md` §10.5).
+    pub generation_id: Option<String>,
+    /// Upstream provider OpenRouter routed to (`None` for Gemini).
+    pub served_provider: Option<String>,
+    /// Tier OpenRouter actually served (`None` for Gemini).
+    pub served_tier: Option<String>,
 }
 
 /// The narrow persistence seam for usage recording (`docs/ARCHITECTURE.md` §3).
@@ -161,10 +170,16 @@ impl<T, U> Metered<T, U> {
         latency_ms: i64,
         result: &Result<LlmResponse, LlmError>,
     ) -> LlmCallRecord {
+        // The provider is parsed from the model reference (`docs/LLM.md` §10.1); a
+        // bare model (no prefix) defaults to Gemini, matching the request routing.
+        let provider = crate::domain::ModelRef::parse(&model, crate::domain::Provider::Gemini)
+            .map(|r| r.provider.label().to_string())
+            .ok();
         let base = |cache_hit_local: bool, outcome: CallOutcome| LlmCallRecord {
             stage: self.context.stage.clone(),
             unit: self.context.unit,
             model: model.clone(),
+            provider: provider.clone(),
             service_tier: Some(service_tier.clone()),
             prompt_tokens: None,
             cached_tokens: None,
@@ -174,6 +189,9 @@ impl<T, U> Metered<T, U> {
             cache_hit_local,
             dry_run: self.context.dry_run,
             outcome,
+            generation_id: None,
+            served_provider: None,
+            served_tier: None,
         };
 
         match result {
@@ -196,6 +214,10 @@ impl<T, U> Metered<T, U> {
                     cached_tokens: Some(usage.cached_tokens as i64),
                     output_tokens: Some(usage.output_tokens as i64),
                     thinking_tokens: Some(usage.thinking_tokens as i64),
+                    // OpenRouter fills these; Gemini leaves them `None` (§10.5).
+                    generation_id: usage.generation_id.clone(),
+                    served_provider: usage.served_provider.clone(),
+                    served_tier: usage.served_tier.clone(),
                     ..base(false, CallOutcome::Ok)
                 }
             }
