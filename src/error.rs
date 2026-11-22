@@ -8,6 +8,7 @@
 pub use crate::config::ConfigError;
 pub use crate::formats::codec::FormatError;
 pub use crate::formats::encoding::EncodingError;
+pub use crate::llm::catalog::CatalogError;
 pub use crate::llm::client::LlmError;
 pub use crate::pipeline::PipelineError;
 pub use crate::project::ProjectError;
@@ -93,6 +94,11 @@ impl ExitCode for PipelineError {
             | PipelineError::MissingFromLanguage => exit::PRECONDITION,
             // A format/extension disagreement is a usage error (exit 2).
             PipelineError::OutputFormatExtensionMismatch { .. } => exit::USAGE,
+            // An unknown `provider:` prefix is a usage error (exit 2, ADR-051a).
+            PipelineError::InvalidModel(_) => exit::USAGE,
+            // An unknown/unsupported OpenRouter model is a usage error (exit 2); an
+            // unavailable catalog is a generic error (exit 1, ADR-051f/052b).
+            PipelineError::Catalog(e) => e.exit_code(),
             // A missing API key is a generic error (exit 1), not a precondition.
             PipelineError::MissingApiKey => exit::ERROR,
             PipelineError::ProjectResolution(err) => err.exit_code(),
@@ -101,6 +107,20 @@ impl ExitCode for PipelineError {
             PipelineError::Store(err) => err.exit_code(),
             PipelineError::Llm(err) => err.exit_code(),
             PipelineError::Io { .. } => exit::ERROR,
+        }
+    }
+}
+
+impl ExitCode for CatalogError {
+    /// An unknown model id and a model without structured-output support are usage
+    /// errors (exit 2, `docs/LLM.md` §10.3/§10.9); an unavailable catalog is a
+    /// generic error (exit 1).
+    fn exit_code(&self) -> i32 {
+        match self {
+            CatalogError::UnknownModel { .. } | CatalogError::NoStructuredOutput { .. } => {
+                exit::USAGE
+            }
+            CatalogError::Unavailable(_) => exit::ERROR,
         }
     }
 }
@@ -123,12 +143,16 @@ impl ExitCode for ReviewError {
 }
 
 impl ExitCode for LlmError {
-    /// A cancelled operation maps to the interrupted code (130); every other
-    /// `LlmError` maps to the generic error code. The pipeline translates failed
-    /// *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
+    /// A cancelled operation maps to the interrupted code (130); an out-of-credits stop
+    /// (OpenRouter 402) is a precondition the user must satisfy before the run can
+    /// proceed — add credits or switch to a `:free` model — so it maps to exit 3
+    /// (precondition), the closest existing mapping (`docs/LLM.md` §10.6, ADR-051e).
+    /// Every other `LlmError` maps to the generic error code. The pipeline translates
+    /// failed *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
     fn exit_code(&self) -> i32 {
         match self {
             LlmError::Cancelled => exit::INTERRUPTED,
+            LlmError::Credits { .. } => exit::PRECONDITION,
             _ => exit::ERROR,
         }
     }
@@ -154,6 +178,59 @@ mod tests {
                 message: "bad".to_string(),
             }
             .exit_code(),
+            exit::ERROR
+        );
+    }
+
+    // AC: M13-AC4 — an out-of-credits stop (402) is a precondition (exit 3), so `main`
+    // exits non-zero with the actionable message (`docs/LLM.md` §10.6, ADR-051e).
+    #[test]
+    fn credits_error_maps_to_precondition_exit_code() {
+        assert_eq!(
+            LlmError::Credits {
+                message: "add OpenRouter credits, or use a `:free` model".to_string(),
+            }
+            .exit_code(),
+            exit::PRECONDITION
+        );
+        assert_eq!(
+            PipelineError::Llm(LlmError::Credits {
+                message: "add credits".to_string(),
+            })
+            .exit_code(),
+            exit::PRECONDITION
+        );
+    }
+
+    // AC: M13-AC1/AC9/AC12 — an unknown model reference and a catalog validation
+    // failure (unknown id / no structured output) are usage errors (exit 2); an
+    // unavailable catalog is a generic error (exit 1).
+    #[test]
+    fn model_and_catalog_errors_map_to_expected_codes() {
+        use crate::domain::ParseModelRefError;
+
+        assert_eq!(
+            PipelineError::InvalidModel(ParseModelRefError::UnknownProvider("openai".to_string()))
+                .exit_code(),
+            exit::USAGE
+        );
+        assert_eq!(
+            PipelineError::Catalog(CatalogError::UnknownModel {
+                id: "x".to_string(),
+                suggestions: Vec::new(),
+            })
+            .exit_code(),
+            exit::USAGE
+        );
+        assert_eq!(
+            PipelineError::Catalog(CatalogError::NoStructuredOutput {
+                id: "x".to_string()
+            })
+            .exit_code(),
+            exit::USAGE
+        );
+        assert_eq!(
+            PipelineError::Catalog(CatalogError::Unavailable("offline".to_string())).exit_code(),
             exit::ERROR
         );
     }

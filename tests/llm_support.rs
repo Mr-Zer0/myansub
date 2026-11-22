@@ -599,6 +599,7 @@ fn usage_serde_round_trips() {
         thinking_tokens: 2,
         cache_hit_local: true,
         applied_tier: Some("flex".to_string()),
+        ..Default::default()
     };
     let json = serde_json::to_string(&usage).unwrap();
     let back: Usage = serde_json::from_str(&json).unwrap();

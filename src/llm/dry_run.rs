@@ -87,8 +87,7 @@ impl DryRun {
             cached_tokens: 0,
             output_tokens,
             thinking_tokens: 0,
-            cache_hit_local: false,
-            applied_tier: None,
+            ..Default::default()
         }
     }
 }

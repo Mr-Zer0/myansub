@@ -920,3 +920,163 @@ UNDER-invalidation — never corrupts, never re-pays; `--redo` or a cache prune 
 Fresh M12-era projects record the style on first translation and are unaffected. Acceptable for v1 (cache cold, no
 straddling production projects); a future migration could backfill `translation_digits` for existing projects if
 the upgrade path matters.
+
+### ADR-051 OpenRouter as a second provider: provider-neutral core + a routing transport (M13, PBI-009)
+Context (M13; `docs/MILESTONES.md`; PBI-009): the product owner wants to keep Gemini exactly as today and
+also run any model on OpenRouter, chosen per stage (`[llm.models]`) or per run (`--model`). The codebase is
+already past M3 (LLM layer) and M6 (translation), so PBI-009's two slices land together. The shared layers
+(local cache, metering, retry engine, scheduler, prompts, quality checks) must stay provider-agnostic.
+The PBI's AC17 cited "ADR-026" as the home for this decision; ADR-026 is already taken (jitter policy), so the
+next free numbers (ADR-051, ADR-052) are used. Decisions:
+
+(a) **Model references are `[provider:]model`, parsed into a `domain` type.** A new `domain::ModelRef { provider:
+Provider, model: String }` and `enum Provider { Gemini, OpenRouter }` parse a reference: a `provider:` prefix
+selects the provider; no prefix uses `llm.default_provider` (default `Gemini`); an unrecognised prefix is a
+parse error that `main` maps to **exit 2** (usage error, like a clap/flag error). `ModelRef` lives in `domain`
+(pure, like `DigitStyle`/`CueFinalStop`, ADR-050) so `config`, `cli`, `llm`, and `pipeline` can all name it
+without a cycle. The *provider* half of a reference is NEVER sent on the wire — only the bare `model` goes to
+the provider's API. The full `provider:model` string is what is stored (batches/translations `model` columns,
+ADR row (d)) and folded into the local cache key.
+
+(b) **The logical request/response/usage types are made provider-neutral; wire names stay in the adapters.**
+`LlmRequest`/`LlmResponse`/`Usage` (in `llm/client.rs`) already avoid Gemini wire names; M13 extends them so
+BOTH providers map cleanly, keeping the invariant that provider-specific field names appear ONLY in
+`llm/gemini.rs` and `llm/openrouter.rs` (a reviewer greps for `serviceTier`/`responseJsonSchema`/
+`thinkingConfig`/`response_format`/`reasoning`/`cache_control` and finds them only there). Specifics:
+  - **Tier becomes neutral `Tier { Flex, Default, Floor }`** on `LlmRequest`. `Default` is the old `Standard`;
+    `Floor` is new (cheapest endpoint, OpenRouter). Gemini maps `Flex→flex`, `Default→standard`, `Floor→flex`
+    (flex is Gemini's cheapest); OpenRouter maps `Flex/Default/Floor` to its own tier/sort behaviour (ADR row
+    for §10). The rename ripples to existing `ServiceTier::Flex/Standard` call sites and test literals; these
+    are **mechanical, assertion-preserving** call-site edits (same precedent as ADR-046's `Progress` threading,
+    which the test-first guardrail allows — no existing assertion is weakened, only the symbol is renamed).
+    `Tier` lives in `domain` alongside `ModelRef` so `config` can validate it.
+  - **A "cached prefix ends here" marker** replaces the implicit "everything before `contents[1]`" convention
+    with an explicit boundary on the request, so each adapter can place its cache control correctly (Gemini: a
+    stable implicit/explicit prefix; OpenRouter: `cache_control: {type:"ephemeral"}` on the last block at or
+    before the marker — §10).
+  - **Reasoning level** is added as a neutral field (reuse/rename of the existing `ThinkingSetting`): Gemini maps
+    it to `thinkingBudget`/`thinkingLevel` (ADR-028, unchanged); OpenRouter maps it to `reasoning.effort` with
+    nearest-lower-supported fallback (§10).
+  - **`Usage` fields become optional and gain `cost_usd`, `cache_write_tokens`, `reasoning_tokens`.** Gemini
+    leaves `cost_usd` `None` (cost is computed by `pricing.rs` from the price table); OpenRouter fills it from
+    `usage.cost`. Making the counts `Option`-shaped keeps parity meaningful (a field a provider does not report
+    is `None`, not a misleading `0`).
+
+(c) **Routing: a new `llm::Router` transport implements `LlmClient` and dispatches by `req` provider.** There is
+no `enum Transport` today — the pipeline is generic over one `T: LlmClient` (ARCHITECTURE §5 describes an enum
+that was never built; the real design is static-dispatch structs `Gemini`/`DryRun`/`Fake`). To route per request
+WITHOUT giving every provider its own layer stack, `Router { gemini: Option<Gemini>, openrouter: Option<OpenRouter> }`
+implements `LlmClient::generate` by reading the provider off the request's model reference and delegating to the
+matching transport. The pipeline wraps the `Router` once in `Metered<Cached<Retrying<Router>>>`, so BOTH providers
+sit under the SAME shared layers (AC3) and share one cache/metering/retry path. A provider whose key is absent is
+`None`; a request for it returns a fatal "missing `OPENROUTER_API_KEY`" error — so a missing key fails only when a
+stage actually dispatches to that provider (AC6). `DryRun` and `Fake` continue to implement `LlmClient` directly and
+are swapped in whole (dry-run / tests) exactly as before; the `Router` is only for a real run.
+
+(d) **Provider is part of the local cache key and the stored model strings.** The local response-cache key
+(`LLM.md` §4) folds in the full `provider:model` (it is already part of the hashed `model` field once the stored
+`model` is the full reference), so a `gemini:` and an `openrouter:` request for byte-identical text never collide.
+`migration 5` adds `llm_calls.provider TEXT` plus `generation_id`/`served_provider`/`served_tier TEXT` (the last
+three filled by OpenRouter; `NULL` for Gemini). `translation_batches.model` and `translations.model` now store the
+full `provider:model` reference (value-only change; no schema change for those two columns). Append-only migration,
+like 2/3/4.
+
+(e) **Retry stays provider-agnostic via per-transport `classify`.** `llm/retry.rs::decide` keeps operating on
+`ErrorClass` only. Each transport owns the status→class mapping: `gemini.rs` as today (ADR-028); `openrouter.rs`
+via a `classify(&RawError) -> ErrorClass` over OpenRouter's status codes and in-body errors (§10 table).
+`ErrorClass` gains two variants: **`Credits`** (OpenRouter 402 — stop the run before dispatching more work, like a
+hard precondition failure) and **`ContentRefused`** (OpenRouter 403 moderation/guardrail — the batch fails and is
+flagged, but the run continues, like a content failure). A new `refused` quality/batch flag records a
+`ContentRefused` batch (`DATA_MODEL.md` §5). `Credits` surfaces to `main` as a run-stopping error; `ContentRefused`
+is handled by the pipeline's content path (no transport retry).
+
+(f) **`ModelCatalog` trait; prices read only through it.** `llm/catalog.rs` defines
+`trait ModelCatalog` supplying model validation, context length, supported parameters (incl. structured-output
+support and reasoning levels), and prices. `GeminiCatalog` is backed by the existing `[pricing]` table (today's
+behaviour, unchanged observable prices); `OpenRouterCatalog` is backed by the fetched `/models` document (§10,
+ADR-052). `pricing.rs::cost` reads prices only through the catalog, so a dry-run estimate is priced the same way
+for both providers. `PROMPT_VERSION` is unchanged — no prompt text changed (the OpenRouter message order mirrors
+the existing §2 layout, and the system/analysis/variable text is byte-identical to the Gemini path).
+
+### ADR-052 Migration 5, env-var-only keys (PBI-008 deferred), OpenRouter catalog cache without a new crate (M13, PBI-009)
+Context (M13; PBI-009 AC6/AC12): PBI-009's AC6 referenced **PBI-008** (a stored credential account + `auth
+set|status|remove --provider` command, OS keychain). PBI-008 is not implemented, and the product owner decided it
+adds no value right now. AC12 needs a **user cache directory** for the 24 h OpenRouter `/models` cache, but
+`ARCHITECTURE.md` §10 forbids adding a crate without approval (so no `dirs`/`keyring`). Decisions:
+
+(a) **Keys are env-var only; PBI-008 is dropped for M13.** Key resolution reads `GEMINI_API_KEY` and
+`OPENROUTER_API_KEY` from the environment (as `GEMINI_API_KEY` already is), lazily: the `Router` holds a provider's
+transport only when its key is present, and a request for an absent-key provider fails with a fatal, actionable
+error ("set `OPENROUTER_API_KEY`") — so a missing key fails ONLY when a stage actually uses that provider (the
+observable half of AC6). No `auth` command, no stored accounts, no keychain, no new crate. `CONFIG.md` §2 lists both
+variables. If PBI-008 is picked up later, it adds the stored-account layer beneath this env-var fallback without
+changing the resolution contract. Recorded as a deliberate deviation per `CLAUDE.md`.
+
+(b) **The OpenRouter catalog cache reuses the hand-rolled platform-dir pattern — no `dirs` crate.** `config.rs`
+already resolves the global config dir by hand (`XDG_CONFIG_HOME`/`HOME/.config` on Unix, `APPDATA` on Windows).
+The catalog cache resolves a user cache dir the same way (`XDG_CACHE_HOME`/`HOME/.cache` on Unix,
+`LOCALAPPDATA`/`APPDATA` on Windows) into `myansub/openrouter-models.json`, written with the existing atomic-write
+helper (`store::atomic`, ARCHITECTURE §6 rule 4 — temp file, fsync, rename). Freshness (24 h) is judged from the
+file's mtime via `std::fs::metadata` + `SystemTime` (no `chrono`, consistent with ADR-042(b)'s epoch-seconds
+approach). On a failed fetch, a present-but-stale cache is used with one `tracing::warn!`; with no cache at all and
+no network, catalog-dependent commands fail with a clear error. All tests stay offline: the fetch goes through
+wiremock and the on-disk cache uses a `tempfile` dir, with a trimmed `/models` fixture (AC18).
+
+(c) **Migration 5 is append-only (adds `llm_calls` columns).** `migration 5` adds `provider TEXT`, `generation_id
+TEXT`, `served_provider TEXT`, `served_tier TEXT` to `llm_calls` (all nullable; Gemini leaves the OpenRouter-only
+three `NULL`). A migration-5 test mirrors the existing migration-2/3/4 data-preservation tests (`SCHEMA_VERSION → 5`,
+pre-existing rows intact, new columns read `NULL`). `translation_batches.model`/`translations.model` now hold the
+full `provider:model` string — a value change only, no DDL. `PROMPT_VERSION` stays `5` (no prompt text changed).
+
+### ADR-051 addendum — M13 QA-review fixes (2026-11, PBI-009)
+Follow-up to the M13 QA review. Four behaviour fixes plus three recorded known-limitations:
+
+(a) **402 Credits now actually stops the run (M13-AC4, `LLM.md` §10.6).** The translation content loop surfaced a
+`Credits` error as `CallResult::Transport(err)` and collapsed it via `mark_failed(&err.to_string())`, so the
+scheduler kept dispatching the remaining batches and the actionable message was lost to stringification. Now a batch
+whose transport error classes as `ErrorClass::Credits` records the typed `LlmError` in a shared `run_stop` slot on
+the batch context and cancels the scheduler's `CancellationToken` (halting dispatch exactly like Ctrl-C); the batch is
+left `in_flight` (NOT per-batch `failed`), so a resume after credits are added reruns it. `run_translation` reads the
+slot after the scheduler returns — *before* the `token.is_cancelled()` interrupt check — and returns
+`Err(PipelineError::Llm(Credits))` so `main` prints "add OpenRouter credits, or use a `:free` model". This mirrors the
+analysis stage, which already returns `Err(PipelineError::Llm)` on a single-pass transport failure. **Exit code:**
+`LlmError::Credits` maps to **exit 3 (precondition)** — the closest existing mapping, since the user must add credits
+(or pick a `:free` model) before the run can proceed, like the other precondition stops in `CLI.md` §7. Not
+transport-retried (already `GiveUp` in `retry.rs`).
+
+(b) **403 ContentRefused now records `QualityFlag::Refused` (M13-AC4, `DATA_MODEL.md` §5).** A `ContentRefused` batch
+now fails AND, in the same transaction, upserts one `translations` row per translatable cue carrying the `refused`
+flag (empty target). The flag is persisted exactly like every other quality flag (on the cue's `translations.flags`,
+the only place flags live); `upsert_translation_in_tx` still respects a locked row. The run continues — only Credits
+stops it. Known side effect: a refused cue now has an empty-text `translations` row, so `export` treats it the same
+way it already treats a genuinely `empty`-flagged translation (exports blank / source text), rather than as a
+no-row "failed" cue. This matches existing empty-translation behaviour and is noted as a pre-existing export nuance,
+not changed here.
+
+(c) **Catalog reasoning levels are wired into the live transport (M13-AC10, `LLM.md` §10.4).** `build_router` /
+`openrouter_config` previously used `OpenRouterConfig { .., ..Default::default() }`, whose `reasoning_levels` default
+is ALL levels, so `OpenRouterCatalog::supported_reasoning_levels` never affected a real run (the nearest-lower/omit
+fallback could not trigger, and a non-reasoning model still got `reasoning.effort` with `require_parameters=true`).
+Now the OpenRouter catalog is loaded once at startup (the same load `ensure_model_supported` already does) and each
+OpenRouter-routed stage model's `supported_reasoning_levels` is threaded into that provider's
+`OpenRouterConfig.reasoning_levels`.
+
+(d) **`[verify] session_id derivation (known deviation).** `LLM.md` §10.2 specifies the sticky-routing key as
+`sha256(source_hash + stage + analysis_version)`. The implementation instead derives it from the hash of the
+cached-prefix text (system instruction + cached-prefix content blocks), which is byte-stable within a stage and
+differs across stages / analysis versions, so it satisfies the observable intent (one upstream endpoint per stage).
+For a single-content analysis request the prefix is near-constant across versions, so this reduces to a near-constant
+value. Both the field name (`session_id`) and this derivation are **[verify]** against the live OpenRouter docs. Impact
+is routing affinity only — no effect on produced output. Left as-is (the available cheap improvement — folding
+`analysis_version` into the hash — would weaken within-stage stability for map-reduce, which is the opposite of what
+sticky routing wants).
+
+(e) **OpenRouter real-run cost reporting is a known follow-up.** `usage.cost` is parsed into `Usage.cost_usd`
+(AC11, met) but is not yet persisted or consumed by the cost summary, which still prices OpenRouter rows through the
+Gemini `[pricing]` table and reports "unknown" for models absent there. No AC mandates persisting the actual cost, so
+this is recorded as a follow-up (it would need a `cost` column on `llm_calls` and a cost-source switch), not fixed now.
+
+(f) **503 "retryable ×3 then fatal" — the ×3 is illustrative.** A 503 (no endpoint meets the routing settings) is
+`ErrorClass::Retryable` and is retried under the general `llm.max_retries` budget with an actionable routing message
+naming `tier`/`data_collection`/`zdr`; the "×3" in `LLM.md` §10.6 is illustrative of "retry a few times then give a
+clear routing error", not a hard-coded cap separate from `max_retries`.

@@ -36,7 +36,7 @@ pub enum CacheError {
 
 /// A cached response read back from the store: just the stored text and
 /// [`Usage`], which is all that is needed to reconstruct an [`LlmResponse`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CachedEntry {
     pub response: String,
     pub usage: Usage,
@@ -247,6 +247,20 @@ mod tests {
         let mut other = request(ServiceTier::Flex);
         other.model = "gemini-pro-latest".to_string();
         assert_ne!(cache_key(&request(ServiceTier::Flex)), cache_key(&other));
+    }
+
+    #[test]
+    fn cache_key_differs_when_provider_differs() {
+        // AC: M13-AC5 — the provider is part of the local cache key (it is folded in
+        // through the full `provider:model` reference carried in `req.model`). Two
+        // requests identical except their provider prefix must never collide, so a
+        // `gemini:` and an `openrouter:` call for byte-identical text keep separate
+        // cache entries. Would fail if the provider half were stripped before hashing.
+        let mut gemini = request(ServiceTier::Flex);
+        gemini.model = "gemini:foo".to_string();
+        let mut openrouter = request(ServiceTier::Flex);
+        openrouter.model = "openrouter:foo".to_string();
+        assert_ne!(cache_key(&gemini), cache_key(&openrouter));
     }
 
     #[tokio::test]

@@ -63,6 +63,11 @@ impl PriceTable {
         self.models.get(model)
     }
 
+    /// Iterates `(model, price)` pairs in key order (for `models list`, M13-AC16).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &ModelPrice)> {
+        self.models.iter()
+    }
+
     /// Builds a price table from the `[pricing]` config map (`docs/CONFIG.md`).
     pub fn from_config(entries: &BTreeMap<String, PriceEntry>) -> Self {
         let models = entries
@@ -71,6 +76,35 @@ impl PriceTable {
             .collect();
         Self { models }
     }
+}
+
+/// A source of per-model prices (`docs/LLM.md` §9, ADR-051f). The narrow seam
+/// [`cost`] reads prices through, so pricing stays a pure calculation regardless of
+/// whether the backing store is the Gemini `[pricing]` table or the OpenRouter
+/// catalog. Both [`PriceTable`] and
+/// [`GeminiCatalog`](crate::llm::catalog::GeminiCatalog) implement it; the model id
+/// passed in may be a full `provider:model` reference (the provider half is
+/// stripped before lookup).
+pub trait PriceSource {
+    /// The price for `model`, if known. `model` may be a bare id or a full
+    /// `provider:model` reference.
+    fn model_price(&self, model: &str) -> Option<ModelPrice>;
+}
+
+impl PriceSource for PriceTable {
+    fn model_price(&self, model: &str) -> Option<ModelPrice> {
+        self.get(&bare_model(model)).cloned()
+    }
+}
+
+/// Strips any `provider:` prefix from a model reference, returning the bare model
+/// id used to key the price table (`docs/DATA_MODEL.md` §2 stores the full
+/// `provider:model` string; prices are keyed by the bare id). An unparseable
+/// reference is returned unchanged.
+pub(crate) fn bare_model(model: &str) -> String {
+    crate::domain::ModelRef::parse(model, crate::domain::Provider::default())
+        .map(|r| r.model)
+        .unwrap_or_else(|_| model.to_string())
 }
 
 /// The cost of a call in USD, or [`Cost::Unknown`] when the model has no price
@@ -85,7 +119,12 @@ pub enum Cost {
 /// output (with thinking billed as output), the flex tier multiplier, and the
 /// optional long-prompt bracket. Explicit-cache storage is a separate component
 /// ([`storage_cost`]). An unknown model yields [`Cost::Unknown`].
-pub fn cost(model: &str, tier: ServiceTier, usage: &Usage, table: &PriceTable) -> Cost {
+pub fn cost<S: PriceSource + ?Sized>(
+    model: &str,
+    tier: ServiceTier,
+    usage: &Usage,
+    source: &S,
+) -> Cost {
     // A local cache hit consumed no API tokens, so it is always free regardless of
     // the token counts carried by the stored response (`docs/LLM.md` §5). This
     // guards a caller that prices a hit's usage directly from over-charging.
@@ -93,9 +132,10 @@ pub fn cost(model: &str, tier: ServiceTier, usage: &Usage, table: &PriceTable) -
         return Cost::Known(0.0);
     }
 
-    let Some(price) = table.get(model) else {
+    let Some(price) = source.model_price(model) else {
         return Cost::Unknown;
     };
+    let price = &price;
 
     // Long-prompt bracket: above the threshold, prefer the long input/output
     // rates (falling back to the base rate if a long rate is not configured).
@@ -121,7 +161,9 @@ pub fn cost(model: &str, tier: ServiceTier, usage: &Usage, table: &PriceTable) -
 
     let per_token = fresh * input_rate + cached * price.cached_input + output * output_rate;
     let multiplier = match tier {
-        ServiceTier::Flex => price.flex_multiplier,
+        // Flex and Floor both bill at the cheapest (flex) rate on the Gemini price
+        // table (Gemini has no distinct floor tier, ADR-051b).
+        ServiceTier::Flex | ServiceTier::Floor => price.flex_multiplier,
         ServiceTier::Standard => 1.0,
     };
 
@@ -132,7 +174,7 @@ pub fn cost(model: &str, tier: ServiceTier, usage: &Usage, table: &PriceTable) -
 /// the model's `storage_per_hour` rate (USD per 1M tokens per hour). Not subject
 /// to the flex multiplier. An unknown model yields [`Cost::Unknown`].
 pub fn storage_cost(model: &str, tokens: u64, hours: f64, table: &PriceTable) -> Cost {
-    match table.get(model) {
+    match table.get(&bare_model(model)) {
         Some(price) => Cost::Known(tokens as f64 * price.storage_per_hour * hours / 1_000_000.0),
         None => Cost::Unknown,
     }

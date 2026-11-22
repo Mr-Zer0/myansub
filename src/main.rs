@@ -10,15 +10,18 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use myansub::cli::{
     AnalysisCommand, AnalyzeArgs, AutoApprove, CacheCommand, Cli, Command, ExportArgs, InitArgs,
-    OutputFormat, ReviewCommand, ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier,
-    TranslateArgs,
+    ModelProvider, ModelsCommand, OutputFormat, ReviewCommand, ReviewListArgs, ReviewSelectionArgs,
+    RunArgs, ServiceTier, TranslateArgs,
 };
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::domain::SubtitleFormat;
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
-use myansub::llm::client::Secret;
+use myansub::llm::client::{LlmError, Secret};
 use myansub::llm::pricing::{Cost, PriceTable};
-use myansub::llm::{DryRun, Estimator, Gemini};
+use myansub::llm::{
+    DryRun, Estimator, Gemini, GeminiCatalog, ModelCatalog, ModelInfo, OpenRouter,
+    OpenRouterCatalog, OpenRouterConfig, ReasoningLevel, Router, catalog_cache_path,
+};
 use myansub::pipeline::analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, DryRunReport, analysis_exit_code,
     dry_run_analysis, prepare_analysis, run_analysis_confirmed,
@@ -108,6 +111,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Review { command } => run_translation_review_command(cli, command),
         Command::Export(args) => run_export_command(cli, args),
         Command::Cache { command } => run_cache_command(cli, command),
+        Command::Models { command } => run_models_command(cli, command),
         other => not_implemented(command_name(other)),
     }
 }
@@ -267,11 +271,21 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
             )
             .await
         } else {
+            // OpenRouter models are validated against the catalog before any request
+            // is sent (M13-AC9/AC12): an unknown id or a model without structured
+            // output exits 2. The same (single) catalog load yields the reasoning
+            // levels threaded into the OpenRouter transport (M13-AC10). Gemini models
+            // are a no-op.
+            let reasoning_levels = prepare_openrouter_models(
+                &config,
+                &[&config.llm.models.analysis, &config.llm.models.translation],
+            )
+            .await?;
             // Cost-confirmation gate (docs/CLI.md §4/§5): `--auto-approve` does not
             // imply `--yes`, so the gate still applies to an auto-approving run.
-            // `build_gemini` runs only once the gate is cleared.
+            // `build_router` runs only once the gate is cleared.
             run_confirmed(
-                || build_gemini(&config),
+                || build_router(&config, reasoning_levels.clone()),
                 request,
                 &config,
                 &token,
@@ -511,6 +525,12 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
             return Ok(exit::SUCCESS);
         }
 
+        // An OpenRouter analysis model is validated against the catalog before any
+        // request is sent (M13-AC9/AC12); the same catalog load yields the reasoning
+        // levels threaded into the OpenRouter transport (M13-AC10). Gemini is a no-op.
+        let reasoning_levels =
+            prepare_openrouter_models(&config, &[&config.llm.models.analysis]).await?;
+
         // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6).
         let signal_token = token.clone();
         tokio::spawn(async move {
@@ -524,14 +544,14 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
             retry_failed: args.retry_failed,
         };
         // Cost-confirmation gate (docs/CLI.md §5, docs/LLM.md §9): estimate first,
-        // then confirm. `build_gemini` (and the API key it needs) is only invoked
+        // then confirm. `build_router` (and the API key it needs) is only invoked
         // once the gate is cleared, so a refusal exits 3 without requiring a key.
         let prices = PriceTable::from_config(&config.pricing);
         let settings = confirm_settings(cli, &config);
         // Live progress on stderr (`docs/CLI.md` §8); the dry-run path returned above.
         let progress = build_progress(cli, false);
         let confirmed = run_analysis_confirmed(
-            || build_gemini(&config),
+            || build_router(&config, reasoning_levels.clone()),
             &store,
             &cues,
             &params,
@@ -607,6 +627,12 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
             return Ok(exit::SUCCESS);
         }
 
+        // An OpenRouter translation model is validated against the catalog before any
+        // request is sent (M13-AC9/AC12); the same catalog load yields the reasoning
+        // levels threaded into the OpenRouter transport (M13-AC10). Gemini is a no-op.
+        let reasoning_levels =
+            prepare_openrouter_models(&config, &[&config.llm.models.translation]).await?;
+
         // Ctrl-C triggers the CancellationToken (docs/ARCHITECTURE.md §6 rule 6).
         let signal_token = token.clone();
         tokio::spawn(async move {
@@ -621,14 +647,14 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
             stale: args.stale,
         };
         // Cost-confirmation gate (docs/CLI.md §5, docs/LLM.md §7/§9): for `--stale`
-        // the estimate covers only the stale, unlocked cues. `build_gemini` runs only
+        // the estimate covers only the stale, unlocked cues. `build_router` runs only
         // once the gate is cleared, so a refusal exits 3 without requiring a key.
         let prices = PriceTable::from_config(&config.pricing);
         let settings = confirm_settings(cli, &config);
         // Live progress on stderr (`docs/CLI.md` §8); the dry-run path returned above.
         let progress = build_progress(cli, false);
         let confirmed = run_translation_confirmed(
-            || build_gemini(&config),
+            || build_router(&config, reasoning_levels.clone()),
             &store,
             &cues,
             &params,
@@ -1088,22 +1114,213 @@ fn print_review_listing(listing: &myansub::review::translation::ReviewListing) {
     );
 }
 
-/// Builds the real Gemini transport from the environment and config
-/// (docs/LLM.md §1). The API key comes from `GEMINI_API_KEY` and is wrapped in a
-/// [`Secret`] so it never leaks through logging.
-fn build_gemini(config: &Config) -> Result<Gemini, PipelineError> {
-    // Detect an absent/empty key before building the transport, so a missing key is
-    // a clear, actionable error rather than a confusing 401 from a would-be request.
-    let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    if key.trim().is_empty() {
-        return Err(PipelineError::MissingApiKey);
+/// Handles `myansub models list [--provider P] [FILTER]` (docs/CLI.md, M13-AC16):
+/// prints each model's id, input/output price per 1M tokens, context length, and
+/// structured-output support. Gemini entries come from the `[pricing]` table;
+/// OpenRouter entries come from the cached `/models` catalog (offline-friendly).
+fn run_models_command(cli: &Cli, command: &ModelsCommand) -> anyhow::Result<i32> {
+    let ModelsCommand::List(args) = command;
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let config = load_config(cli, &cwd)?;
+    let filter = args.filter.as_deref();
+
+    let want_gemini = !matches!(args.provider, Some(ModelProvider::Openrouter));
+    let want_openrouter = !matches!(args.provider, Some(ModelProvider::Gemini));
+
+    if want_gemini {
+        let catalog = GeminiCatalog::new(PriceTable::from_config(&config.pricing));
+        print_model_rows("gemini", &catalog.list(filter));
     }
-    Gemini::new(
-        config.llm.base_url.clone(),
-        Secret::new(key),
-        Duration::from_secs(config.llm.timeout_secs),
+
+    if want_openrouter {
+        let explicit = matches!(args.provider, Some(ModelProvider::Openrouter));
+        match load_openrouter_catalog(&config) {
+            Ok(catalog) => print_model_rows("openrouter", &catalog.list(filter)),
+            Err(err) if explicit => return Err(err.into()),
+            Err(err) => tracing::warn!("skipping openrouter models: {err}"),
+        }
+    }
+
+    Ok(exit::SUCCESS)
+}
+
+/// Loads the OpenRouter catalog once (fetch + 24 h cache, ADR-052b) in an async
+/// context — unlike [`load_openrouter_catalog`], which spins its own runtime for the
+/// synchronous `models list` command.
+async fn load_openrouter_catalog_async(
+    config: &Config,
+) -> Result<OpenRouterCatalog, PipelineError> {
+    let cache = catalog_cache_path().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("myansub")
+            .join("openrouter-models.json")
+    });
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    OpenRouterCatalog::load(
+        &client,
+        &config.llm.openrouter.base_url,
+        &cache,
+        std::time::SystemTime::now(),
     )
-    .map_err(PipelineError::Llm)
+    .await
+    .map_err(PipelineError::from)
+}
+
+/// Validates every OpenRouter-routed stage model against the catalog (loading it ONCE,
+/// M13-AC9/AC12) and returns the reasoning levels to thread into the live OpenRouter
+/// transport (M13-AC10, `docs/LLM.md` §10.4). The threaded value is the **intersection**
+/// of the routed models' catalog-supported levels, so a shared transport never sends a
+/// reasoning effort a stage model rejects (which `provider.require_parameters=true`
+/// would turn into a 503). `Some(vec![])` means "no reasoning for this transport" — the
+/// adapter then omits `reasoning.effort` entirely (the fix for a non-reasoning model
+/// still receiving it). `None` means no stage routes to OpenRouter, so the transport
+/// keeps its default and is never dispatched to. Gemini models are a no-op.
+async fn prepare_openrouter_models(
+    config: &Config,
+    stage_models: &[&str],
+) -> Result<Option<Vec<ReasoningLevel>>, PipelineError> {
+    use myansub::domain::{ModelRef, Provider};
+    let default = config.default_provider();
+    let or_models: Vec<String> = stage_models
+        .iter()
+        .filter_map(|m| ModelRef::parse(m, default).ok())
+        .filter(|r| r.provider == Provider::OpenRouter)
+        .map(|r| r.model)
+        .collect();
+    if or_models.is_empty() {
+        return Ok(None);
+    }
+    let catalog = load_openrouter_catalog_async(config).await?;
+    let mut levels: Option<Vec<ReasoningLevel>> = None;
+    for model in &or_models {
+        catalog.validate(model)?;
+        let supported = catalog.supported_reasoning_levels(model);
+        levels = Some(match levels {
+            None => supported,
+            Some(existing) => intersect_levels(&existing, &supported),
+        });
+    }
+    Ok(levels)
+}
+
+/// The reasoning levels supported by BOTH models, preserving the order of `a`
+/// (low→high). Used to pick a single safe set for the one shared OpenRouter transport.
+fn intersect_levels(a: &[ReasoningLevel], b: &[ReasoningLevel]) -> Vec<ReasoningLevel> {
+    a.iter().copied().filter(|l| b.contains(l)).collect()
+}
+
+/// Loads the OpenRouter catalog for `models list` (fetch + 24 h cache, ADR-052b).
+fn load_openrouter_catalog(config: &Config) -> Result<OpenRouterCatalog, PipelineError> {
+    let cache = catalog_cache_path().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("myansub")
+            .join("openrouter-models.json")
+    });
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    runtime
+        .block_on(OpenRouterCatalog::load(
+            &client,
+            &config.llm.openrouter.base_url,
+            &cache,
+            std::time::SystemTime::now(),
+        ))
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))
+}
+
+/// Prints the `models list` rows for one provider (M13-AC16).
+fn print_model_rows(provider: &str, rows: &[ModelInfo]) {
+    for row in rows {
+        let input = row
+            .input_per_m
+            .map(|v| format!("${v:.4}/1M"))
+            .unwrap_or_else(|| "—".to_string());
+        let output = row
+            .output_per_m
+            .map(|v| format!("${v:.4}/1M"))
+            .unwrap_or_else(|| "—".to_string());
+        let context = row
+            .context_length
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let structured = if row.structured_output { "yes" } else { "no" };
+        println!(
+            "{provider}:{id}\tin {input}\tout {output}\tctx {context}\tstructured {structured}",
+            id = row.id
+        );
+    }
+}
+
+/// Builds the real provider-routing transport from the environment and config
+/// (docs/LLM.md §10.1, ADR-051c/052a). A provider's transport is included only when
+/// its key is present in the environment (`GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
+/// each wrapped in a [`Secret`] so it never leaks through logging. A missing key
+/// therefore fails only when a stage actually dispatches to that provider. The two
+/// transports share one [`reqwest::Client`] (docs/LLM.md §1).
+fn build_router(
+    config: &Config,
+    reasoning_levels: Option<Vec<ReasoningLevel>>,
+) -> Result<Router, PipelineError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    let timeout = Duration::from_secs(config.llm.timeout_secs);
+
+    let gemini = non_empty_env("GEMINI_API_KEY").map(|key| {
+        Gemini::with_client(
+            client.clone(),
+            config.llm.base_url.clone(),
+            Secret::new(key),
+            timeout,
+        )
+    });
+    let openrouter = non_empty_env("OPENROUTER_API_KEY").map(|key| {
+        OpenRouter::with_client(
+            client.clone(),
+            config.llm.openrouter.base_url.clone(),
+            Secret::new(key),
+            timeout,
+            openrouter_config(config, reasoning_levels),
+        )
+    });
+
+    Ok(Router::new(gemini, openrouter, config.default_provider()))
+}
+
+/// Reads an environment variable, treating an absent or blank value as unset.
+fn non_empty_env(name: &str) -> Option<String> {
+    let value = std::env::var(name).unwrap_or_default();
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Builds the OpenRouter provider settings from `[llm.openrouter]` (docs/CONFIG.md §7),
+/// threading the catalog-derived reasoning levels (M13-AC10, `docs/LLM.md` §10.4) when
+/// a stage routes to OpenRouter. When `reasoning_levels` is `None` (no OpenRouter stage
+/// model) the default all-levels set is kept, but that transport is never dispatched to.
+fn openrouter_config(
+    config: &Config,
+    reasoning_levels: Option<Vec<ReasoningLevel>>,
+) -> OpenRouterConfig {
+    let mut cfg = OpenRouterConfig {
+        tier: config.llm.openrouter.tier.clone(),
+        data_collection: config.llm.openrouter.data_collection.clone(),
+        zdr: config.llm.openrouter.zdr,
+        attribution: config.llm.openrouter.attribution,
+        ..OpenRouterConfig::default()
+    };
+    if let Some(levels) = reasoning_levels {
+        cfg.reasoning_levels = levels;
+    }
+    cfg
 }
 
 /// The config label for a CLI service tier.
@@ -1216,7 +1433,20 @@ fn load_config_with(
         env,
         overrides,
     );
-    Ok(config::load(&sources)?)
+    let config = config::load(&sources)?;
+    validate_model_refs(&config)?;
+    Ok(config)
+}
+
+/// Rejects a model reference (from `--model` or `[llm.models]`) that names an unknown
+/// `provider:` prefix, mapping it to exit 2 (docs/LLM.md §10.1, ADR-051a). Empty
+/// models are already rejected by `config::validate`.
+fn validate_model_refs(config: &Config) -> Result<(), PipelineError> {
+    let default = config.default_provider();
+    for raw in [&config.llm.models.analysis, &config.llm.models.translation] {
+        myansub::domain::ModelRef::parse(raw, default).map_err(PipelineError::InvalidModel)?;
+    }
+    Ok(())
 }
 
 /// Maps a dispatch error to its exit code by inspecting the error chain for a
@@ -1255,5 +1485,33 @@ fn command_name(command: &Command) -> &'static str {
         Command::Review { .. } => "review",
         Command::Export(_) => "export",
         Command::Cache { .. } => "cache",
+        Command::Models { .. } => "models",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AC: M13-AC10 — the single shared OpenRouter transport takes the intersection of
+    // the routed stage models' catalog levels, so it never sends an effort a model
+    // rejects. Order follows the first argument (low→high).
+    #[test]
+    fn intersect_levels_keeps_only_common_levels_in_order() {
+        let a = [
+            ReasoningLevel::Minimal,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+        ];
+        let b = [ReasoningLevel::Low, ReasoningLevel::High];
+        assert_eq!(
+            intersect_levels(&a, &b),
+            vec![ReasoningLevel::Low, ReasoningLevel::High]
+        );
+        // No overlap → empty (the transport then omits reasoning entirely).
+        assert!(intersect_levels(&[ReasoningLevel::High], &[ReasoningLevel::Low]).is_empty());
+        // Intersection with an empty (non-reasoning) model is empty.
+        assert!(intersect_levels(&a, &[]).is_empty());
     }
 }

@@ -11,11 +11,14 @@
 use std::time::Duration;
 
 use myansub::domain::{Cue, DigitStyle, QualityFlag};
-use myansub::llm::client::{CommitToken, LlmResponse, ServiceTier, ThinkingSetting, Usage};
+use myansub::llm::client::{
+    CommitToken, LlmError, LlmResponse, ServiceTier, ThinkingSetting, Usage,
+};
 use myansub::llm::dry_run::Estimator;
 use myansub::llm::fake::Fake;
 use myansub::llm::pricing::{Cost, ModelPrice, PriceTable};
 use myansub::llm::retry::RetryConfig;
+use myansub::pipeline::PipelineError;
 use myansub::pipeline::progress::{Progress, ProgressStage};
 use myansub::pipeline::scheduler::SchedulerConfig;
 use myansub::pipeline::scheduler::{Summary, UnitOutcome};
@@ -1399,6 +1402,130 @@ async fn one_failed_batch_does_not_block_others_exit_4() {
     );
     let translations = store.call(|c| list_translations(c)).await.expect("list");
     assert_eq!(translations.len(), 2, "cues 1 and 3 translated");
+}
+
+// ---------------------------------------------------------------------------
+// M13-AC4: a 402 Credits error stops the run; 403 ContentRefused flags the batch
+// ---------------------------------------------------------------------------
+
+// AC: M13-AC4 — a `Credits` (402) error from the transport STOPS the run before any
+// further batch is dispatched, and surfaces as a run-stopping typed error carrying the
+// actionable message (not a per-batch `failed`, not `CompletedWithFailures`). LLM.md
+// §10.6.
+#[tokio::test]
+async fn credits_error_stops_the_run_before_dispatching_more_batches() {
+    // Three cues, batch_size 1 → batches [1],[2],[3]. The first call returns Credits;
+    // the rest would succeed if they were ever dispatched.
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+        cue_full(3, "To the market.", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    let fake = Fake::new()
+        .push_result(Err(LlmError::Credits {
+            message: "add OpenRouter credits, or use a `:free` model".to_string(),
+        }))
+        .always(|| Ok(lines_response(&[(1, MM), (2, MM), (3, MM)])));
+
+    let result = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await;
+
+    match result {
+        Err(PipelineError::Llm(LlmError::Credits { message })) => assert!(
+            message.contains("credits"),
+            "actionable Credits message, got {message:?}"
+        ),
+        other => panic!("expected a run-stopping Credits error, got {other:?}"),
+    }
+
+    // Dispatch halted: only the first batch was ever sent.
+    assert_eq!(
+        fake.call_count(),
+        1,
+        "no further batch is dispatched after a Credits error"
+    );
+}
+
+// AC: M13-AC4 — a `ContentRefused` (403 moderation) error fails exactly that batch and
+// records `QualityFlag::Refused` on its cues; the run CONTINUES and the other batches
+// still complete. LLM.md §10.6, DATA_MODEL §5.
+#[tokio::test]
+async fn content_refused_flags_the_batch_and_others_continue() {
+    // Two cues, batch_size 1 → batches [1],[2]. Batch for cue 1 is refused; cue 2
+    // succeeds. The refusal fires only on the request that carries cue 1.
+    let cues = vec![
+        cue_full(1, "Good morning.", None, true),
+        cue_full(2, "Where are you going?", None, true),
+    ];
+    let store = seed(&cues).await;
+    let token = CancellationToken::new();
+    // Refuse the first dispatched batch, succeed afterwards. Dispatch order is
+    // deterministic (concurrency 1, no warm-up), so the first call is batch 1 (cue 1).
+    let fake = Fake::new()
+        .push_result(Err(LlmError::ContentRefused {
+            message: "flagged by provider moderation".to_string(),
+        }))
+        .always(|| Ok(lines_response(&[(1, MM), (2, MM)])));
+
+    let outcome = run_translation(
+        fake.clone(),
+        &store,
+        &cues,
+        &params(1),
+        TranslationFlags::default(),
+        &token,
+        std::sync::Arc::new(myansub::pipeline::progress::NoopProgress),
+    )
+    .await
+    .expect("run continues after a content refusal");
+
+    assert_eq!(
+        outcome,
+        TranslationOutcome::CompletedWithFailures {
+            failed: 1,
+            incomplete: 0,
+        },
+        "the refused batch failed but the run completed"
+    );
+
+    // Batch 1 is failed; batch 2 is done.
+    let failed = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Failed))
+        .await
+        .expect("count");
+    let done = store
+        .call(|c| count_translation_batches_by_status(c, UnitStatus::Done))
+        .await
+        .expect("count");
+    assert_eq!(failed, 1, "the refused batch is failed");
+    assert_eq!(done, 1, "the other batch still completed");
+
+    // The refused cue carries the `refused` quality flag (persisted).
+    let id1 = store
+        .call(|c| Ok(cue_id_by_idx(c)?.get(&1).copied()))
+        .await
+        .expect("map")
+        .expect("cue 1");
+    let row = store
+        .call(move |c| get_translation(c, id1))
+        .await
+        .expect("get")
+        .expect("refused cue has a row carrying the flag");
+    assert!(
+        row.flags.contains(&QualityFlag::Refused),
+        "refused flag persisted, got {:?}",
+        row.flags
+    );
 }
 
 // ---------------------------------------------------------------------------

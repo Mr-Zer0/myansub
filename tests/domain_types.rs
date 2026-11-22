@@ -2,7 +2,90 @@
 
 use std::str::FromStr;
 
-use myansub::domain::{Cue, Document, FormatMeta, QualityFlag, SubtitleFormat};
+use myansub::domain::{
+    Cue, Document, FormatMeta, ModelRef, ParseModelRefError, Provider, QualityFlag, SubtitleFormat,
+};
+
+// AC: M13-AC1 — a model reference with an explicit `provider:` prefix routes to
+// that provider and strips the prefix from the wire model id.
+#[test]
+fn model_ref_parses_explicit_provider_prefix() {
+    let r = ModelRef::parse("openrouter:anthropic/claude-sonnet-5.5", Provider::Gemini).unwrap();
+    assert_eq!(r.provider, Provider::OpenRouter);
+    assert_eq!(r.model, "anthropic/claude-sonnet-5.5");
+    assert_eq!(r.as_ref_string(), "openrouter:anthropic/claude-sonnet-5.5");
+
+    let g = ModelRef::parse("gemini:gemini-flash-latest", Provider::OpenRouter).unwrap();
+    assert_eq!(g.provider, Provider::Gemini);
+    assert_eq!(g.model, "gemini-flash-latest");
+}
+
+// AC: M13-AC1 — a reference with no provider prefix uses the default provider,
+// and an id that merely contains a `/` (an OpenRouter-style id) is not mistaken
+// for a prefix.
+#[test]
+fn model_ref_without_prefix_uses_default() {
+    let r = ModelRef::parse("gemini-flash-latest", Provider::Gemini).unwrap();
+    assert_eq!(r.provider, Provider::Gemini);
+    assert_eq!(r.model, "gemini-flash-latest");
+
+    let d = ModelRef::parse("anthropic/claude-sonnet-5.5", Provider::OpenRouter).unwrap();
+    assert_eq!(d.provider, Provider::OpenRouter);
+    assert_eq!(d.model, "anthropic/claude-sonnet-5.5");
+}
+
+// AC: M13-AC1 — an OpenRouter id with a `:free` suffix keeps its colon and is a
+// bare model under the default provider, not a provider claim.
+#[test]
+fn model_ref_free_suffix_is_not_a_provider_prefix() {
+    let r = ModelRef::parse(
+        "meta-llama/llama-3.1-8b-instruct:free",
+        Provider::OpenRouter,
+    )
+    .unwrap();
+    assert_eq!(r.provider, Provider::OpenRouter);
+    assert_eq!(r.model, "meta-llama/llama-3.1-8b-instruct:free");
+
+    // provider prefix + a model that itself carries a :free suffix
+    let p = ModelRef::parse(
+        "openrouter:meta-llama/llama-3.1-8b-instruct:free",
+        Provider::Gemini,
+    )
+    .unwrap();
+    assert_eq!(p.provider, Provider::OpenRouter);
+    assert_eq!(p.model, "meta-llama/llama-3.1-8b-instruct:free");
+}
+
+// AC: M13-AC1 — an unknown provider prefix is rejected (main maps it to exit 2).
+#[test]
+fn model_ref_rejects_unknown_provider() {
+    let err = ModelRef::parse("bogus:some-model", Provider::Gemini).unwrap_err();
+    assert_eq!(
+        err,
+        ParseModelRefError::UnknownProvider("bogus".to_string())
+    );
+}
+
+// AC: M13-AC1 — provider labels parse and display canonically.
+#[test]
+fn provider_round_trips() {
+    assert_eq!("gemini".parse::<Provider>().unwrap(), Provider::Gemini);
+    assert_eq!(
+        "openrouter".parse::<Provider>().unwrap(),
+        Provider::OpenRouter
+    );
+    assert_eq!(Provider::OpenRouter.label(), "openrouter");
+    assert!("nope".parse::<Provider>().is_err());
+}
+
+// AC: M13-AC4 — the `refused` quality flag round-trips as snake_case.
+#[test]
+fn refused_flag_serializes_as_snake_case() {
+    let json = serde_json::to_string(&QualityFlag::Refused).unwrap();
+    assert_eq!(json, "\"refused\"");
+    let back: QualityFlag = serde_json::from_str("\"refused\"").unwrap();
+    assert_eq!(back, QualityFlag::Refused);
+}
 
 #[test]
 fn subtitle_format_round_trips_through_str() {

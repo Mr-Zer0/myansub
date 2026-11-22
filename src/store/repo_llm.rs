@@ -26,7 +26,7 @@ use crate::llm::metered::{LlmCallRecord, SinkError, UsageSink};
 // ---------------------------------------------------------------------------
 
 /// A full `llm_cache` row (`docs/DATA_MODEL.md` §2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CacheRow {
     pub key: String,
     pub model: String,
@@ -147,13 +147,15 @@ pub fn prune(conn: &mut Connection, older_than_days: Option<u64>) -> Result<usiz
 pub fn insert_call_in_tx(tx: &Transaction, call: &LlmCallRecord) -> Result<i64, StoreError> {
     tx.execute(
         "INSERT INTO llm_calls \
-         (stage, unit, model, service_tier, prompt_tokens, cached_tokens, output_tokens, \
-          thinking_tokens, latency_ms, cache_hit_local, dry_run, outcome) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         (stage, unit, model, provider, service_tier, prompt_tokens, cached_tokens, output_tokens, \
+          thinking_tokens, latency_ms, cache_hit_local, dry_run, outcome, \
+          generation_id, served_provider, served_tier) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             call.stage,
             call.unit,
             call.model,
+            call.provider,
             call.service_tier,
             call.prompt_tokens,
             call.cached_tokens,
@@ -163,6 +165,9 @@ pub fn insert_call_in_tx(tx: &Transaction, call: &LlmCallRecord) -> Result<i64, 
             call.cache_hit_local as i64,
             call.dry_run as i64,
             call.outcome.as_str(),
+            call.generation_id,
+            call.served_provider,
+            call.served_tier,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -185,7 +190,7 @@ pub fn count_calls(conn: &Connection) -> Result<usize, StoreError> {
 /// Token usage for one `(model, service_tier)` group, summed over `llm_calls`
 /// (`docs/DATA_MODEL.md` §2). Used by `status` to report usage and estimate cost
 /// (`docs/CLI.md` §6, `docs/LLM.md` §9).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelUsage {
     pub model: String,
     /// The `service_tier` label stored on the calls (`flex`/`standard`), or `None`
@@ -226,6 +231,7 @@ pub fn usage_by_model(conn: &Connection) -> Result<Vec<ModelUsage>, StoreError> 
                 thinking_tokens: thinking.max(0) as u64,
                 cache_hit_local: false,
                 applied_tier: None,
+                ..Default::default()
             },
         });
     }

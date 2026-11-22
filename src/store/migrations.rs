@@ -12,7 +12,13 @@ use super::db::StoreError;
 
 /// Migration scripts in order. Index `i` (0-based) upgrades the database to
 /// `user_version = i + 1`. Append new scripts here; never edit a released one.
-const MIGRATIONS: &[&str] = &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4];
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_1,
+    MIGRATION_2,
+    MIGRATION_3,
+    MIGRATION_4,
+    MIGRATION_5,
+];
 
 /// The current schema version (highest migration applied by a fresh open).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -219,6 +225,19 @@ const MIGRATION_4: &str = r#"
 ALTER TABLE project ADD COLUMN translation_digits TEXT;
 "#;
 
+/// Migration 5: provider columns on `llm_calls` (`docs/DATA_MODEL.md` §2, ADR-051/052).
+/// `provider` records which provider served the call (`gemini`/`openrouter`);
+/// `generation_id`, `served_provider`, and `served_tier` are filled only by the
+/// OpenRouter transport (`docs/LLM.md` §10.5) and read `NULL` for Gemini. All four
+/// are nullable; `ALTER TABLE ADD COLUMN` is append-only, so existing projects
+/// migrate without data loss (migrated rows read `NULL`).
+const MIGRATION_5: &str = r#"
+ALTER TABLE llm_calls ADD COLUMN provider TEXT;
+ALTER TABLE llm_calls ADD COLUMN generation_id TEXT;
+ALTER TABLE llm_calls ADD COLUMN served_provider TEXT;
+ALTER TABLE llm_calls ADD COLUMN served_tier TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,8 +360,14 @@ mod tests {
         )
         .expect("insert project");
 
-        // Apply the full set: versions 1..3 skipped, version 4 applied.
-        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 4");
+        // Apply through version 4: versions 1..3 skipped, version 4 applied. Scoped to
+        // the first four scripts so this stays a migration-4 test as later migrations
+        // are appended to `MIGRATIONS`.
+        run_migrations_with(
+            &mut conn,
+            &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4],
+        )
+        .expect("apply migration 4");
         let v4: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
@@ -358,5 +383,63 @@ mod tests {
             .expect("read project row");
         assert_eq!(path, "movie.en.srt");
         assert_eq!(digits, None);
+    }
+
+    // AC: M13-AC5 — migration 5 adds the `llm_calls` provider columns without losing
+    // an existing row: the prior columns survive, the new columns read NULL for a row
+    // written before the migration, and user_version → 5.
+    #[test]
+    fn migration_five_adds_llm_calls_provider_columns() {
+        let mut conn = Connection::open_in_memory().expect("open");
+
+        // Bring the database up to version 4 only, then record an llm_calls row.
+        run_migrations_with(
+            &mut conn,
+            &[MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4],
+        )
+        .expect("apply 1..4");
+        conn.execute(
+            "INSERT INTO llm_calls (stage, model, service_tier, outcome) \
+             VALUES ('translation', 'gemini-flash-latest', 'flex', 'ok')",
+            [],
+        )
+        .expect("insert llm_call");
+
+        // Apply the full set: versions 1..4 skipped, version 5 applied.
+        run_migrations_with(&mut conn, MIGRATIONS).expect("apply migration 5");
+        let v5: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(v5, 5);
+        assert_eq!(SCHEMA_VERSION, 5);
+
+        // The pre-existing row survives; the four new columns are NULL.
+        let (model, provider, generation_id, served_provider, served_tier): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT model, provider, generation_id, served_provider, served_tier \
+                 FROM llm_calls LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read llm_calls row");
+        assert_eq!(model, "gemini-flash-latest");
+        assert_eq!(provider, None);
+        assert_eq!(generation_id, None);
+        assert_eq!(served_provider, None);
+        assert_eq!(served_tier, None);
     }
 }

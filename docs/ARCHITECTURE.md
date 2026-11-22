@@ -57,17 +57,20 @@ src/
     repo_project.rs  repo_cues.rs  repo_analysis.rs  repo_units.rs
     repo_translations.rs  repo_llm.rs
   llm/
-    client.rs           # trait LlmClient, LlmRequest, LlmResponse, Usage
-    gemini.rs           # reqwest transport: request/response mapping only
+    client.rs           # trait LlmClient, LlmRequest, LlmResponse, Usage (provider-neutral)
+    router.rs           # Router: LlmClient that dispatches by model-ref provider (M13, ADR-051c)
+    gemini.rs           # Gemini reqwest transport: request/response mapping only
+    openrouter.rs       # OpenRouter reqwest transport: request/response mapping only (M13)
+    catalog.rs          # trait ModelCatalog + GeminiCatalog / OpenRouterCatalog (M13, ADR-051f)
     retry.rs            # pure transport retry policy + Retrying layer
-    cache.rs            # local response cache layer
+    cache.rs            # local response cache layer (provider in the key)
     context_cache.rs    # Gemini explicit cache lifecycle
     metered.rs          # usage recording layer
     dry_run.rs          # bottom layer that records and estimates instead of sending
     fake.rs             # scripted transport for tests (cfg(test) or feature "testing")
-    pricing.rs          # pure cost functions
+    pricing.rs          # pure cost functions (prices read through ModelCatalog)
     prompts.rs          # prompt builders, PROMPT_VERSION
-    schemas.rs          # Gemini response schemas
+    schemas.rs          # response schemas (shared by both providers)
   quality/
     checks.rs           # deterministic checks; used by pipeline and review
   pipeline/
@@ -94,7 +97,9 @@ main/cli ─► pipeline, review ─► llm, quality, store, formats ─► doma
   the scheduler depend only on the trait, not on `main`/`cli`.
 - `quality` must not depend on `llm` or `store` (pure functions over domain types).
 - `llm` must not depend on `pipeline`. It may depend on `store` only inside `cache.rs` and
-  `metered.rs`, through a narrow trait (`CacheStore`, `UsageSink`) defined in `llm`.
+  `metered.rs`, through a narrow trait (`CacheStore`, `UsageSink`) defined in `llm`, and inside
+  `catalog.rs`, which reuses the leaf `store::atomic` write helper for the OpenRouter catalog
+  cache (ADR-052b — a crash-safe file write, not a DB coupling; no new crate).
 
 ## 4. Key responsibilities
 
@@ -123,17 +128,25 @@ All layers implement the same `LlmClient` trait.
 
 ```
 pipeline ──► Metered ──► Cached ──► Retrying ──► Transport
-                                                  ├─ Gemini   (normal)
+                                                  ├─ Router   (normal; dispatches by provider)
+                                                  │    ├─ Gemini
+                                                  │    └─ OpenRouter
                                                   ├─ DryRun   (--dry-run)
                                                   └─ Fake     (tests)
 ```
 
 - **Metered** (outermost): writes one `llm_calls` row per logical request, including local
-  cache hits (cost 0).
+  cache hits (cost 0). Records the `provider` (M13).
 - **Cached**: looks up / stores in `llm_cache`. Stores only responses that the caller marked
-  valid (see `LLM.md` §4). Sits outside Retrying so a hit never triggers retries.
-- **Retrying**: applies the transport retry policy, including Flex→standard tier fallback.
-- **Transport**: `enum Transport { Gemini(..), DryRun(..), Fake(..) }` implementing `LlmClient`.
+  valid (see `LLM.md` §4). The full `provider:model` is in the key, so two providers never
+  collide. Sits outside Retrying so a hit never triggers retries.
+- **Retrying**: applies the transport retry policy. Operates on `ErrorClass` only, so it is
+  provider-agnostic; each transport maps its own statuses via `classify` (`LLM.md` §6/§10).
+- **Transport**: there is no `enum Transport` — each transport is a struct implementing
+  `LlmClient` (static dispatch, ADR-008/051c). A real run wraps a single **`Router`** (which holds
+  the per-provider transports it has keys for and delegates `generate` by the request's model-ref
+  provider) so both providers share one `Metered<Cached<Retrying<_>>>` stack. `DryRun` (`--dry-run`)
+  and `Fake` (tests) are swapped in whole in place of the `Router`.
 
 Static dispatch: layers are generic structs, e.g. `Metered<Cached<Retrying<Transport>>>`.
 Define the trait method as
@@ -200,6 +213,11 @@ Dev-dependencies (approved): `tempfile`, `wiremock`.
 Note: `subtitler` versions 0.0.x are an unrelated older codebase. Always use 2.x.
 Do not add `native-tls`, `openssl`, `chrono`, `async-trait`, or `rand`. Backoff jitter uses
 a small local xorshift seeded from the system clock.
+
+M13 (OpenRouter) adds **no new crate**: the second transport reuses `reqwest`; the OpenRouter
+catalog's 24 h disk cache resolves the user cache dir by hand (like `config.rs` resolves the config
+dir) and writes via `store::atomic`, judging freshness from the file mtime (no `dirs`, no `chrono`).
+API keys stay env-var only — no keychain crate (PBI-008 deferred, ADR-052).
 
 No progress-bar/spinner crate (`indicatif` et al.) is approved: progress (§11) is hand-rolled on `std`
 (stderr writes, `std::time::Instant`, `std::io::IsTerminal`).

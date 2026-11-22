@@ -667,6 +667,7 @@ async fn status_aggregates_usage_and_prices_known_models() {
                     stage: "analysis".to_string(),
                     unit: None,
                     model: "priced-model".to_string(),
+                    provider: Some("gemini".to_string()),
                     service_tier: Some("standard".to_string()),
                     prompt_tokens: Some(1000),
                     cached_tokens: Some(200),
@@ -676,6 +677,9 @@ async fn status_aggregates_usage_and_prices_known_models() {
                     cache_hit_local: false,
                     dry_run: false,
                     outcome: CallOutcome::Ok,
+                    generation_id: None,
+                    served_provider: None,
+                    served_tier: None,
                 },
             )?;
             insert_call(
@@ -684,6 +688,7 @@ async fn status_aggregates_usage_and_prices_known_models() {
                     stage: "translation".to_string(),
                     unit: Some(1),
                     model: "mystery-model".to_string(),
+                    provider: Some("gemini".to_string()),
                     service_tier: Some("standard".to_string()),
                     prompt_tokens: Some(300),
                     cached_tokens: Some(0),
@@ -693,6 +698,9 @@ async fn status_aggregates_usage_and_prices_known_models() {
                     cache_hit_local: false,
                     dry_run: false,
                     outcome: CallOutcome::Ok,
+                    generation_id: None,
+                    served_provider: None,
+                    served_tier: None,
                 },
             )?;
             Ok(())

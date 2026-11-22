@@ -29,6 +29,7 @@ fn record() -> LlmCallRecord {
         stage: "translation".to_string(),
         unit: Some(3),
         model: "gemini-flash-latest".to_string(),
+        provider: Some("gemini".to_string()),
         service_tier: Some("flex".to_string()),
         prompt_tokens: Some(120),
         cached_tokens: Some(30),
@@ -38,6 +39,9 @@ fn record() -> LlmCallRecord {
         cache_hit_local: false,
         dry_run: false,
         outcome: CallOutcome::Ok,
+        generation_id: None,
+        served_provider: None,
+        served_tier: None,
     }
 }
 

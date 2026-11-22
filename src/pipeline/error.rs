@@ -93,6 +93,19 @@ pub enum PipelineError {
     #[error("GEMINI_API_KEY is not set; export it (or add it to a `.env` file) to run analysis")]
     MissingApiKey,
 
+    /// A model reference (from `--model` or `[llm.models]`) named an unknown
+    /// `provider:` prefix (`docs/LLM.md` §10.1, ADR-051a). Maps to exit code 2
+    /// (usage error, like a clap/flag error).
+    #[error("{0}")]
+    InvalidModel(crate::domain::ParseModelRefError),
+
+    /// An OpenRouter model failed catalog validation at startup, or the catalog
+    /// could not be loaded (`docs/LLM.md` §10.9, ADR-051f). An unknown id or a model
+    /// without structured-output support is a usage error (exit 2); an unavailable
+    /// catalog is a generic error (exit 1).
+    #[error(transparent)]
+    Catalog(#[from] crate::llm::catalog::CatalogError),
+
     /// Project resolution failed (`docs/CLI.md` §2). Maps to exit code 3 (except
     /// an unreadable directory, which is a generic error).
     #[error(transparent)]
