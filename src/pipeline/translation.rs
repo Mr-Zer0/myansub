@@ -39,8 +39,8 @@
 //! than burning the remaining budget on an unresponsive model.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -50,8 +50,8 @@ use crate::llm::assemble_stack;
 use crate::llm::cache::Cached;
 use crate::llm::canonical::canonical_json;
 use crate::llm::client::{
-    CommitToken, ContentBlock, GenerationConfig, LlmClient, LlmError, LlmRequest, ServiceTier,
-    ThinkingSetting,
+    CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError, LlmRequest,
+    ServiceTier, ThinkingSetting,
 };
 use crate::llm::dry_run::{DryRun, Estimator};
 use crate::llm::metered::CallContext;
@@ -367,6 +367,7 @@ where
         digits: params.digits,
         formal_segments: sheet.formal_segments.clone(),
         idx_to_id,
+        run_stop: Arc::new(Mutex::new(None)),
     });
 
     let units: Vec<Arc<TranslationBatchUnit<T>>> = assembled
@@ -384,6 +385,14 @@ where
     progress.stage_start(ProgressStage::Translation);
     let summary = scheduler::run(units, params.scheduler, token, progress.clone()).await;
     progress.stage_finish(summary);
+
+    // A run-stopping Credits error (402) halts dispatch via the token, so this also
+    // trips `token.is_cancelled()` below; surface the typed error FIRST so `main` prints
+    // the actionable "add OpenRouter credits…" message and exits non-zero, rather than
+    // reporting a plain interrupt (`docs/LLM.md` §10.6, ADR-051e).
+    if let Some(err) = ctx.run_stop.lock().ok().and_then(|mut slot| slot.take()) {
+        return Err(PipelineError::Llm(err));
+    }
 
     if token.is_cancelled() {
         return Ok(TranslationOutcome::Interrupted);
@@ -1329,6 +1338,12 @@ struct BatchExecCtx<T> {
     /// `(literary: <kind>)` register markers on its TRANSLATE lines (ADR-049(b)).
     formal_segments: Vec<FormalRange>,
     idx_to_id: BTreeMap<u32, i64>,
+    /// A run-stopping error captured by a batch (OpenRouter 402 Credits, `docs/LLM.md`
+    /// §10.6). The first batch to hit it records the typed error here and cancels the
+    /// scheduler token so dispatch halts; `run_translation` reads it after the scheduler
+    /// returns and surfaces it to `main` as a run-stopping error (exit 3), rather than
+    /// collapsing it into a per-batch `failed` with a stringified message (ADR-051e).
+    run_stop: Arc<Mutex<Option<LlmError>>>,
 }
 
 /// One translation batch as a [`WorkUnit`] (`docs/ARCHITECTURE.md` §4/§6). Its
@@ -1608,11 +1623,25 @@ where
                     .await;
                 UnitOutcome::Failed
             }
-            CallResult::Transport(err) => {
-                let message = err.to_string();
-                self.mark_failed(&message).await;
-                UnitOutcome::Failed
-            }
+            CallResult::Transport(err) => match err.class() {
+                // 402 Credits is run-stopping (`docs/LLM.md` §10.6): record the typed
+                // error, cancel the scheduler token so no further batch is dispatched,
+                // and leave this batch `in_flight` (NOT `failed`) so a resume — once
+                // credits are added — reruns it. `run_translation` surfaces the recorded
+                // error to `main`.
+                ErrorClass::Credits => {
+                    if let Ok(mut slot) = self.ctx.run_stop.lock() {
+                        slot.get_or_insert(err);
+                    }
+                    self.ctx.token.cancel();
+                    UnitOutcome::Failed
+                }
+                _ => {
+                    let message = err.to_string();
+                    self.mark_failed(&message).await;
+                    UnitOutcome::Failed
+                }
+            },
             CallResult::Cancelled => {
                 // Leave the batch `in_flight`; `Store::open` recovers it to `pending`
                 // so the rerun resumes it without re-sending a completed batch.

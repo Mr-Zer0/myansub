@@ -143,12 +143,16 @@ impl ExitCode for ReviewError {
 }
 
 impl ExitCode for LlmError {
-    /// A cancelled operation maps to the interrupted code (130); every other
-    /// `LlmError` maps to the generic error code. The pipeline translates failed
-    /// *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
+    /// A cancelled operation maps to the interrupted code (130); an out-of-credits stop
+    /// (OpenRouter 402) is a precondition the user must satisfy before the run can
+    /// proceed — add credits or switch to a `:free` model — so it maps to exit 3
+    /// (precondition), the closest existing mapping (`docs/LLM.md` §10.6, ADR-051e).
+    /// Every other `LlmError` maps to the generic error code. The pipeline translates
+    /// failed *units* to exit 4 later (see the task brief and `docs/CLI.md` §7).
     fn exit_code(&self) -> i32 {
         match self {
             LlmError::Cancelled => exit::INTERRUPTED,
+            LlmError::Credits { .. } => exit::PRECONDITION,
             _ => exit::ERROR,
         }
     }
@@ -175,6 +179,26 @@ mod tests {
             }
             .exit_code(),
             exit::ERROR
+        );
+    }
+
+    // AC: M13-AC4 — an out-of-credits stop (402) is a precondition (exit 3), so `main`
+    // exits non-zero with the actionable message (`docs/LLM.md` §10.6, ADR-051e).
+    #[test]
+    fn credits_error_maps_to_precondition_exit_code() {
+        assert_eq!(
+            LlmError::Credits {
+                message: "add OpenRouter credits, or use a `:free` model".to_string(),
+            }
+            .exit_code(),
+            exit::PRECONDITION
+        );
+        assert_eq!(
+            PipelineError::Llm(LlmError::Credits {
+                message: "add credits".to_string(),
+            })
+            .exit_code(),
+            exit::PRECONDITION
         );
     }
 

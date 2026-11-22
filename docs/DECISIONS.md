@@ -1027,3 +1027,47 @@ TEXT`, `served_provider TEXT`, `served_tier TEXT` to `llm_calls` (all nullable; 
 three `NULL`). A migration-5 test mirrors the existing migration-2/3/4 data-preservation tests (`SCHEMA_VERSION → 5`,
 pre-existing rows intact, new columns read `NULL`). `translation_batches.model`/`translations.model` now hold the
 full `provider:model` string — a value change only, no DDL. `PROMPT_VERSION` stays `5` (no prompt text changed).
+
+### ADR-051 addendum — M13 QA-review fixes (2026-11, PBI-009)
+Follow-up to the M13 QA review. Four behaviour fixes plus three recorded known-limitations:
+
+(a) **402 Credits now actually stops the run (M13-AC4, `LLM.md` §10.6).** The translation content loop surfaced a
+`Credits` error as `CallResult::Transport(err)` and collapsed it via `mark_failed(&err.to_string())`, so the
+scheduler kept dispatching the remaining batches and the actionable message was lost to stringification. Now a batch
+whose transport error classes as `ErrorClass::Credits` records the typed `LlmError` in a shared `run_stop` slot on
+the batch context and cancels the scheduler's `CancellationToken` (halting dispatch exactly like Ctrl-C); the batch is
+left `in_flight` (NOT per-batch `failed`), so a resume after credits are added reruns it. `run_translation` reads the
+slot after the scheduler returns — *before* the `token.is_cancelled()` interrupt check — and returns
+`Err(PipelineError::Llm(Credits))` so `main` prints "add OpenRouter credits, or use a `:free` model". This mirrors the
+analysis stage, which already returns `Err(PipelineError::Llm)` on a single-pass transport failure. **Exit code:**
+`LlmError::Credits` maps to **exit 3 (precondition)** — the closest existing mapping, since the user must add credits
+(or pick a `:free` model) before the run can proceed, like the other precondition stops in `CLI.md` §7. Not
+transport-retried (already `GiveUp` in `retry.rs`).
+
+(c) **Catalog reasoning levels are wired into the live transport (M13-AC10, `LLM.md` §10.4).** `build_router` /
+`openrouter_config` previously used `OpenRouterConfig { .., ..Default::default() }`, whose `reasoning_levels` default
+is ALL levels, so `OpenRouterCatalog::supported_reasoning_levels` never affected a real run (the nearest-lower/omit
+fallback could not trigger, and a non-reasoning model still got `reasoning.effort` with `require_parameters=true`).
+Now the OpenRouter catalog is loaded once at startup (the same load `ensure_model_supported` already does) and each
+OpenRouter-routed stage model's `supported_reasoning_levels` is threaded into that provider's
+`OpenRouterConfig.reasoning_levels`.
+
+(d) **`[verify] session_id derivation (known deviation).** `LLM.md` §10.2 specifies the sticky-routing key as
+`sha256(source_hash + stage + analysis_version)`. The implementation instead derives it from the hash of the
+cached-prefix text (system instruction + cached-prefix content blocks), which is byte-stable within a stage and
+differs across stages / analysis versions, so it satisfies the observable intent (one upstream endpoint per stage).
+For a single-content analysis request the prefix is near-constant across versions, so this reduces to a near-constant
+value. Both the field name (`session_id`) and this derivation are **[verify]** against the live OpenRouter docs. Impact
+is routing affinity only — no effect on produced output. Left as-is (the available cheap improvement — folding
+`analysis_version` into the hash — would weaken within-stage stability for map-reduce, which is the opposite of what
+sticky routing wants).
+
+(e) **OpenRouter real-run cost reporting is a known follow-up.** `usage.cost` is parsed into `Usage.cost_usd`
+(AC11, met) but is not yet persisted or consumed by the cost summary, which still prices OpenRouter rows through the
+Gemini `[pricing]` table and reports "unknown" for models absent there. No AC mandates persisting the actual cost, so
+this is recorded as a follow-up (it would need a `cost` column on `llm_calls` and a cost-source switch), not fixed now.
+
+(f) **503 "retryable ×3 then fatal" — the ×3 is illustrative.** A 503 (no endpoint meets the routing settings) is
+`ErrorClass::Retryable` and is retried under the general `llm.max_retries` budget with an actionable routing message
+naming `tier`/`data_collection`/`zdr`; the "×3" in `LLM.md` §10.6 is illustrative of "retry a few times then give a
+clear routing error", not a hard-coded cap separate from `max_retries`.
