@@ -97,7 +97,9 @@ main/cli ─► pipeline, review ─► llm, quality, store, formats ─► doma
   the scheduler depend only on the trait, not on `main`/`cli`.
 - `quality` must not depend on `llm` or `store` (pure functions over domain types).
 - `llm` must not depend on `pipeline`. It may depend on `store` only inside `cache.rs` and
-  `metered.rs`, through a narrow trait (`CacheStore`, `UsageSink`) defined in `llm`.
+  `metered.rs`, through a narrow trait (`CacheStore`, `UsageSink`) defined in `llm`, and inside
+  `catalog.rs`, which reuses the leaf `store::atomic` write helper for the OpenRouter catalog
+  cache (ADR-052b — a crash-safe file write, not a DB coupling; no new crate).
 
 ## 4. Key responsibilities
 

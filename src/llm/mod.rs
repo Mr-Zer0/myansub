@@ -32,7 +32,10 @@ pub mod fake;
 
 pub use cache::{CacheError, CacheStore, Cached, CachedEntry, cache_key};
 pub use canonical::canonical_json;
-pub use catalog::{CatalogError, GeminiCatalog, ModelCatalog, ReasoningLevel};
+pub use catalog::{
+    CATALOG_TTL, CatalogError, GeminiCatalog, ModelCatalog, OpenRouterCatalog, ReasoningLevel,
+    catalog_cache_path,
+};
 pub use client::{
     CachePayload, CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError,
     LlmRequest, LlmResponse, Role, Secret, ServiceTier, ThinkingSetting, Usage,
