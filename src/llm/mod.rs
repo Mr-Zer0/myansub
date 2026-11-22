@@ -11,6 +11,7 @@
 
 pub mod cache;
 pub mod canonical;
+pub mod catalog;
 pub mod client;
 pub mod context_cache;
 pub mod dry_run;
@@ -29,6 +30,7 @@ pub mod fake;
 
 pub use cache::{CacheError, CacheStore, Cached, CachedEntry, cache_key};
 pub use canonical::canonical_json;
+pub use catalog::{CatalogError, GeminiCatalog, ModelCatalog, ReasoningLevel};
 pub use client::{
     CachePayload, CommitToken, ContentBlock, ErrorClass, GenerationConfig, LlmClient, LlmError,
     LlmRequest, LlmResponse, Role, Secret, ServiceTier, ThinkingSetting, Usage,
@@ -41,7 +43,7 @@ pub use context_cache::{
 pub use dry_run::{DryRun, Estimator};
 pub use gemini::Gemini;
 pub use metered::{CallContext, CallOutcome, LlmCallRecord, Metered, SinkError, UsageSink};
-pub use pricing::{Cost, ModelPrice, PriceTable, cost, storage_cost};
+pub use pricing::{Cost, ModelPrice, PriceSource, PriceTable, cost, storage_cost};
 pub use prompts::{PROMPT_VERSION, TranslationBlock, TranslationLine};
 pub use retry::{Decision, RetryConfig, Xorshift, decide};
 pub use retrying::Retrying;
