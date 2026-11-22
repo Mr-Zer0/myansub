@@ -102,8 +102,43 @@ pub struct Llm {
     pub service_tier_fallback: bool,
     pub max_sheds_before_fallback: u32,
     pub confirm_above_usd: f64,
+    /// Provider for an unprefixed model reference (`gemini`/`openrouter`, default
+    /// `gemini`; `docs/CONFIG.md` §7, `docs/LLM.md` §10.1).
+    pub default_provider: String,
     pub models: Models,
     pub thinking: Thinking,
+    /// OpenRouter provider settings (`[llm.openrouter]`, `docs/CONFIG.md` §7).
+    pub openrouter: OpenRouter,
+}
+
+/// OpenRouter provider settings (`[llm.openrouter]`, `docs/CONFIG.md` §7, ADR-051).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenRouter {
+    /// API base URL (default `https://openrouter.ai/api/v1`).
+    pub base_url: String,
+    /// Endpoint-selection tier: `floor` | `flex` | `default` (default `floor`,
+    /// cheapest endpoint incl. flex with automatic fallback, `docs/LLM.md` §10.7).
+    pub tier: String,
+    /// Whether endpoints that may train on data are allowed: `deny` | `allow`
+    /// (default `deny`). Named in the free-model routing error (`docs/LLM.md` §10.8).
+    pub data_collection: String,
+    /// Require zero-data-retention endpoints (default `false`).
+    pub zdr: bool,
+    /// When true, send `X-OpenRouter-Title: myansub` (default `false`).
+    pub attribution: bool,
+}
+
+impl Default for OpenRouter {
+    fn default() -> Self {
+        Self {
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            tier: "floor".to_string(),
+            data_collection: "deny".to_string(),
+            zdr: false,
+            attribution: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -249,8 +284,10 @@ impl Default for Llm {
             service_tier_fallback: true,
             max_sheds_before_fallback: 3,
             confirm_above_usd: 1.0,
+            default_provider: "gemini".to_string(),
             models: Models::default(),
             thinking: Thinking::default(),
+            openrouter: OpenRouter::default(),
         }
     }
 }
@@ -456,6 +493,9 @@ fn apply_env(table: &mut toml::Table, env: &[(String, String)]) -> Result<(), Co
             "MYANSUB_SERVICE_TIER" => {
                 set_path(table, &["llm", "service_tier"], value.clone().into());
             }
+            "MYANSUB_DEFAULT_PROVIDER" => {
+                set_path(table, &["llm", "default_provider"], value.clone().into());
+            }
             "MYANSUB_CONCURRENCY" => {
                 let parsed: u32 = value.parse().ok().filter(|n| *n >= 1).ok_or_else(|| {
                     ConfigError::InvalidEnv {
@@ -566,6 +606,39 @@ impl Config {
                 ),
             });
         }
+        if !matches!(self.llm.default_provider.as_str(), "gemini" | "openrouter") {
+            return Err(ConfigError::Invalid {
+                key: "llm.default_provider".to_string(),
+                message: format!(
+                    "must be one of gemini, openrouter; got `{}`",
+                    self.llm.default_provider
+                ),
+            });
+        }
+        if !matches!(
+            self.llm.openrouter.tier.as_str(),
+            "floor" | "flex" | "default"
+        ) {
+            return Err(ConfigError::Invalid {
+                key: "llm.openrouter.tier".to_string(),
+                message: format!(
+                    "must be one of floor, flex, default; got `{}`",
+                    self.llm.openrouter.tier
+                ),
+            });
+        }
+        if !matches!(
+            self.llm.openrouter.data_collection.as_str(),
+            "deny" | "allow"
+        ) {
+            return Err(ConfigError::Invalid {
+                key: "llm.openrouter.data_collection".to_string(),
+                message: format!(
+                    "must be one of deny, allow; got `{}`",
+                    self.llm.openrouter.data_collection
+                ),
+            });
+        }
         if self.quality.drift_ratio < 1.0 {
             return Err(ConfigError::Invalid {
                 key: "quality.drift_ratio".to_string(),
@@ -614,6 +687,19 @@ impl Config {
             });
         }
         Ok(())
+    }
+
+    /// The validated default provider (`llm.default_provider`, ADR-051a). Falls back
+    /// to [`Provider::Gemini`] for an unrecognized value, which [`validate`] has
+    /// already rejected before any caller reaches this.
+    ///
+    /// [`Provider::Gemini`]: crate::domain::Provider::Gemini
+    /// [`validate`]: Config::validate
+    pub fn default_provider(&self) -> crate::domain::Provider {
+        match self.llm.default_provider.as_str() {
+            "openrouter" => crate::domain::Provider::OpenRouter,
+            _ => crate::domain::Provider::Gemini,
+        }
     }
 
     /// The validated digit style (`[burmese].digits`, ADR-049(e)). Falls back to

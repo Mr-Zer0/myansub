@@ -12,11 +12,21 @@ service_tier = "flex"            # flex (≈50% cheaper, may be shed) | standard
 service_tier_fallback = true     # move a unit to standard after repeated sheds
 max_sheds_before_fallback = 3
 confirm_above_usd = 1.0          # ask before runs estimated above this (0 = always ask)
+default_provider = "gemini"      # gemini | openrouter; provider for an unprefixed model reference
 
 [llm.models]
 # Aliases are convenient; pin explicit versions for reproducible results and caching.
+# Prefix a reference with a provider to route it there, e.g.
+# translation = "openrouter:anthropic/claude-sonnet-5.5"
 analysis = "gemini-flash-latest"
 translation = "gemini-flash-latest"
+
+[llm.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+tier = "floor"                   # floor (cheapest, incl. flex, auto-fallback) | flex | default
+data_collection = "deny"         # deny | allow; whether endpoints that may train on data are allowed
+zdr = false                      # require zero-data-retention endpoints
+attribution = false              # when true, send X-OpenRouter-Title: myansub
 
 [llm.thinking]
 analysis = "low"                 # off | minimal | low | medium | high | <token budget>

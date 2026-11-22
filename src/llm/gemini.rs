@@ -96,7 +96,7 @@ impl Gemini {
         format!(
             "{}/models/{}:generateContent",
             self.base_url.trim_end_matches('/'),
-            model
+            bare_model(model)
         )
     }
 }
@@ -217,13 +217,26 @@ fn build_cached_content_body(req: &CreateCacheRequest) -> Value {
 }
 
 /// Qualifies a plain model name to the `models/<name>` form the `cachedContents`
-/// endpoint expects, leaving an already-qualified name untouched.
+/// endpoint expects, leaving an already-qualified name untouched. Any `provider:`
+/// prefix is stripped first (`docs/LLM.md` §10.1): the provider half selects the
+/// transport and is never sent on the wire.
 fn qualify_model(model: &str) -> String {
-    if model.starts_with("models/") {
-        model.to_string()
+    let bare = bare_model(model);
+    if bare.starts_with("models/") {
+        bare
     } else {
-        format!("models/{model}")
+        format!("models/{bare}")
     }
+}
+
+/// Strips any `provider:` prefix from a model reference, returning the bare model
+/// id Gemini's wire API expects (`docs/LLM.md` §10.1). Backward compatible with a
+/// bare model id (`gemini-flash-latest` → `gemini-flash-latest`). An unparseable
+/// reference is returned unchanged.
+fn bare_model(model: &str) -> String {
+    crate::domain::ModelRef::parse(model, crate::domain::Provider::Gemini)
+        .map(|r| r.model)
+        .unwrap_or_else(|_| model.to_string())
 }
 
 /// Parses a successful `cachedContents` create body into a [`CacheHandle`]: the
@@ -249,7 +262,7 @@ fn parse_cache_handle(body: &str) -> Result<CacheHandle, LlmError> {
 fn build_request_body(req: &LlmRequest) -> Value {
     let mut body = json!({
         "contents": req.contents.iter().map(content_block_json).collect::<Vec<_>>(),
-        "generationConfig": generation_config_json(&req.model, &req.generation_config),
+        "generationConfig": generation_config_json(&bare_model(&req.model), &req.generation_config),
         "serviceTier": service_tier_label(req.service_tier),
     });
 
@@ -591,6 +604,22 @@ mod tests {
         let debug = format!("{gemini:?}");
         assert!(!debug.contains(key), "api key leaked in Debug: {debug}");
         assert!(debug.contains("redacted"));
+    }
+
+    // AC: M13-AC3 — a `gemini:` (or any `provider:`) prefix is stripped before the
+    // wire URL is built; a bare model id is unchanged (backward compatible).
+    #[test]
+    fn endpoint_strips_provider_prefix() {
+        let gemini = Gemini::new("https://example.test/v1", "k", Duration::from_secs(5))
+            .expect("build gemini");
+        assert_eq!(
+            gemini.endpoint("gemini:gemini-flash-latest"),
+            "https://example.test/v1/models/gemini-flash-latest:generateContent"
+        );
+        assert_eq!(
+            gemini.endpoint("gemini-flash-latest"),
+            "https://example.test/v1/models/gemini-flash-latest:generateContent"
+        );
     }
 
     #[test]

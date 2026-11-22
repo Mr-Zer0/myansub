@@ -53,6 +53,24 @@ fn env_overrides_project_file() {
     assert_eq!(config.llm.service_tier, "flex");
 }
 
+// AC: M13-AC1 — `MYANSUB_DEFAULT_PROVIDER` overrides the config file.
+#[test]
+fn env_overrides_default_provider() {
+    let project = write_toml("[llm]\ndefault_provider = \"gemini\"\n");
+
+    let sources = ConfigSources {
+        project_file: Some(project.path().to_path_buf()),
+        env: vec![(
+            "MYANSUB_DEFAULT_PROVIDER".to_string(),
+            "openrouter".to_string(),
+        )],
+        ..Default::default()
+    };
+    let config = myansub::config::load(&sources).expect("load");
+
+    assert_eq!(config.llm.default_provider, "openrouter");
+}
+
 // AC: M0-AC2
 #[test]
 fn cli_flag_overrides_env() {

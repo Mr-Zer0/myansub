@@ -793,9 +793,10 @@ fn boundary_action(stage: Stage) -> String {
 /// (`docs/CONFIG.md`). Shared by `run` and `main`'s `analyze` handler so the two
 /// agree on how config maps to params.
 pub fn analysis_params(config: &Config, source_hash: &str) -> AnalysisParams {
+    let (model, tier) = resolve_model(config, &config.llm.models.analysis);
     AnalysisParams {
-        model: config.llm.models.analysis.clone(),
-        tier: parse_tier_label(&config.llm.service_tier),
+        model,
+        tier,
         thinking: parse_thinking(&config.llm.thinking.analysis),
         source_digest: source_hash.to_string(),
         max_content_attempts: config.translation.max_content_attempts,
@@ -812,9 +813,10 @@ pub fn analysis_params(config: &Config, source_hash: &str) -> AnalysisParams {
 /// Builds [`TranslationParams`] from the resolved config (`docs/CONFIG.md`
 /// `[translation]`). Shared by `run` and `main`'s `translate` handler.
 pub fn translation_params(config: &Config) -> TranslationParams {
+    let (model, tier) = resolve_model(config, &config.llm.models.translation);
     TranslationParams {
-        model: config.llm.models.translation.clone(),
-        tier: parse_tier_label(&config.llm.service_tier),
+        model,
+        tier,
         thinking: parse_thinking(&config.llm.thinking.translation),
         batch_size: config.translation.batch_size,
         context_before: config.translation.context_before,
@@ -827,6 +829,41 @@ pub fn translation_params(config: &Config) -> TranslationParams {
         scheduler: scheduler_from(config),
         seed: clock_seed(),
         retry: retry_from(config),
+    }
+}
+
+/// Resolves a configured model string into its canonical `provider:model` reference
+/// and the service tier that provider should use (`docs/LLM.md` §10.1, ADR-051a/d).
+/// The full reference is what is stored (`DATA_MODEL.md` §2) and folded into the
+/// local cache key, so a `gemini:` and an `openrouter:` call never collide.
+///
+/// The tier depends on the provider: Gemini uses `llm.service_tier`
+/// (`flex`/`standard`); OpenRouter uses `llm.openrouter.tier`
+/// (`floor`/`flex`/`default`). An unparseable reference (unknown provider) is
+/// returned unchanged under the Gemini tier — `main` validates references and exits
+/// 2 before this is reached on a real run (`docs/CLI.md` §7).
+fn resolve_model(config: &Config, raw: &str) -> (String, ServiceTier) {
+    use crate::domain::{ModelRef, Provider};
+    match ModelRef::parse(raw, config.default_provider()) {
+        Ok(model_ref) => {
+            let tier = match model_ref.provider {
+                Provider::OpenRouter => openrouter_tier(&config.llm.openrouter.tier),
+                Provider::Gemini => parse_tier_label(&config.llm.service_tier),
+            };
+            (model_ref.as_ref_string(), tier)
+        }
+        Err(_) => (raw.to_string(), parse_tier_label(&config.llm.service_tier)),
+    }
+}
+
+/// Maps an `[llm.openrouter].tier` label to a neutral [`ServiceTier`]
+/// (`docs/LLM.md` §10.7). `default` is the neutral `standard`; `floor` (the
+/// configured default) is the cheapest endpoint.
+fn openrouter_tier(label: &str) -> ServiceTier {
+    match label {
+        "default" => ServiceTier::Standard,
+        "flex" => ServiceTier::Flex,
+        _ => ServiceTier::Floor,
     }
 }
 
@@ -1219,6 +1256,7 @@ fn summarize_usage(
 fn parse_tier(label: Option<&str>) -> ServiceTier {
     match label {
         Some("flex") => ServiceTier::Flex,
+        Some("floor") => ServiceTier::Floor,
         _ => ServiceTier::Standard,
     }
 }

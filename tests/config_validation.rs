@@ -148,3 +148,60 @@ fn burmese_cue_final_stop_invalid_value_names_the_key() {
         "error should name burmese.cue_final_stop, got: {err}"
     );
 }
+
+// AC: M13-AC1 — `llm.default_provider` defaults to `gemini` and `[llm.openrouter]`
+// has the documented defaults (docs/CONFIG.md §7).
+#[test]
+fn default_provider_and_openrouter_defaults() {
+    let config = load_toml("").expect("empty config is valid");
+    assert_eq!(config.llm.default_provider, "gemini");
+    assert_eq!(
+        config.llm.openrouter.base_url,
+        "https://openrouter.ai/api/v1"
+    );
+    assert_eq!(config.llm.openrouter.tier, "floor");
+    assert_eq!(config.llm.openrouter.data_collection, "deny");
+    assert!(!config.llm.openrouter.zdr);
+    assert!(!config.llm.openrouter.attribution);
+}
+
+// AC: M13-AC1/AC14 — an invalid `llm.default_provider` is rejected, naming the key.
+#[test]
+fn invalid_default_provider_names_the_key() {
+    let err = load_toml("[llm]\ndefault_provider = \"openai\"\n")
+        .expect_err("should reject default_provider = openai");
+    assert!(
+        err.to_string().contains("llm.default_provider"),
+        "error should name llm.default_provider, got: {err}"
+    );
+}
+
+// AC: M13-AC14 — an invalid `llm.openrouter.tier` is rejected, naming the key.
+#[test]
+fn invalid_openrouter_tier_names_the_key() {
+    let err = load_toml("[llm.openrouter]\ntier = \"turbo\"\n")
+        .expect_err("should reject openrouter.tier = turbo");
+    assert!(
+        err.to_string().contains("llm.openrouter.tier"),
+        "error should name llm.openrouter.tier, got: {err}"
+    );
+}
+
+// AC: M13-AC14 — an invalid `llm.openrouter.data_collection` is rejected, naming the key.
+#[test]
+fn invalid_openrouter_data_collection_names_the_key() {
+    let err = load_toml("[llm.openrouter]\ndata_collection = \"maybe\"\n")
+        .expect_err("should reject openrouter.data_collection = maybe");
+    assert!(
+        err.to_string().contains("llm.openrouter.data_collection"),
+        "error should name llm.openrouter.data_collection, got: {err}"
+    );
+}
+
+// AC: M13-AC1 — `openrouter` is a valid default provider.
+#[test]
+fn default_provider_openrouter_passes() {
+    let config =
+        load_toml("[llm]\ndefault_provider = \"openrouter\"\n").expect("openrouter is valid");
+    assert_eq!(config.llm.default_provider, "openrouter");
+}
