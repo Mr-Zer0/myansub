@@ -111,6 +111,23 @@ impl GeminiCatalog {
     pub fn new(prices: PriceTable) -> Self {
         Self { prices }
     }
+
+    /// Lists the priced Gemini models for `models list` (M13-AC16), optionally
+    /// filtered by a substring of the id. Gemini entries come from the price table;
+    /// context length is not tracked and structured output is always supported.
+    pub fn list(&self, filter: Option<&str>) -> Vec<ModelInfo> {
+        self.prices
+            .iter()
+            .filter(|(id, _)| filter.is_none_or(|f| id.contains(f)))
+            .map(|(id, price)| ModelInfo {
+                id: id.clone(),
+                input_per_m: Some(price.input),
+                output_per_m: Some(price.output),
+                context_length: None,
+                structured_output: true,
+            })
+            .collect()
+    }
 }
 
 impl ModelCatalog for GeminiCatalog {
@@ -148,6 +165,18 @@ impl PriceSource for GeminiCatalog {
     fn model_price(&self, model: &str) -> Option<ModelPrice> {
         self.prices.get(&bare_model(model)).cloned()
     }
+}
+
+/// A row for `myansub models list` (`docs/CLI.md`, M13-AC16): the model id, input
+/// and output price per 1M tokens (when known), context length, and whether it
+/// supports structured output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub input_per_m: Option<f64>,
+    pub output_per_m: Option<f64>,
+    pub context_length: Option<u64>,
+    pub structured_output: bool,
 }
 
 /// One model's catalog entry parsed from the OpenRouter `/models` document
@@ -226,6 +255,22 @@ impl OpenRouterCatalog {
                 ))),
             },
         }
+    }
+
+    /// Lists the catalog models for `models list` (M13-AC16), optionally filtered by
+    /// a substring of the id.
+    pub fn list(&self, filter: Option<&str>) -> Vec<ModelInfo> {
+        self.models
+            .iter()
+            .filter(|(id, _)| filter.is_none_or(|f| id.contains(f)))
+            .map(|(id, entry)| ModelInfo {
+                id: id.clone(),
+                input_per_m: entry.price.as_ref().map(|p| p.input),
+                output_per_m: entry.price.as_ref().map(|p| p.output),
+                context_length: entry.context_length,
+                structured_output: entry.structured_output,
+            })
+            .collect()
     }
 
     /// Up to five known ids closest to `query` (by edit distance), for an
@@ -570,6 +615,27 @@ mod tests {
                 .supported_reasoning_levels("openai/gpt-oss-chat")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn openrouter_catalog_list_filters_by_substring() {
+        // AC: M13-AC16 — list filters by a substring of the id and reports price,
+        // context length, and structured-output support.
+        let rows = openrouter_catalog().list(Some("anthropic"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "anthropic/claude-sonnet-5.5");
+        assert_eq!(rows[0].context_length, Some(200000));
+        assert!(rows[0].structured_output);
+        assert_eq!(rows[0].input_per_m, Some(3.0));
+    }
+
+    #[test]
+    fn gemini_catalog_list_from_price_table() {
+        // AC: M13-AC16 — Gemini list entries come from the price table.
+        let rows = catalog().list(None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "gemini-flash-latest");
+        assert!(rows[0].structured_output);
     }
 
     #[test]

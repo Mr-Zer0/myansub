@@ -10,15 +10,18 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use myansub::cli::{
     AnalysisCommand, AnalyzeArgs, AutoApprove, CacheCommand, Cli, Command, ExportArgs, InitArgs,
-    OutputFormat, ReviewCommand, ReviewListArgs, ReviewSelectionArgs, RunArgs, ServiceTier,
-    TranslateArgs,
+    ModelProvider, ModelsCommand, OutputFormat, ReviewCommand, ReviewListArgs, ReviewSelectionArgs,
+    RunArgs, ServiceTier, TranslateArgs,
 };
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::domain::SubtitleFormat;
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
 use myansub::llm::client::{LlmError, Secret};
 use myansub::llm::pricing::{Cost, PriceTable};
-use myansub::llm::{DryRun, Estimator, Gemini, OpenRouter, OpenRouterConfig, Router};
+use myansub::llm::{
+    DryRun, Estimator, Gemini, GeminiCatalog, ModelInfo, OpenRouter, OpenRouterCatalog,
+    OpenRouterConfig, Router, catalog_cache_path,
+};
 use myansub::pipeline::analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, DryRunReport, analysis_exit_code,
     dry_run_analysis, prepare_analysis, run_analysis_confirmed,
@@ -108,6 +111,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<i32> {
         Command::Review { command } => run_translation_review_command(cli, command),
         Command::Export(args) => run_export_command(cli, args),
         Command::Cache { command } => run_cache_command(cli, command),
+        Command::Models { command } => run_models_command(cli, command),
         other => not_implemented(command_name(other)),
     }
 }
@@ -1088,6 +1092,81 @@ fn print_review_listing(listing: &myansub::review::translation::ReviewListing) {
     );
 }
 
+/// Handles `myansub models list [--provider P] [FILTER]` (docs/CLI.md, M13-AC16):
+/// prints each model's id, input/output price per 1M tokens, context length, and
+/// structured-output support. Gemini entries come from the `[pricing]` table;
+/// OpenRouter entries come from the cached `/models` catalog (offline-friendly).
+fn run_models_command(cli: &Cli, command: &ModelsCommand) -> anyhow::Result<i32> {
+    let ModelsCommand::List(args) = command;
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let config = load_config(cli, &cwd)?;
+    let filter = args.filter.as_deref();
+
+    let want_gemini = !matches!(args.provider, Some(ModelProvider::Openrouter));
+    let want_openrouter = !matches!(args.provider, Some(ModelProvider::Gemini));
+
+    if want_gemini {
+        let catalog = GeminiCatalog::new(PriceTable::from_config(&config.pricing));
+        print_model_rows("gemini", &catalog.list(filter));
+    }
+
+    if want_openrouter {
+        let explicit = matches!(args.provider, Some(ModelProvider::Openrouter));
+        match load_openrouter_catalog(&config) {
+            Ok(catalog) => print_model_rows("openrouter", &catalog.list(filter)),
+            Err(err) if explicit => return Err(err.into()),
+            Err(err) => tracing::warn!("skipping openrouter models: {err}"),
+        }
+    }
+
+    Ok(exit::SUCCESS)
+}
+
+/// Loads the OpenRouter catalog for `models list` (fetch + 24 h cache, ADR-052b).
+fn load_openrouter_catalog(config: &Config) -> Result<OpenRouterCatalog, PipelineError> {
+    let cache = catalog_cache_path().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("myansub")
+            .join("openrouter-models.json")
+    });
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    runtime
+        .block_on(OpenRouterCatalog::load(
+            &client,
+            &config.llm.openrouter.base_url,
+            &cache,
+            std::time::SystemTime::now(),
+        ))
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))
+}
+
+/// Prints the `models list` rows for one provider (M13-AC16).
+fn print_model_rows(provider: &str, rows: &[ModelInfo]) {
+    for row in rows {
+        let input = row
+            .input_per_m
+            .map(|v| format!("${v:.4}/1M"))
+            .unwrap_or_else(|| "—".to_string());
+        let output = row
+            .output_per_m
+            .map(|v| format!("${v:.4}/1M"))
+            .unwrap_or_else(|| "—".to_string());
+        let context = row
+            .context_length
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let structured = if row.structured_output { "yes" } else { "no" };
+        println!(
+            "{provider}:{id}\tin {input}\tout {output}\tctx {context}\tstructured {structured}",
+            id = row.id
+        );
+    }
+}
+
 /// Builds the real provider-routing transport from the environment and config
 /// (docs/LLM.md §10.1, ADR-051c/052a). A provider's transport is included only when
 /// its key is present in the environment (`GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
@@ -1304,5 +1383,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::Review { .. } => "review",
         Command::Export(_) => "export",
         Command::Cache { .. } => "cache",
+        Command::Models { .. } => "models",
     }
 }

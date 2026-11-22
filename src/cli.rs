@@ -104,6 +104,36 @@ pub enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// List available models with prices, context length, and structured-output support.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelsCommand {
+    /// List models: id, input/output price per 1M tokens, context length, structured output.
+    List(ModelsListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ModelsListArgs {
+    /// Restrict the listing to one provider.
+    #[arg(long, value_name = "PROVIDER")]
+    pub provider: Option<ModelProvider>,
+
+    /// Only list models whose id contains this substring.
+    #[arg(value_name = "FILTER")]
+    pub filter: Option<String>,
+}
+
+/// The provider selector for `models list --provider` (`docs/CLI.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ModelProvider {
+    Gemini,
+    Openrouter,
 }
 
 #[derive(Debug, Args)]

@@ -63,6 +63,11 @@ impl PriceTable {
         self.models.get(model)
     }
 
+    /// Iterates `(model, price)` pairs in key order (for `models list`, M13-AC16).
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &ModelPrice)> {
+        self.models.iter()
+    }
+
     /// Builds a price table from the `[pricing]` config map (`docs/CONFIG.md`).
     pub fn from_config(entries: &BTreeMap<String, PriceEntry>) -> Self {
         let models = entries
