@@ -280,6 +280,10 @@ fn service_tier_label(tier: ServiceTier) -> &'static str {
     match tier {
         ServiceTier::Flex => "flex",
         ServiceTier::Standard => "standard",
+        // Gemini has no "floor" tier; its cheapest is flex, so a neutral `Floor`
+        // request (only produced by the OpenRouter path, but handled here for
+        // exhaustiveness) maps to flex on the Gemini wire (ADR-051b).
+        ServiceTier::Floor => "flex",
     }
 }
 
@@ -385,8 +389,11 @@ fn parse_usage(value: &Value) -> Usage {
         cached_tokens: count("cachedContentTokenCount"),
         output_tokens: count("candidatesTokenCount"),
         thinking_tokens: count("thoughtsTokenCount"),
-        cache_hit_local: false,
         applied_tier,
+        // Gemini leaves the provider-neutral extras (cost_usd, cache_write_tokens,
+        // reasoning_tokens, generation_id, served_*) unset — cost is computed from
+        // the price table and the served-* fields are OpenRouter-only (§10.5).
+        ..Default::default()
     }
 }
 

@@ -58,8 +58,11 @@ pub fn decide(
     let backoff = || full_jitter(backoff_ceiling(attempt, cfg), jitter);
 
     match err.class() {
-        // Permanent errors always give up, regardless of the retry budget.
-        ErrorClass::Fatal => Decision::GiveUp,
+        // Permanent errors always give up, regardless of the retry budget. Credits
+        // (402) and ContentRefused (403) are never transport-retried either: Credits
+        // stops the run (handled above the transport), and ContentRefused is handled
+        // by the content path (`docs/LLM.md` §10.6, ADR-051e).
+        ErrorClass::Fatal | ErrorClass::Credits | ErrorClass::ContentRefused => Decision::GiveUp,
 
         // 429: honor a server-provided delay exactly (no jitter); otherwise back off.
         ErrorClass::RateLimited { retry_after } => {

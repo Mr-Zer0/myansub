@@ -26,7 +26,7 @@ use crate::llm::metered::{LlmCallRecord, SinkError, UsageSink};
 // ---------------------------------------------------------------------------
 
 /// A full `llm_cache` row (`docs/DATA_MODEL.md` §2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CacheRow {
     pub key: String,
     pub model: String,
@@ -185,7 +185,7 @@ pub fn count_calls(conn: &Connection) -> Result<usize, StoreError> {
 /// Token usage for one `(model, service_tier)` group, summed over `llm_calls`
 /// (`docs/DATA_MODEL.md` §2). Used by `status` to report usage and estimate cost
 /// (`docs/CLI.md` §6, `docs/LLM.md` §9).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelUsage {
     pub model: String,
     /// The `service_tier` label stored on the calls (`flex`/`standard`), or `None`
@@ -226,6 +226,7 @@ pub fn usage_by_model(conn: &Connection) -> Result<Vec<ModelUsage>, StoreError> 
                 thinking_tokens: thinking.max(0) as u64,
                 cache_hit_local: false,
                 applied_tier: None,
+                ..Default::default()
             },
         });
     }

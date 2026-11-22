@@ -36,7 +36,7 @@ pub enum CacheError {
 
 /// A cached response read back from the store: just the stored text and
 /// [`Usage`], which is all that is needed to reconstruct an [`LlmResponse`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CachedEntry {
     pub response: String,
     pub usage: Usage,

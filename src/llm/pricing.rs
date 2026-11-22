@@ -121,7 +121,9 @@ pub fn cost(model: &str, tier: ServiceTier, usage: &Usage, table: &PriceTable) -
 
     let per_token = fresh * input_rate + cached * price.cached_input + output * output_rate;
     let multiplier = match tier {
-        ServiceTier::Flex => price.flex_multiplier,
+        // Flex and Floor both bill at the cheapest (flex) rate on the Gemini price
+        // table (Gemini has no distinct floor tier, ADR-051b).
+        ServiceTier::Flex | ServiceTier::Floor => price.flex_multiplier,
         ServiceTier::Standard => 1.0,
     };
 

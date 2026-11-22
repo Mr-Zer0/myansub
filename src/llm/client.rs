@@ -62,21 +62,34 @@ impl From<&str> for Secret {
     }
 }
 
-/// Service tier for a request (`docs/LLM.md` §5). `Flex` is roughly half the
-/// standard price but may be shed under load; `Standard` is the fallback.
+/// The neutral service tier carried by a request (`docs/LLM.md` §5/§10, ADR-051b).
+///
+/// The neutral values are `flex | default | floor`; `Standard` IS the neutral
+/// `default` (kept under its original name to avoid churn across the Gemini path).
+/// `Flex` is roughly half the standard price but may be shed under load; `Floor`
+/// (new, M13) is "cheapest endpoint" and is only produced by the OpenRouter path.
+/// Each transport maps these to its own wire representation: Gemini maps
+/// `Flex→flex`, `Standard→standard`, `Floor→flex` (flex is Gemini's cheapest);
+/// OpenRouter maps them to its tier/sort behaviour (`docs/LLM.md` §10.7). The wire
+/// field name stays inside each adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceTier {
     Flex,
     Standard,
+    Floor,
 }
 
 impl ServiceTier {
-    /// The lowercase label used in config and the `llm_calls.service_tier` column.
+    /// The lowercase label used in config, the Gemini wire tier, and the
+    /// `llm_calls.service_tier` column. `Standard` stays `"standard"` (Gemini's
+    /// unchanged vocabulary); the OpenRouter config surface speaks of the same
+    /// variant as the neutral `"default"` (`docs/LLM.md` §10.7) and maps it here.
     pub fn label(self) -> &'static str {
         match self {
             ServiceTier::Flex => "flex",
             ServiceTier::Standard => "standard",
+            ServiceTier::Floor => "floor",
         }
     }
 }
@@ -150,29 +163,89 @@ pub struct LlmRequest {
     pub generation_config: GenerationConfig,
 }
 
-/// Token usage read from `usageMetadata` (`docs/LLM.md` §1) plus the markers the
-/// `llm_calls` row and pricing need (`docs/DATA_MODEL.md` §2).
+impl LlmRequest {
+    /// The "cached prefix ends here" marker (`docs/LLM.md` §2, ADR-051b): the number
+    /// of leading [`ContentBlock`]s that belong to the stable cached prefix — every
+    /// block except the last, which is the variable block. For a translation request
+    /// (`[analysis_sheet, variable]`) this is `1` (the sheet); for a single-content
+    /// analysis request (`[transcript]`, the variable block) it is `0` (only the
+    /// `system_instruction` is stable). Each adapter uses this to place its cache
+    /// control: Gemini relies on the stable prefix for implicit/explicit caching;
+    /// OpenRouter puts `cache_control: {type:"ephemeral"}` on the last prefix block
+    /// (`docs/LLM.md` §10.2). A request with no content blocks has no prefix (`0`).
+    pub fn cached_prefix_block_count(&self) -> usize {
+        self.contents.len().saturating_sub(1)
+    }
+
+    /// The provider this request routes to, parsed from [`LlmRequest::model`] under
+    /// `default` (`docs/LLM.md` §10.1). The [`Router`](crate::llm::router::Router)
+    /// uses this to pick a transport.
+    pub fn provider(&self, default: crate::domain::Provider) -> crate::domain::Provider {
+        crate::domain::ModelRef::parse(&self.model, default)
+            .map(|r| r.provider)
+            .unwrap_or(default)
+    }
+}
+
+/// Token usage read from a provider's response plus the markers the `llm_calls`
+/// row and pricing need (`docs/DATA_MODEL.md` §2). Provider-neutral: a field a
+/// provider does not report stays `0`/`None` rather than a misleading value
+/// (`docs/LLM.md` §10.5, ADR-051b). Wire field names stay inside each adapter.
 ///
-/// Field mapping from Gemini `usageMetadata`:
-/// `promptTokenCount → prompt_tokens`, `cachedContentTokenCount → cached_tokens`,
-/// `candidatesTokenCount → output_tokens`, `thoughtsTokenCount → thinking_tokens`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Gemini mapping (`llm/gemini.rs`): `promptTokenCount → prompt_tokens`,
+/// `cachedContentTokenCount → cached_tokens`, `candidatesTokenCount →
+/// output_tokens`, `thoughtsTokenCount → thinking_tokens` (Gemini leaves
+/// `cost_usd`/`cache_write_tokens`/`reasoning_tokens` and the served-* fields
+/// unset — cost is computed from the price table). OpenRouter mapping
+/// (`llm/openrouter.rs`, §10.5) fills `cost_usd` and the served-* fields.
+///
+/// `Eq` is intentionally not derived: `cost_usd` is an `f64`. Nothing uses `Usage`
+/// (or the response types that carry it) as a hash/set key, so `PartialEq` suffices
+/// for the `assert_eq!`/equality uses in the pipeline and tests.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
     /// Portion of the prompt served from cache (subset of `prompt_tokens`).
     pub cached_tokens: u64,
+    /// Tokens written to a provider cache on this call, when the provider reports
+    /// them (OpenRouter `cache_write`; `docs/LLM.md` §10.5). `0` for Gemini.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
-    /// Thinking tokens; billed as output (`docs/LLM.md` §9).
+    /// Thinking/reasoning tokens; billed as output (`docs/LLM.md` §9). Gemini fills
+    /// this from `thoughtsTokenCount`; OpenRouter from
+    /// `completion_tokens_details.reasoning_tokens`.
     pub thinking_tokens: u64,
+    /// Explicit reasoning-token count when a provider reports it separately from
+    /// `thinking_tokens` (OpenRouter, §10.5). Defaults to `0`.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// The provider's own reported cost in USD, when it reports one (OpenRouter
+    /// `usage.cost`, §10.5). `None` for Gemini (cost is computed from the price
+    /// table by `pricing.rs`). Additive and omitted from serialized output when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     /// Set when the response came from the local response cache (cost 0).
     #[serde(default)]
     pub cache_hit_local: bool,
-    /// The service tier the server reported it actually applied
-    /// (`usageMetadata.serviceTier`), when present. Lets a smoke test confirm a
-    /// `flex` request was not silently served on `standard` (ADR-028). Additive:
-    /// defaults to `None` and is omitted from serialized output when absent.
+    /// The service tier the server reported it actually applied, when present. Lets
+    /// a smoke test confirm a `flex` request was not silently served on `standard`
+    /// (ADR-028). Additive: `None` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_tier: Option<String>,
+    /// OpenRouter generation id (`usage.id` / response `id`), for the `llm_calls`
+    /// `generation_id` column (§10.5). `None` for Gemini.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// The upstream provider OpenRouter routed to, for `llm_calls.served_provider`
+    /// (§10.5). `None` for Gemini.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_provider: Option<String>,
+    /// The tier OpenRouter actually served, for `llm_calls.served_tier` (§10.5).
+    /// `None` for Gemini.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_tier: Option<String>,
 }
 
 /// Everything the [`Cached`](crate::llm::cache) layer needs to persist one
@@ -182,7 +255,9 @@ pub struct Usage {
 /// it has validated it (`docs/LLM.md` §4). Public fields so the pipeline (M5/M6)
 /// can hand the payload to a store `*_in_tx` helper and commit it inside the
 /// unit's transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived because [`Usage`] now carries an `f64` (`cost_usd`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct CachePayload {
     pub key: String,
     pub model: String,
@@ -199,10 +274,15 @@ pub struct CachePayload {
 /// *hit*, a dry-run, or a transport with no cache behind it carries nothing
 /// (`noop`). Invalid responses are simply never committed — the caller just
 /// drops the token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommitToken {
     key: Option<String>,
-    payload: Option<CachePayload>,
+    // Boxed so the token (threaded through `LlmResponse` and several pipeline
+    // outcome enums) stays small: `CachePayload` embeds a `Usage`, which grew with
+    // the provider-neutral fields (`cost_usd` and the OpenRouter served-* fields,
+    // ADR-051b). Keeping the common `None` token pointer-sized avoids a
+    // `clippy::large_enum_variant` on `CallResult`/`CallStep`.
+    payload: Option<Box<CachePayload>>,
 }
 
 impl CommitToken {
@@ -230,7 +310,7 @@ impl CommitToken {
     pub fn to_store(payload: CachePayload) -> Self {
         Self {
             key: Some(payload.key.clone()),
-            payload: Some(payload),
+            payload: Some(Box::new(payload)),
         }
     }
 
@@ -241,13 +321,15 @@ impl CommitToken {
 
     /// The payload to store once validated, if this token carries one.
     pub fn payload(&self) -> Option<&CachePayload> {
-        self.payload.as_ref()
+        self.payload.as_deref()
     }
 }
 
 /// A logical LLM response: the raw payload text, token [`Usage`], and a
 /// [`CommitToken`] for the cache flow (`docs/LLM.md` §4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived because [`Usage`] now carries an `f64` (`cost_usd`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct LlmResponse {
     /// The model's text output. For structured output this is the JSON document
     /// as a string; parsing/validation happens in the pipeline.
@@ -266,6 +348,16 @@ pub enum ErrorClass {
     Shed,
     /// Rate limited (429), optionally carrying a server-provided delay.
     RateLimited { retry_after: Option<Duration> },
+    /// Out of provider credits (OpenRouter 402, `docs/LLM.md` §10.6, ADR-051e).
+    /// The run must stop before dispatching further work — it is not retryable and
+    /// not a per-unit content failure. `main` surfaces it as a run-stopping error
+    /// ("add OpenRouter credits, or use a `:free` model").
+    Credits,
+    /// The provider refused the content on moderation/guardrail grounds (OpenRouter
+    /// 403, `docs/LLM.md` §10.6, ADR-051e). The batch fails and is flagged
+    /// [`QualityFlag::Refused`](crate::domain::QualityFlag::Refused), but the run
+    /// continues — it is handled by the content path, never a transport retry.
+    ContentRefused,
     /// Permanent; give up (400/401/403/404, schema/decode errors).
     Fatal,
 }
@@ -303,6 +395,17 @@ pub enum LlmError {
     #[error("service tier not supported: {message}")]
     TierUnsupported { message: String },
 
+    /// Out of provider credits (OpenRouter 402, `docs/LLM.md` §10.6). Run-stopping;
+    /// classed [`ErrorClass::Credits`].
+    #[error("out of provider credits: {message}")]
+    Credits { message: String },
+
+    /// The provider refused the content on moderation/guardrail grounds (OpenRouter
+    /// 403, `docs/LLM.md` §10.6). Classed [`ErrorClass::ContentRefused`]; handled by
+    /// the content path, never a transport retry.
+    #[error("content refused by provider: {message}")]
+    ContentRefused { message: String },
+
     /// The operation was cancelled (Ctrl-C / [`CancellationToken`]), e.g. during
     /// a backoff sleep (`docs/ARCHITECTURE.md` §6.6). Maps to exit code 130.
     ///
@@ -332,6 +435,8 @@ impl LlmError {
             | LlmError::Connection(_)
             | LlmError::Transport(_) => ErrorClass::Retryable,
             LlmError::Shed => ErrorClass::Shed,
+            LlmError::Credits { .. } => ErrorClass::Credits,
+            LlmError::ContentRefused { .. } => ErrorClass::ContentRefused,
             // `TierUnsupported` and `Cancelled` are handled by the `Retrying`
             // layer directly (tier re-send / early return) and never flow through
             // `decide`; classed `Fatal` so the policy gives up if one ever does.
