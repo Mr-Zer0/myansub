@@ -93,6 +93,8 @@ impl ExitCode for PipelineError {
             | PipelineError::MissingFromLanguage => exit::PRECONDITION,
             // A format/extension disagreement is a usage error (exit 2).
             PipelineError::OutputFormatExtensionMismatch { .. } => exit::USAGE,
+            // An unknown `provider:` prefix is a usage error (exit 2, ADR-051a).
+            PipelineError::InvalidModel(_) => exit::USAGE,
             // A missing API key is a generic error (exit 1), not a precondition.
             PipelineError::MissingApiKey => exit::ERROR,
             PipelineError::ProjectResolution(err) => err.exit_code(),

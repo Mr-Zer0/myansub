@@ -22,6 +22,7 @@ pub mod pricing;
 pub mod prompts;
 pub mod retry;
 pub mod retrying;
+pub mod router;
 pub mod schemas;
 
 /// Scripted transport for tests (`docs/TESTING.md` §3). Compiled only for this
@@ -49,6 +50,7 @@ pub use pricing::{Cost, ModelPrice, PriceSource, PriceTable, cost, storage_cost}
 pub use prompts::{PROMPT_VERSION, TranslationBlock, TranslationLine};
 pub use retry::{Decision, RetryConfig, Xorshift, decide};
 pub use retrying::Retrying;
+pub use router::Router;
 
 /// The full client layer stack `Metered<Cached<Retrying<Transport>>>`
 /// (`docs/ARCHITECTURE.md` §5). A type alias so the pipeline (M5/M6) can name the

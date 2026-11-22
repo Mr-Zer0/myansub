@@ -16,9 +16,9 @@ use myansub::cli::{
 use myansub::config::{self, CliOverrides, Config, global_config_path, sources_from_paths};
 use myansub::domain::SubtitleFormat;
 use myansub::error::{ConfigError, ExitCode, PipelineError, ProjectError, ReviewError, exit};
-use myansub::llm::client::Secret;
+use myansub::llm::client::{LlmError, Secret};
 use myansub::llm::pricing::{Cost, PriceTable};
-use myansub::llm::{DryRun, Estimator, Gemini};
+use myansub::llm::{DryRun, Estimator, Gemini, OpenRouter, OpenRouterConfig, Router};
 use myansub::pipeline::analysis::{
     AnalysisFlags, AnalysisModeKind, AnalysisOutcome, DryRunReport, analysis_exit_code,
     dry_run_analysis, prepare_analysis, run_analysis_confirmed,
@@ -269,9 +269,9 @@ fn run_run_command(cli: &Cli, args: &RunArgs) -> anyhow::Result<i32> {
         } else {
             // Cost-confirmation gate (docs/CLI.md §4/§5): `--auto-approve` does not
             // imply `--yes`, so the gate still applies to an auto-approving run.
-            // `build_gemini` runs only once the gate is cleared.
+            // `build_router` runs only once the gate is cleared.
             run_confirmed(
-                || build_gemini(&config),
+                || build_router(&config),
                 request,
                 &config,
                 &token,
@@ -524,14 +524,14 @@ fn run_analyze_command(cli: &Cli, args: &AnalyzeArgs) -> anyhow::Result<i32> {
             retry_failed: args.retry_failed,
         };
         // Cost-confirmation gate (docs/CLI.md §5, docs/LLM.md §9): estimate first,
-        // then confirm. `build_gemini` (and the API key it needs) is only invoked
+        // then confirm. `build_router` (and the API key it needs) is only invoked
         // once the gate is cleared, so a refusal exits 3 without requiring a key.
         let prices = PriceTable::from_config(&config.pricing);
         let settings = confirm_settings(cli, &config);
         // Live progress on stderr (`docs/CLI.md` §8); the dry-run path returned above.
         let progress = build_progress(cli, false);
         let confirmed = run_analysis_confirmed(
-            || build_gemini(&config),
+            || build_router(&config),
             &store,
             &cues,
             &params,
@@ -621,14 +621,14 @@ fn run_translate_command(cli: &Cli, args: &TranslateArgs) -> anyhow::Result<i32>
             stale: args.stale,
         };
         // Cost-confirmation gate (docs/CLI.md §5, docs/LLM.md §7/§9): for `--stale`
-        // the estimate covers only the stale, unlocked cues. `build_gemini` runs only
+        // the estimate covers only the stale, unlocked cues. `build_router` runs only
         // once the gate is cleared, so a refusal exits 3 without requiring a key.
         let prices = PriceTable::from_config(&config.pricing);
         let settings = confirm_settings(cli, &config);
         // Live progress on stderr (`docs/CLI.md` §8); the dry-run path returned above.
         let progress = build_progress(cli, false);
         let confirmed = run_translation_confirmed(
-            || build_gemini(&config),
+            || build_router(&config),
             &store,
             &cues,
             &params,
@@ -1088,22 +1088,58 @@ fn print_review_listing(listing: &myansub::review::translation::ReviewListing) {
     );
 }
 
-/// Builds the real Gemini transport from the environment and config
-/// (docs/LLM.md §1). The API key comes from `GEMINI_API_KEY` and is wrapped in a
-/// [`Secret`] so it never leaks through logging.
-fn build_gemini(config: &Config) -> Result<Gemini, PipelineError> {
-    // Detect an absent/empty key before building the transport, so a missing key is
-    // a clear, actionable error rather than a confusing 401 from a would-be request.
-    let key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-    if key.trim().is_empty() {
-        return Err(PipelineError::MissingApiKey);
+/// Builds the real provider-routing transport from the environment and config
+/// (docs/LLM.md §10.1, ADR-051c/052a). A provider's transport is included only when
+/// its key is present in the environment (`GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
+/// each wrapped in a [`Secret`] so it never leaks through logging. A missing key
+/// therefore fails only when a stage actually dispatches to that provider. The two
+/// transports share one [`reqwest::Client`] (docs/LLM.md §1).
+fn build_router(config: &Config) -> Result<Router, PipelineError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| PipelineError::Llm(LlmError::Transport(e.to_string())))?;
+    let timeout = Duration::from_secs(config.llm.timeout_secs);
+
+    let gemini = non_empty_env("GEMINI_API_KEY").map(|key| {
+        Gemini::with_client(
+            client.clone(),
+            config.llm.base_url.clone(),
+            Secret::new(key),
+            timeout,
+        )
+    });
+    let openrouter = non_empty_env("OPENROUTER_API_KEY").map(|key| {
+        OpenRouter::with_client(
+            client.clone(),
+            config.llm.openrouter.base_url.clone(),
+            Secret::new(key),
+            timeout,
+            openrouter_config(config),
+        )
+    });
+
+    Ok(Router::new(gemini, openrouter, config.default_provider()))
+}
+
+/// Reads an environment variable, treating an absent or blank value as unset.
+fn non_empty_env(name: &str) -> Option<String> {
+    let value = std::env::var(name).unwrap_or_default();
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
     }
-    Gemini::new(
-        config.llm.base_url.clone(),
-        Secret::new(key),
-        Duration::from_secs(config.llm.timeout_secs),
-    )
-    .map_err(PipelineError::Llm)
+}
+
+/// Builds the OpenRouter provider settings from `[llm.openrouter]` (docs/CONFIG.md §7).
+fn openrouter_config(config: &Config) -> OpenRouterConfig {
+    OpenRouterConfig {
+        tier: config.llm.openrouter.tier.clone(),
+        data_collection: config.llm.openrouter.data_collection.clone(),
+        zdr: config.llm.openrouter.zdr,
+        attribution: config.llm.openrouter.attribution,
+        ..OpenRouterConfig::default()
+    }
 }
 
 /// The config label for a CLI service tier.
@@ -1216,7 +1252,20 @@ fn load_config_with(
         env,
         overrides,
     );
-    Ok(config::load(&sources)?)
+    let config = config::load(&sources)?;
+    validate_model_refs(&config)?;
+    Ok(config)
+}
+
+/// Rejects a model reference (from `--model` or `[llm.models]`) that names an unknown
+/// `provider:` prefix, mapping it to exit 2 (docs/LLM.md §10.1, ADR-051a). Empty
+/// models are already rejected by `config::validate`.
+fn validate_model_refs(config: &Config) -> Result<(), PipelineError> {
+    let default = config.default_provider();
+    for raw in [&config.llm.models.analysis, &config.llm.models.translation] {
+        myansub::domain::ModelRef::parse(raw, default).map_err(PipelineError::InvalidModel)?;
+    }
+    Ok(())
 }
 
 /// Maps a dispatch error to its exit code by inspecting the error chain for a

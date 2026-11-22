@@ -93,6 +93,12 @@ pub enum PipelineError {
     #[error("GEMINI_API_KEY is not set; export it (or add it to a `.env` file) to run analysis")]
     MissingApiKey,
 
+    /// A model reference (from `--model` or `[llm.models]`) named an unknown
+    /// `provider:` prefix (`docs/LLM.md` §10.1, ADR-051a). Maps to exit code 2
+    /// (usage error, like a clap/flag error).
+    #[error("{0}")]
+    InvalidModel(crate::domain::ParseModelRefError),
+
     /// Project resolution failed (`docs/CLI.md` §2). Maps to exit code 3 (except
     /// an unreadable directory, which is a generic error).
     #[error(transparent)]
