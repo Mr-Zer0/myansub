@@ -291,6 +291,28 @@ async fn error_429_honors_retry_after() {
     }
 }
 
+// AC: M13-AC13 — 408 is retryable and honors Retry-After when present.
+#[tokio::test]
+async fn error_408_honors_retry_after() {
+    let server = MockServer::start().await;
+    mount_once(
+        &server,
+        ResponseTemplate::new(408).insert_header("Retry-After", "3"),
+    )
+    .await;
+
+    let err = openrouter(&server)
+        .generate(request())
+        .await
+        .expect_err("408 errors");
+    match err {
+        LlmError::RateLimited { retry_after } => {
+            assert_eq!(retry_after, Some(Duration::from_secs(3)));
+        }
+        other => panic!("expected RateLimited honoring Retry-After, got {other:?}"),
+    }
+}
+
 // AC: M13-AC13 — 502 is retryable.
 #[tokio::test]
 async fn error_502_is_retryable() {
@@ -302,6 +324,28 @@ async fn error_502_is_retryable() {
         .await
         .expect_err("502 errors");
     assert_eq!(err.class(), myansub::llm::client::ErrorClass::Retryable);
+}
+
+// AC: M13-AC13 — 502 with a Retry-After honors the server delay (RateLimited).
+#[tokio::test]
+async fn error_502_honors_retry_after() {
+    let server = MockServer::start().await;
+    mount_once(
+        &server,
+        ResponseTemplate::new(502).insert_header("Retry-After", "5"),
+    )
+    .await;
+
+    let err = openrouter(&server)
+        .generate(request())
+        .await
+        .expect_err("502 errors");
+    match err {
+        LlmError::RateLimited { retry_after } => {
+            assert_eq!(retry_after, Some(Duration::from_secs(5)));
+        }
+        other => panic!("expected RateLimited honoring Retry-After, got {other:?}"),
+    }
 }
 
 // AC: M13-AC13 — 503 (no provider meets routing) is retried the configured number of

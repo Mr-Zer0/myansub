@@ -613,6 +613,30 @@ mod tests {
             classify(&raw(429, false)),
             ErrorClass::RateLimited { retry_after: None }
         );
+        // 408/502 are retryable; with a `Retry-After` they carry the server delay.
+        assert_eq!(classify(&raw(408, false)), ErrorClass::Retryable);
+        assert_eq!(classify(&raw(502, false)), ErrorClass::Retryable);
+        let with_delay = RawError {
+            status: 408,
+            retry_after: Some(Duration::from_secs(4)),
+            message: String::new(),
+            moderation: false,
+        };
+        assert_eq!(
+            classify(&with_delay),
+            ErrorClass::RateLimited {
+                retry_after: Some(Duration::from_secs(4))
+            }
+        );
+        assert_eq!(
+            classify(&RawError {
+                status: 502,
+                ..with_delay
+            }),
+            ErrorClass::RateLimited {
+                retry_after: Some(Duration::from_secs(4))
+            }
+        );
         assert_eq!(classify(&raw(503, false)), ErrorClass::Retryable);
     }
 
